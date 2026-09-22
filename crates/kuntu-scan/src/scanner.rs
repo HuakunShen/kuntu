@@ -54,16 +54,34 @@ impl ScanControl {
   }
 
   pub fn progress(&self) -> ScanProgress {
-    ScanProgress {
-      visited: self.visited.load(Ordering::Relaxed),
-      admitted: self.admitted.load(Ordering::Relaxed),
-      completed: self.completed.load(Ordering::Relaxed),
-      bytes: self.bytes.load(Ordering::Relaxed),
+    self.progress_with_hook(&NoopProgressSnapshotHook)
+  }
+
+  fn progress_with_hook(&self, hook: &dyn ProgressSnapshotHook) -> ScanProgress {
+    loop {
+      // Load in reverse causal order. A completed release includes the
+      // preceding visit and admission, and a visited release includes its
+      // preceding admission. The retry is a final guard against publishing a
+      // tuple that violates that causal chain.
+      let completed = self.completed.load(Ordering::Acquire);
+      hook.after_completed_load();
+      let visited = self.visited.load(Ordering::Acquire);
+      let admitted = self.admitted.load(Ordering::Acquire);
+      let bytes = self.bytes.load(Ordering::Acquire);
+      if completed <= visited && visited <= admitted {
+        return ScanProgress {
+          visited,
+          admitted,
+          completed,
+          bytes,
+        };
+      }
+      std::hint::spin_loop();
     }
   }
 
   fn increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = counter.fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
       Some(value.saturating_add(1))
     });
   }
@@ -71,11 +89,19 @@ impl ScanControl {
   fn add_bytes(&self, bytes: u64) {
     let _ = self
       .bytes
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+      .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
         Some(value.saturating_add(bytes))
       });
   }
 }
+
+trait ProgressSnapshotHook {
+  fn after_completed_load(&self) {}
+}
+
+struct NoopProgressSnapshotHook;
+
+impl ProgressSnapshotHook for NoopProgressSnapshotHook {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanProgress {
@@ -127,6 +153,13 @@ trait TraversalHook: Send + Sync {
   fn after_enumeration(&self, _path: &Path) {}
   fn before_admission(&self, _path: &Path) {}
   fn before_collapsed_entry(&self, _path: &Path) {}
+  fn before_metadata(&self, _path: &Path) {}
+  fn after_metadata(&self, _path: &Path) {}
+  fn before_inode_mutation(&self, _path: &Path) {}
+  fn after_inode_mutation(&self, _path: &Path) {}
+  fn deadline_reached(&self, deadline: Instant) -> bool {
+    Instant::now() >= deadline
+  }
 }
 
 struct NoopTraversalHook;
@@ -151,7 +184,7 @@ impl WalkContext<'_> {
     self.control.is_cancelled()
       || self
         .deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
+        .is_some_and(|deadline| self.hook.deadline_reached(deadline))
   }
 
   fn stopped_outcome(&self) -> ScanOutcome {
@@ -265,7 +298,13 @@ fn scan_path(
   }
   context.visit();
 
-  let metadata = match std::fs::symlink_metadata(path) {
+  context.hook.before_metadata(path);
+  if context.should_stop() {
+    return WalkOutcome::Cancelled;
+  }
+  let metadata_result = std::fs::symlink_metadata(path);
+  context.hook.after_metadata(path);
+  let metadata = match metadata_result {
     Ok(metadata) => metadata,
     Err(_) => {
       context.complete();
@@ -275,13 +314,14 @@ fn scan_path(
   if context.should_stop() {
     return WalkOutcome::Cancelled;
   }
-  let own_size = match unique_allocated_size_cooperative(path, &metadata, seen_inodes) {
-    Ok(Some(size)) => size,
-    Ok(None) => {
+  let own_size = match unique_allocated_size_cooperative(path, &metadata, seen_inodes, context) {
+    WalkOutcome::Completed(size) => size,
+    WalkOutcome::Skipped => {
       context.complete();
       return WalkOutcome::Skipped;
     }
-    Err(error) => return WalkOutcome::Failed(error),
+    WalkOutcome::Cancelled => return WalkOutcome::Cancelled,
+    WalkOutcome::Failed(error) => return WalkOutcome::Failed(error),
   };
   context.control.add_bytes(own_size);
   let is_dir = metadata.is_dir();
@@ -443,7 +483,13 @@ fn summarize_path_cooperative(
   }
   context.visit();
 
-  let metadata = match std::fs::symlink_metadata(path) {
+  context.hook.before_metadata(path);
+  if context.should_stop() {
+    return WalkOutcome::Cancelled;
+  }
+  let metadata_result = std::fs::symlink_metadata(path);
+  context.hook.after_metadata(path);
+  let metadata = match metadata_result {
     Ok(metadata) => metadata,
     Err(_) => {
       context.complete();
@@ -453,13 +499,14 @@ fn summarize_path_cooperative(
   if context.should_stop() {
     return WalkOutcome::Cancelled;
   }
-  let own_size = match unique_allocated_size_cooperative(path, &metadata, seen_inodes) {
-    Ok(Some(size)) => size,
-    Ok(None) => {
+  let own_size = match unique_allocated_size_cooperative(path, &metadata, seen_inodes, context) {
+    WalkOutcome::Completed(size) => size,
+    WalkOutcome::Skipped => {
       context.complete();
       return WalkOutcome::Skipped;
     }
-    Err(error) => return WalkOutcome::Failed(error),
+    WalkOutcome::Cancelled => return WalkOutcome::Cancelled,
+    WalkOutcome::Failed(error) => return WalkOutcome::Failed(error),
   };
   context.control.add_bytes(own_size);
 
@@ -626,17 +673,28 @@ fn unique_allocated_size_cooperative(
   path: &Path,
   metadata: &std::fs::Metadata,
   seen_inodes: &SeenInodes,
-) -> Result<Option<u64>, ScanError> {
+  context: &WalkContext<'_>,
+) -> WalkOutcome<u64> {
   if let Some(key) = inode_key(path, metadata) {
-    let mut seen = seen_inodes.lock().map_err(|_| ScanError {
-      message: "scan inode state was poisoned".to_string(),
-    })?;
-    if !seen.insert(key) {
-      return Ok(None);
+    let mut seen = match seen_inodes.lock() {
+      Ok(seen) => seen,
+      Err(_) => {
+        return WalkOutcome::Failed(ScanError {
+          message: "scan inode state was poisoned".to_string(),
+        });
+      }
+    };
+    context.hook.before_inode_mutation(path);
+    if context.should_stop() {
+      return WalkOutcome::Cancelled;
     }
+    if !seen.insert(key) {
+      return WalkOutcome::Skipped;
+    }
+    context.hook.after_inode_mutation(path);
   }
 
-  Ok(Some(allocated_size(metadata)))
+  WalkOutcome::Completed(allocated_size(metadata))
 }
 
 #[cfg(unix)]
