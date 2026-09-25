@@ -20,6 +20,11 @@ pub struct ScanOptions {
   pub full_path: bool,
   pub respect_gitignore: bool,
   pub ignored_mode: IgnoredMode,
+  /// Descend into symlinked directories. Off by default: symlinked project
+  /// checkouts are measured as link nodes instead of being traversed, which
+  /// keeps scans from wandering into external trees (and symlink cycles).
+  #[serde(default)]
+  pub follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,21 +39,71 @@ pub struct ScanNode {
 }
 
 type IgnoreStack = Vec<Arc<Gitignore>>;
-type SeenInodes = Arc<Mutex<HashSet<(u64, u64)>>>;
+pub(crate) type SeenInodes = Arc<Mutex<HashSet<(u64, u64)>>>;
+
+pub(crate) fn new_seen_inodes() -> SeenInodes {
+  Arc::new(Mutex::new(HashSet::new()))
+}
+
+struct ScanCtx<'a> {
+  options: &'a ScanOptions,
+  seen_inodes: &'a SeenInodes,
+  seen_dirs: &'a SeenInodes,
+}
 
 pub fn scan_directory(options: ScanOptions) -> Vec<ScanNode> {
-  let seen_inodes = Arc::new(Mutex::new(HashSet::new()));
+  let ctx = ScanCtx {
+    options: &options,
+    seen_inodes: &new_seen_inodes(),
+    seen_dirs: &new_seen_inodes(),
+  };
 
   options
     .directories
     .iter()
-    .filter_map(|directory| scan_path(directory, 0, &[], false, false, &options, &seen_inodes))
+    .filter_map(|directory| scan_path(directory, 0, &[], false, false, &ctx))
     .collect()
 }
 
 pub fn measure_path(path: &Path) -> u64 {
-  let seen_inodes = Arc::new(Mutex::new(HashSet::new()));
-  summarize_path(path, &seen_inodes)
+  measure_path_inner(path, false)
+}
+
+/// Like [`measure_path`], but resolves symlinked directories to their target
+/// contents when `follow_symlinks` is set.
+pub fn measure_path_inner(path: &Path, follow_symlinks: bool) -> u64 {
+  let seen_inodes = new_seen_inodes();
+  let seen_dirs = new_seen_inodes();
+  summarize_path(path, &seen_inodes, &seen_dirs, follow_symlinks)
+}
+
+/// Resolve a symlinked path to its target metadata when following is enabled.
+pub(crate) fn effective_metadata(
+  path: &Path,
+  metadata: std::fs::Metadata,
+  follow_symlinks: bool,
+) -> Option<std::fs::Metadata> {
+  if follow_symlinks && metadata.is_symlink() {
+    std::fs::metadata(path).ok()
+  } else {
+    Some(metadata)
+  }
+}
+
+/// Mark a directory as visited when following symlinks. Returns false when the
+/// directory was already visited, which cuts symlink cycles and double counts.
+pub(crate) fn mark_dir_visited(
+  path: &Path,
+  metadata: &std::fs::Metadata,
+  seen_dirs: &SeenInodes,
+) -> bool {
+  match inode_key(path, metadata) {
+    Some(key) => match seen_dirs.lock() {
+      Ok(mut seen) => seen.insert(key),
+      Err(_) => true,
+    },
+    None => true,
+  }
 }
 
 fn scan_path(
@@ -57,12 +112,20 @@ fn scan_path(
   ignore_stack: &[Arc<Gitignore>],
   ignored: bool,
   collapsed: bool,
-  options: &ScanOptions,
-  seen_inodes: &SeenInodes,
+  ctx: &ScanCtx<'_>,
 ) -> Option<ScanNode> {
-  let metadata = std::fs::symlink_metadata(path).ok()?;
-  let own_size = unique_allocated_size(path, &metadata, seen_inodes)?;
+  let options = ctx.options;
+  let metadata = effective_metadata(
+    path,
+    std::fs::symlink_metadata(path).ok()?,
+    options.follow_symlinks,
+  )?;
+  let own_size = unique_allocated_size(path, &metadata, ctx.seen_inodes)?;
   let is_dir = metadata.is_dir();
+
+  if is_dir && options.follow_symlinks && !mark_dir_visited(path, &metadata, ctx.seen_dirs) {
+    return None;
+  }
 
   if !is_dir {
     return Some(ScanNode {
@@ -86,7 +149,13 @@ fn scan_path(
     return Some(ScanNode {
       name: display_name(path, options.full_path),
       path: path.to_path_buf(),
-      size: own_size + summarize_dir_children(path, seen_inodes),
+      size: own_size
+        + summarize_dir_children(
+          path,
+          ctx.seen_inodes,
+          ctx.seen_dirs,
+          options.follow_symlinks,
+        ),
       children: vec![],
       depth,
       ignored,
@@ -101,7 +170,12 @@ fn scan_path(
         let entry = entry.ok()?;
         let entry_path = entry.path();
         let file_type = entry.file_type().ok()?;
-        let is_entry_dir = file_type.is_dir();
+        let mut is_entry_dir = file_type.is_dir();
+        if options.follow_symlinks && file_type.is_symlink() {
+          is_entry_dir = std::fs::metadata(&entry_path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        }
 
         if options.ignore_hidden && is_hidden(&entry_path) {
           return None;
@@ -122,8 +196,7 @@ fn scan_path(
           &current_stack,
           is_ignored,
           collapse_child,
-          options,
-          seen_inodes,
+          ctx,
         )
       })
       .collect::<Vec<_>>(),
@@ -143,15 +216,26 @@ fn scan_path(
   })
 }
 
-fn summarize_path(path: &Path, seen_inodes: &SeenInodes) -> u64 {
+fn summarize_path(
+  path: &Path,
+  seen_inodes: &SeenInodes,
+  seen_dirs: &SeenInodes,
+  follow_symlinks: bool,
+) -> u64 {
   let metadata = match std::fs::symlink_metadata(path) {
-    Ok(metadata) => metadata,
+    Ok(metadata) => match effective_metadata(path, metadata, follow_symlinks) {
+      Some(metadata) => metadata,
+      None => return 0,
+    },
     Err(_) => return 0,
   };
   let own_size = unique_allocated_size(path, &metadata, seen_inodes).unwrap_or(0);
 
   if metadata.is_dir() {
-    own_size + summarize_dir_children(path, seen_inodes)
+    if follow_symlinks && !mark_dir_visited(path, &metadata, seen_dirs) {
+      return 0;
+    }
+    own_size + summarize_dir_children(path, seen_inodes, seen_dirs, follow_symlinks)
   } else {
     own_size
   }
@@ -191,7 +275,12 @@ fn is_gitignored(path: &Path, is_dir: bool, ignore_stack: &[Arc<Gitignore>]) -> 
   ignored
 }
 
-fn summarize_dir_children(path: &Path, seen_inodes: &SeenInodes) -> u64 {
+fn summarize_dir_children(
+  path: &Path,
+  seen_inodes: &SeenInodes,
+  seen_dirs: &SeenInodes,
+  follow_symlinks: bool,
+) -> u64 {
   match std::fs::read_dir(path) {
     Ok(entries) => entries
       .par_bridge()
@@ -199,10 +288,16 @@ fn summarize_dir_children(path: &Path, seen_inodes: &SeenInodes) -> u64 {
         let entry = entry.ok()?;
         let entry_path = entry.path();
         let metadata = std::fs::symlink_metadata(&entry_path).ok()?;
+        let metadata = effective_metadata(&entry_path, metadata, follow_symlinks)?;
         let own_size = unique_allocated_size(&entry_path, &metadata, seen_inodes)?;
 
         if metadata.is_dir() {
-          Some(own_size + summarize_dir_children(&entry_path, seen_inodes))
+          if follow_symlinks && !mark_dir_visited(&entry_path, &metadata, seen_dirs) {
+            return None;
+          }
+          Some(
+            own_size + summarize_dir_children(&entry_path, seen_inodes, seen_dirs, follow_symlinks),
+          )
         } else {
           Some(own_size)
         }

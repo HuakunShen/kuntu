@@ -8,6 +8,7 @@
 
 pub mod clean;
 pub mod cloud;
+pub mod git;
 pub mod scanner;
 pub mod snapshot;
 
@@ -20,4 +21,5 @@ pub use clean::{
   build_removal_plan, delete_path, execute_removal_plan, find_candidates, CandidateOptions,
   CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome, RemovalPlan,
 };
+pub use git::{find_dirty_git_repos, DirtyGitRepo, DirtyGitRepoOptions};
 pub use scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};

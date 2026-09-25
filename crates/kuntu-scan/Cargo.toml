@@ -6,7 +6,7 @@ description = "Fast disk usage scanner, cleanup candidate finder, and cloud evic
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/HuakunShen/kuntu"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
 ignore = "0.4"
