@@ -1,4 +1,7 @@
-use crate::scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};
+use crate::scanner::{
+  effective_metadata, mark_dir_visited, measure_path_inner, new_seen_inodes, scan_directory,
+  IgnoredMode, ScanNode, ScanOptions, SeenInodes,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,10 @@ pub struct CandidateOptions {
   pub roots: Vec<PathBuf>,
   pub presets: Vec<CleanupPreset>,
   pub ignore_hidden: bool,
+  /// Descend into symlinked directories when searching for candidates.
+  /// Off by default so scans do not wander into symlinked external projects.
+  #[serde(default)]
+  pub follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +70,12 @@ impl CandidateOptions {
   }
 }
 
+struct CandidateSpec {
+  dir_name: &'static str,
+  preset: CleanupPreset,
+  reason: &'static str,
+}
+
 pub fn find_candidates(options: CandidateOptions) -> Vec<CleanupCandidate> {
   let mut candidates = Vec::new();
   let mut seen = HashSet::new();
@@ -71,19 +84,23 @@ pub fn find_candidates(options: CandidateOptions) -> Vec<CleanupCandidate> {
     match preset {
       CleanupPreset::Node => find_named_dir_candidates(
         &options.roots,
-        "node_modules",
-        CleanupPreset::Node,
-        "Node dependency directory",
-        options.ignore_hidden,
+        &CandidateSpec {
+          dir_name: "node_modules",
+          preset: CleanupPreset::Node,
+          reason: "Node dependency directory",
+        },
+        &options,
         &mut seen,
         &mut candidates,
       ),
       CleanupPreset::Rust => find_named_dir_candidates(
         &options.roots,
-        "target",
-        CleanupPreset::Rust,
-        "Cargo build output directory",
-        options.ignore_hidden,
+        &CandidateSpec {
+          dir_name: "target",
+          preset: CleanupPreset::Rust,
+          reason: "Cargo build output directory",
+        },
+        &options,
         &mut seen,
         &mut candidates,
       ),
@@ -136,36 +153,26 @@ pub fn execute_removal_plan(plan: &RemovalPlan) -> RemovalOutcome {
 
 fn find_named_dir_candidates(
   roots: &[PathBuf],
-  dir_name: &str,
-  preset: CleanupPreset,
-  reason: &str,
-  ignore_hidden: bool,
+  spec: &CandidateSpec,
+  options: &CandidateOptions,
   seen: &mut HashSet<PathBuf>,
   candidates: &mut Vec<CleanupCandidate>,
 ) {
+  let seen_dirs = new_seen_inodes();
   for root in roots {
-    visit_named_dir_candidate(
-      root,
-      dir_name,
-      preset,
-      reason,
-      ignore_hidden,
-      seen,
-      candidates,
-    );
+    visit_named_dir_candidate(root, spec, options, seen, &seen_dirs, candidates);
   }
 }
 
 fn visit_named_dir_candidate(
   path: &Path,
-  dir_name: &str,
-  preset: CleanupPreset,
-  reason: &str,
-  ignore_hidden: bool,
+  spec: &CandidateSpec,
+  options: &CandidateOptions,
   seen: &mut HashSet<PathBuf>,
+  seen_dirs: &SeenInodes,
   candidates: &mut Vec<CleanupCandidate>,
 ) {
-  if ignore_hidden && is_hidden(path) {
+  if options.ignore_hidden && is_hidden(path) {
     return;
   }
 
@@ -173,13 +180,29 @@ fn visit_named_dir_candidate(
     Ok(metadata) => metadata,
     Err(_) => return,
   };
+  let metadata = match effective_metadata(path, metadata, options.follow_symlinks) {
+    Some(metadata) => metadata,
+    None => return,
+  };
 
   if !metadata.is_dir() {
     return;
   }
 
-  if path.file_name().and_then(|name| name.to_str()) == Some(dir_name) {
-    push_candidate(path, preset, reason, false, seen, candidates);
+  if options.follow_symlinks && !mark_dir_visited(path, &metadata, seen_dirs) {
+    return;
+  }
+
+  if path.file_name().and_then(|name| name.to_str()) == Some(spec.dir_name) {
+    push_candidate(
+      path,
+      spec.preset,
+      spec.reason,
+      false,
+      options,
+      seen,
+      candidates,
+    );
     return;
   }
 
@@ -189,15 +212,7 @@ fn visit_named_dir_candidate(
   };
 
   for entry in entries.flatten() {
-    visit_named_dir_candidate(
-      &entry.path(),
-      dir_name,
-      preset,
-      reason,
-      ignore_hidden,
-      seen,
-      candidates,
-    );
+    visit_named_dir_candidate(&entry.path(), spec, options, seen, seen_dirs, candidates);
   }
 }
 
@@ -212,15 +227,17 @@ fn find_gitignored_candidates(
     full_path: true,
     respect_gitignore: true,
     ignored_mode: IgnoredMode::Summarize,
+    follow_symlinks: options.follow_symlinks,
   });
 
   for tree in trees {
-    collect_ignored_nodes(&tree, seen, candidates);
+    collect_ignored_nodes(&tree, options, seen, candidates);
   }
 }
 
 fn collect_ignored_nodes(
   node: &ScanNode,
+  options: &CandidateOptions,
   seen: &mut HashSet<PathBuf>,
   candidates: &mut Vec<CleanupCandidate>,
 ) {
@@ -230,6 +247,7 @@ fn collect_ignored_nodes(
       CleanupPreset::Gitignored,
       "Path matched by .gitignore",
       true,
+      options,
       seen,
       candidates,
     );
@@ -237,7 +255,7 @@ fn collect_ignored_nodes(
   }
 
   for child in &node.children {
-    collect_ignored_nodes(child, seen, candidates);
+    collect_ignored_nodes(child, options, seen, candidates);
   }
 }
 
@@ -246,6 +264,7 @@ fn push_candidate(
   preset: CleanupPreset,
   reason: &str,
   ignored: bool,
+  options: &CandidateOptions,
   seen: &mut HashSet<PathBuf>,
   candidates: &mut Vec<CleanupCandidate>,
 ) {
@@ -254,8 +273,9 @@ fn push_candidate(
     return;
   }
 
+  let size = measure_path_inner(path.as_path(), options.follow_symlinks);
   candidates.push(CleanupCandidate {
-    size: measure_path(&path),
+    size,
     path,
     reason: reason.to_string(),
     preset,
@@ -309,6 +329,7 @@ mod tests {
       roots: vec![root.join("app")],
       presets: vec![],
       ignore_hidden: false,
+      follow_symlinks: false,
     });
 
     assert!(candidates
@@ -341,6 +362,7 @@ mod tests {
       roots: vec![root.clone()],
       presets: vec![CleanupPreset::Node],
       ignore_hidden: false,
+      follow_symlinks: false,
     });
     let plan = build_removal_plan(candidates);
 
@@ -365,6 +387,65 @@ mod tests {
     delete_path(&root.join("folder")).unwrap();
 
     assert!(!root.join("folder").exists());
+    remove_dir_all(root).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn symlinked_projects_are_skipped_unless_follow_symlinks_is_set() {
+    use std::os::unix::fs::symlink;
+
+    // The linked project lives OUTSIDE the scan root, like a vendored
+    // reference checkout.
+    let base = fixture("symlinks");
+    let store = base.join("store");
+    let root = base.join("root");
+    create_dir_all(store.join("real/node_modules/leftover")).unwrap();
+    create_dir_all(root.join("links")).unwrap();
+    write(store.join("real/package.json"), "{}").unwrap();
+    write(store.join("real/node_modules/leftover/index.js"), "x\n").unwrap();
+    symlink(store.join("real"), root.join("links/project")).unwrap();
+
+    let skipped = find_candidates(CandidateOptions {
+      roots: vec![root.clone()],
+      presets: vec![CleanupPreset::Node],
+      ignore_hidden: false,
+      follow_symlinks: false,
+    });
+    assert!(skipped.is_empty());
+
+    let followed = find_candidates(CandidateOptions {
+      roots: vec![root.clone()],
+      presets: vec![CleanupPreset::Node],
+      ignore_hidden: false,
+      follow_symlinks: true,
+    });
+    assert_eq!(followed.len(), 1);
+    assert!(followed[0].path.starts_with(root.join("links")));
+    assert!(followed[0].path.ends_with("node_modules"));
+
+    remove_dir_all(base).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn symlink_cycles_do_not_hang_the_candidate_walk() {
+    use std::os::unix::fs::symlink;
+
+    let root = fixture("cycle");
+    create_dir_all(root.join("app/node_modules/pkg")).unwrap();
+    symlink(root.join("app"), root.join("app/loop")).unwrap();
+
+    let candidates = find_candidates(CandidateOptions {
+      roots: vec![root.join("app")],
+      presets: vec![CleanupPreset::Node],
+      ignore_hidden: false,
+      follow_symlinks: true,
+    });
+
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].path.ends_with("node_modules"));
+
     remove_dir_all(root).unwrap();
   }
 
