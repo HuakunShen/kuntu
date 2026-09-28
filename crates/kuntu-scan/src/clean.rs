@@ -1,4 +1,4 @@
-use crate::scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};
+use crate::scanner::{IgnoredMode, ScanNode, ScanOptions, measure_path, scan_directory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -311,18 +311,26 @@ mod tests {
       ignore_hidden: false,
     });
 
-    assert!(candidates
-      .iter()
-      .any(|candidate| candidate.path.ends_with("node_modules")));
-    assert!(candidates
-      .iter()
-      .any(|candidate| candidate.path.ends_with("target")));
-    assert!(candidates
-      .iter()
-      .any(|candidate| candidate.path.ends_with("ignored")));
-    assert!(candidates
-      .iter()
-      .any(|candidate| candidate.path.ends_with("debug.log")));
+    assert!(
+      candidates
+        .iter()
+        .any(|candidate| candidate.path.ends_with("node_modules"))
+    );
+    assert!(
+      candidates
+        .iter()
+        .any(|candidate| candidate.path.ends_with("target"))
+    );
+    assert!(
+      candidates
+        .iter()
+        .any(|candidate| candidate.path.ends_with("ignored"))
+    );
+    assert!(
+      candidates
+        .iter()
+        .any(|candidate| candidate.path.ends_with("debug.log"))
+    );
 
     remove_dir_all(root).unwrap();
   }

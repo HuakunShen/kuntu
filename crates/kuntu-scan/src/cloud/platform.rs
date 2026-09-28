@@ -43,16 +43,17 @@ mod macos {
   };
   use super::super::policy::eviction_skip_reason;
   use super::{CloudBackend, NativeICloudBackend};
-  use objc2::rc::{autoreleasepool, Retained};
+  use objc2::rc::{Retained, autoreleasepool};
   use objc2::runtime::AnyObject;
   use objc2_foundation::{
-    NSArray, NSDictionary, NSError, NSFileManager, NSNumber, NSString, NSURLFileAllocatedSizeKey,
-    NSURLIsPackageKey, NSURLTotalFileAllocatedSizeKey, NSURLUbiquitousItemDownloadingErrorKey,
-    NSURLUbiquitousItemDownloadingStatusCurrent, NSURLUbiquitousItemDownloadingStatusDownloaded,
-    NSURLUbiquitousItemDownloadingStatusKey, NSURLUbiquitousItemDownloadingStatusNotDownloaded,
+    NSArray, NSDictionary, NSError, NSFileManager, NSNumber, NSString, NSURL,
+    NSURLFileAllocatedSizeKey, NSURLIsPackageKey, NSURLTotalFileAllocatedSizeKey,
+    NSURLUbiquitousItemDownloadingErrorKey, NSURLUbiquitousItemDownloadingStatusCurrent,
+    NSURLUbiquitousItemDownloadingStatusDownloaded, NSURLUbiquitousItemDownloadingStatusKey,
+    NSURLUbiquitousItemDownloadingStatusNotDownloaded,
     NSURLUbiquitousItemHasUnresolvedConflictsKey, NSURLUbiquitousItemIsDownloadingKey,
     NSURLUbiquitousItemIsUploadedKey, NSURLUbiquitousItemIsUploadingKey,
-    NSURLUbiquitousItemUploadingErrorKey, NSURL,
+    NSURLUbiquitousItemUploadingErrorKey,
   };
   use std::path::Path;
 

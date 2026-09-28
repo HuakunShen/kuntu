@@ -3,13 +3,13 @@ use super::model::{
   Bytes, CloudError, DownloadState, ErrorKind, Fingerprint, ItemInfo, ItemKind, Result,
 };
 use super::platform::CloudBackend;
-use super::policy::{eviction_skip_reason, SkipReason};
+use super::policy::{SkipReason, eviction_skip_reason};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
@@ -23,6 +23,15 @@ pub struct ScanOptions {
   pub max_entries: usize,
   pub max_depth: usize,
   pub max_time: Duration,
+}
+
+/// Additional memory/candidate bounds for callers that retain eviction plans
+/// in a long-lived service. The legacy builder remains unbounded by this type
+/// so standalone Kuntu callers keep their existing policy.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanBudget {
+  pub max_candidates: usize,
+  pub max_staged_bytes: usize,
 }
 
 impl Default for ScanOptions {
@@ -179,6 +188,13 @@ impl EvictionProgressState {
   }
 
   fn begin(&self, total: usize) {
+    // Xross publishes this state to the control map before the blocking worker
+    // starts. In that path `prepare` has already opened the run, and a control
+    // request may have arrived while the worker was queued. Do not clear such
+    // a request when the executor reaches its own begin call.
+    if self.running.load(Ordering::Acquire) {
+      return;
+    }
     self.total.store(total, Ordering::Release);
     self.processed.store(0, Ordering::Release);
     self.evicted.store(0, Ordering::Release);
@@ -188,6 +204,12 @@ impl EvictionProgressState {
     self.paused.store(false, Ordering::Release);
     self.cancelled.store(false, Ordering::Release);
     self.running.store(true, Ordering::Release);
+  }
+
+  /// Starts progress tracking before publishing the state to controls.
+  /// The executor's later begin call is idempotent while this run is active.
+  pub fn prepare(&self, total: usize) {
+    self.begin(total);
   }
 
   fn finish(&self) {
@@ -234,6 +256,33 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
   selected_root: &Path,
   options: ScanOptions,
 ) -> Result<EvictionPlan> {
+  build_eviction_plan_inner(backend, selected_root, options, None)
+}
+
+/// Builds an eviction plan while bounding candidate count and the estimated
+/// bytes retained by pending paths and plan-owned path data. A hit marks the
+/// result incomplete; callers must not present it as an executable plan.
+pub fn build_eviction_plan_bounded<B: CloudBackend + ?Sized>(
+  backend: &B,
+  selected_root: &Path,
+  options: ScanOptions,
+  budget: PlanBudget,
+) -> Result<EvictionPlan> {
+  if budget.max_candidates == 0 || budget.max_staged_bytes == 0 {
+    return Err(CloudError::new(
+      ErrorKind::InvalidState,
+      "plan budget limits must be positive",
+    ));
+  }
+  build_eviction_plan_inner(backend, selected_root, options, Some(budget))
+}
+
+fn build_eviction_plan_inner<B: CloudBackend + ?Sized>(
+  backend: &B,
+  selected_root: &Path,
+  options: ScanOptions,
+  budget: Option<PlanBudget>,
+) -> Result<EvictionPlan> {
   if options.max_entries == 0 || options.max_depth == 0 || options.max_time.is_zero() {
     return Err(CloudError::new(
       ErrorKind::InvalidState,
@@ -263,18 +312,40 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
     visited_entries: 0,
     notes_total: 0,
   };
+  let mut staged_bytes = path_storage_bytes(&root).saturating_mul(2);
+  if budget.is_some_and(|budget| staged_bytes > budget.max_staged_bytes) {
+    return Err(CloudError::new(
+      ErrorKind::InvalidState,
+      "selected root exceeds the plan memory budget",
+    ));
+  }
   let mut pending = vec![(root, 0_usize)];
   let mut seen_identities = HashSet::new();
 
-  while let Some((path, depth)) = pending.pop() {
+  'walk: while let Some((path, depth)) = pending.pop() {
+    if budget.is_some() {
+      staged_bytes = staged_bytes.saturating_sub(path_storage_bytes(&path));
+    }
     if started.elapsed() >= options.max_time {
       plan.coverage_complete = false;
-      add_note(&mut plan, &path, "scan time budget exceeded");
+      add_note(
+        &mut plan,
+        &path,
+        "scan time budget exceeded",
+        &mut staged_bytes,
+        budget,
+      );
       break;
     }
     if plan.visited_entries >= options.max_entries || depth > options.max_depth {
       plan.coverage_complete = false;
-      add_note(&mut plan, &path, "scan entry or depth budget exceeded");
+      add_note(
+        &mut plan,
+        &path,
+        "scan entry or depth budget exceeded",
+        &mut staged_bytes,
+        budget,
+      );
       break;
     }
 
@@ -285,7 +356,15 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
       Ok(info) => info,
       Err(error) => {
         plan.coverage_complete = false;
-        add_note(&mut plan, &path, error.to_string());
+        if !add_note(
+          &mut plan,
+          &path,
+          error.to_string(),
+          &mut staged_bytes,
+          budget,
+        ) {
+          break 'walk;
+        }
         continue;
       }
     };
@@ -293,6 +372,10 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
     if info.kind() == ItemKind::Directory {
       match info.is_package {
         Some(true) => {
+          if !stage_path(&mut staged_bytes, &path, budget) {
+            plan.coverage_complete = false;
+            break 'walk;
+          }
           plan.skipped.push(SkippedItem {
             path,
             reason: SkipReason::Package.to_string(),
@@ -300,6 +383,10 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
           continue;
         }
         None => {
+          if !stage_path(&mut staged_bytes, &path, budget) {
+            plan.coverage_complete = false;
+            break 'walk;
+          }
           plan.skipped.push(SkippedItem {
             path,
             reason: SkipReason::UnknownPackageState.to_string(),
@@ -313,28 +400,61 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
         Ok(entries) => entries,
         Err(error) => {
           plan.coverage_complete = false;
-          add_note(&mut plan, &path, error.to_string());
+          if !add_note(
+            &mut plan,
+            &path,
+            error.to_string(),
+            &mut staged_bytes,
+            budget,
+          ) {
+            break 'walk;
+          }
           continue;
         }
       };
 
       let mut children = Vec::new();
+      let mut staging_limit_hit = false;
       for entry in entries {
         match entry {
-          Ok(entry) => children.push(entry.path()),
+          Ok(entry) => {
+            let child = entry.path();
+            if !stage_path(&mut staged_bytes, &child, budget) {
+              plan.coverage_complete = false;
+              staging_limit_hit = true;
+              break;
+            }
+            children.push(child);
+          }
           Err(error) => {
             plan.coverage_complete = false;
-            add_note(&mut plan, &path, error.to_string());
+            if !add_note(
+              &mut plan,
+              &path,
+              error.to_string(),
+              &mut staged_bytes,
+              budget,
+            ) {
+              staging_limit_hit = true;
+              break;
+            }
           }
         }
       }
       children.sort();
       pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
+      if staging_limit_hit {
+        break 'walk;
+      }
       continue;
     }
 
     if let Some(reason) = eviction_skip_reason(&info) {
       if info.download_state == DownloadState::CloudOnly {
+        if !stage_path(&mut staged_bytes, &path, budget) {
+          plan.coverage_complete = false;
+          break 'walk;
+        }
         plan.cloud_only.push(ItemSummary {
           path,
           logical_bytes: info.logical_bytes(),
@@ -343,6 +463,10 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
           reason: Some(reason.to_string()),
         });
       } else {
+        if !stage_path(&mut staged_bytes, &path, budget) {
+          plan.coverage_complete = false;
+          break 'walk;
+        }
         plan.skipped.push(SkippedItem {
           path,
           reason: reason.to_string(),
@@ -353,6 +477,10 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
 
     let identity = (info.fingerprint.device, info.fingerprint.inode);
     if identity != (0, 0) && !seen_identities.insert(identity) {
+      if !stage_path(&mut staged_bytes, &path, budget) {
+        plan.coverage_complete = false;
+        break 'walk;
+      }
       plan.skipped.push(SkippedItem {
         path,
         reason: SkipReason::HardLinked.to_string(),
@@ -361,6 +489,10 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
     }
 
     let Some(allocated_bytes) = info.allocated_bytes else {
+      if !stage_path(&mut staged_bytes, &path, budget) {
+        plan.coverage_complete = false;
+        break 'walk;
+      }
       plan.skipped.push(SkippedItem {
         path,
         reason: SkipReason::UnknownLocalAllocation.to_string(),
@@ -368,6 +500,14 @@ pub fn build_eviction_plan<B: CloudBackend + ?Sized>(
       continue;
     };
 
+    if budget.is_some_and(|budget| plan.candidates.len() >= budget.max_candidates) {
+      plan.coverage_complete = false;
+      break 'walk;
+    }
+    if !stage_path(&mut staged_bytes, &path, budget) {
+      plan.coverage_complete = false;
+      break 'walk;
+    }
     plan.candidates.push(EvictionCandidate {
       path,
       logical_bytes: info.logical_bytes(),
@@ -401,6 +541,26 @@ pub fn execute_eviction_plan_with_state<B: CloudBackend + ?Sized>(
   max_concurrency: usize,
   state: &EvictionProgressState,
 ) -> Result<EvictionOutcome> {
+  execute_eviction_plan_with_state_and_observer(
+    backend,
+    plan,
+    max_concurrency,
+    state,
+    &|_| Ok(()),
+    &|_, _| Ok(()),
+  )
+}
+
+/// Calls `on_started` durably before a native action and `on_result` after it.
+/// Observer failures cancel admission of further work and fail the entire run.
+pub fn execute_eviction_plan_with_state_and_observer<B: CloudBackend + ?Sized>(
+  backend: &B,
+  plan: &EvictionPlan,
+  max_concurrency: usize,
+  state: &EvictionProgressState,
+  on_started: &(dyn Fn(usize) -> Result<()> + Sync),
+  on_result: &(dyn Fn(usize, &EvictionResult) -> Result<()> + Sync),
+) -> Result<EvictionOutcome> {
   // A plan may be partial when traversal hits a time, depth, entry, or
   // metadata-read boundary. Every candidate is still revalidated immediately
   // before eviction, so executing a partial plan only touches items already
@@ -415,26 +575,58 @@ pub fn execute_eviction_plan_with_state<B: CloudBackend + ?Sized>(
       .map(|_| None)
       .collect::<Vec<Option<EvictionResult>>>(),
   );
+  let observer_error = Mutex::new(None);
 
   std::thread::scope(|scope| {
     for _ in 0..worker_count {
-      scope.spawn(|| loop {
-        if !state.wait_if_paused() {
-          break;
-        }
-        let index = next_index.fetch_add(1, Ordering::Relaxed);
-        if index >= plan.candidates.len() {
-          break;
-        }
+      scope.spawn(|| {
+        loop {
+          if !state.wait_if_paused() {
+            break;
+          }
+          let index = next_index.fetch_add(1, Ordering::Relaxed);
+          if index >= plan.candidates.len() {
+            break;
+          }
 
-        state.active.fetch_add(1, Ordering::AcqRel);
-        let result = execute_eviction_candidate(backend, &plan.candidates[index]);
-        state.active.fetch_sub(1, Ordering::AcqRel);
-        state.record(&result);
-        results.lock().expect("eviction result mutex poisoned")[index] = Some(result);
+          if let Err(error) = on_started(index) {
+            state.cancel();
+            let mut slot = observer_error
+              .lock()
+              .expect("observer error mutex poisoned");
+            if slot.is_none() {
+              *slot = Some(error);
+            }
+            break;
+          }
+
+          state.active.fetch_add(1, Ordering::AcqRel);
+          let result = execute_eviction_candidate(backend, &plan.candidates[index]);
+          state.active.fetch_sub(1, Ordering::AcqRel);
+          if let Err(error) = on_result(index, &result) {
+            state.cancel();
+            let mut slot = observer_error
+              .lock()
+              .expect("observer error mutex poisoned");
+            if slot.is_none() {
+              *slot = Some(error);
+            }
+            break;
+          }
+          state.record(&result);
+          results.lock().expect("eviction result mutex poisoned")[index] = Some(result);
+        }
       });
     }
   });
+
+  if let Some(error) = observer_error
+    .into_inner()
+    .map_err(|_| CloudError::new(ErrorKind::InvalidState, "observer error mutex poisoned"))?
+  {
+    state.finish();
+    return Err(error);
+  }
 
   let cancelled = state.cancelled.load(Ordering::Acquire);
   state.finish();
@@ -532,10 +724,40 @@ pub fn request_download_one<B: CloudBackend + ?Sized>(backend: &B, path: &Path) 
   backend.request_download(path, &info.fingerprint)
 }
 
-fn add_note(plan: &mut EvictionPlan, path: &Path, message: impl Into<String>) {
+fn path_storage_bytes(path: &Path) -> usize {
+  // Covers path bytes, PathBuf/Vec bookkeeping, allocator slack, and per-entry
+  // metadata in the pending stack or plan vectors.
+  path.as_os_str().len().saturating_add(256)
+}
+
+fn stage_path(staged_bytes: &mut usize, path: &Path, budget: Option<PlanBudget>) -> bool {
+  let Some(budget) = budget else {
+    return true;
+  };
+  let Some(next) = staged_bytes.checked_add(path_storage_bytes(path)) else {
+    return false;
+  };
+  if next > budget.max_staged_bytes {
+    return false;
+  }
+  *staged_bytes = next;
+  true
+}
+
+fn add_note(
+  plan: &mut EvictionPlan,
+  path: &Path,
+  message: impl Into<String>,
+  staged_bytes: &mut usize,
+  budget: Option<PlanBudget>,
+) -> bool {
+  if !stage_path(staged_bytes, path, budget) {
+    return false;
+  }
   plan.notes_total += 1;
   plan.skipped.push(SkippedItem {
     path: path.to_path_buf(),
     reason: message.into(),
   });
+  true
 }

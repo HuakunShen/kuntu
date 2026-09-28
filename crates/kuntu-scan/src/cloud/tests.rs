@@ -1,18 +1,123 @@
 use super::engine::{
-  build_eviction_plan, execute_eviction_plan, execute_eviction_plan_with_state,
-  EvictionProgressState, EvictionStatus, ScanOptions,
+  EvictionCandidate, EvictionPlan, EvictionProgressState, EvictionStatus, PlanBudget, ScanOptions,
+  build_eviction_plan, build_eviction_plan_bounded, execute_eviction_plan,
+  execute_eviction_plan_with_state, execute_eviction_plan_with_state_and_observer,
 };
 use super::guard::{absolute_path, ensure_within_scope, fingerprint_for_path};
 use super::model::{Bytes, DownloadState, Fingerprint, ItemInfo, ItemKind};
 use super::model::{CloudError, ErrorKind};
 use super::platform::CloudBackend;
-use super::policy::{eviction_skip_reason, SkipReason};
+use super::policy::{SkipReason, eviction_skip_reason};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+fn observer_fixture() -> (FakeBackend, EvictionPlan) {
+  let root = PathBuf::from("/tmp/kuntu-observer-fixture");
+  let mut items = HashMap::new();
+  let mut candidates = Vec::new();
+  for index in 0..2 {
+    let path = root.join(format!("item-{index}"));
+    let mut info = item(
+      ItemKind::RegularFile,
+      DownloadState::LocalCurrent,
+      Some(4096),
+      true,
+      Some(false),
+      Some(true),
+      Some(false),
+      Some(false),
+      Some(false),
+      1,
+    );
+    info.fingerprint.inode += index;
+    candidates.push(EvictionCandidate {
+      path: path.clone(),
+      logical_bytes: Bytes(4096),
+      allocated_bytes: Bytes(4096),
+      fingerprint: info.fingerprint.clone(),
+    });
+    items.insert(path, info);
+  }
+  (
+    FakeBackend::new(items),
+    EvictionPlan {
+      root,
+      candidates,
+      cloud_only: Vec::new(),
+      skipped: Vec::new(),
+      coverage_complete: true,
+      visited_entries: 2,
+      notes_total: 0,
+    },
+  )
+}
+
+#[test]
+fn observer_start_failure_admits_no_backend_effect() {
+  let (backend, plan) = observer_fixture();
+  let state = EvictionProgressState::new();
+  let result = execute_eviction_plan_with_state_and_observer(
+    &backend,
+    &plan,
+    1,
+    &state,
+    &|_| {
+      Err(CloudError::new(
+        ErrorKind::Io,
+        "durable pre-action write failed",
+      ))
+    },
+    &|_, _| Ok(()),
+  );
+  assert!(result.is_err());
+  assert!(backend.evicted.lock().unwrap().is_empty());
+  assert_eq!(state.snapshot().processed, 0);
+}
+
+#[test]
+fn cancellation_after_prepare_is_not_cleared_when_worker_starts() {
+  let (backend, plan) = observer_fixture();
+  let state = EvictionProgressState::new();
+  state.prepare(plan.candidates.len());
+  state.cancel();
+
+  let outcome = execute_eviction_plan_with_state(&backend, &plan, 1, &state).unwrap();
+
+  assert!(outcome.cancelled);
+  assert!(backend.evicted.lock().unwrap().is_empty());
+  assert!(state.snapshot().cancelled);
+}
+
+#[test]
+fn observer_result_failure_stops_before_next_candidate() {
+  let (backend, plan) = observer_fixture();
+  let state = EvictionProgressState::new();
+  let started = AtomicUsize::new(0);
+  let result = execute_eviction_plan_with_state_and_observer(
+    &backend,
+    &plan,
+    1,
+    &state,
+    &|_| {
+      started.fetch_add(1, Ordering::SeqCst);
+      Ok(())
+    },
+    &|_, _| {
+      Err(CloudError::new(
+        ErrorKind::Io,
+        "durable post-action write failed",
+      ))
+    },
+  );
+  assert!(result.is_err());
+  assert_eq!(started.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.evicted.lock().unwrap().len(), 1);
+  assert_eq!(state.snapshot().processed, 0);
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -355,6 +460,101 @@ impl CloudBackend for SlowBackend {
 fn fixture_info(path: &std::path::Path, mut info: ItemInfo) -> ItemInfo {
   info.fingerprint = fingerprint_for_path(path).unwrap();
   info
+}
+
+fn bounded_fixture(label: &str, count: usize) -> (PathBuf, FakeBackend) {
+  let nonce = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_nanos();
+  let root = std::env::temp_dir().join(format!("kuntu-{label}-{}-{nonce}", std::process::id()));
+  create_dir_all(&root).unwrap();
+  let mut items = HashMap::new();
+  items.insert(
+    root.clone(),
+    fixture_info(
+      &root,
+      item(
+        ItemKind::Directory,
+        DownloadState::LocalCurrent,
+        Some(4096),
+        true,
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+        Some(false),
+        1,
+      ),
+    ),
+  );
+  for index in 0..count {
+    let path = root.join(format!("entry-{index:05}.txt"));
+    write(&path, b"eligible local iCloud item").unwrap();
+    items.insert(
+      path.clone(),
+      fixture_info(
+        &path,
+        item(
+          ItemKind::RegularFile,
+          DownloadState::LocalCurrent,
+          Some(4096),
+          true,
+          Some(false),
+          Some(true),
+          Some(false),
+          Some(false),
+          Some(false),
+          1,
+        ),
+      ),
+    );
+  }
+  (root, FakeBackend::new(items))
+}
+
+#[test]
+fn bounded_plan_refuses_to_claim_complete_after_candidate_limit() {
+  let (root, backend) = bounded_fixture("candidate-cap", 8);
+  let plan = build_eviction_plan_bounded(
+    &backend,
+    &root,
+    ScanOptions::default(),
+    PlanBudget {
+      max_candidates: 2,
+      max_staged_bytes: 1024 * 1024,
+    },
+  )
+  .unwrap();
+
+  assert_eq!(plan.candidates.len(), 2);
+  assert!(!plan.coverage_complete);
+  std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bounded_plan_stops_staging_a_wide_directory_at_its_memory_budget() {
+  let (root, backend) = bounded_fixture("wide-cap", 128);
+  let first_child = root.join("entry-00000.txt");
+  let max_staged_bytes = (root.as_os_str().len() + 256) * 2 + first_child.as_os_str().len() + 256;
+  let plan = build_eviction_plan_bounded(
+    &backend,
+    &root,
+    ScanOptions::default(),
+    PlanBudget {
+      max_candidates: 10_000,
+      max_staged_bytes,
+    },
+  )
+  .unwrap();
+
+  assert_eq!(
+    plan.visited_entries, 1,
+    "children were not all materialized"
+  );
+  assert!(plan.candidates.is_empty());
+  assert!(!plan.coverage_complete);
+  std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

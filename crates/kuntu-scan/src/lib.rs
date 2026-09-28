@@ -17,10 +17,11 @@ pub use snapshot::{
 };
 
 pub use clean::{
-  build_removal_plan, delete_path, execute_removal_plan, find_candidates, CandidateOptions,
-  CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome, RemovalPlan,
+  CandidateOptions, CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome, RemovalPlan,
+  build_removal_plan, delete_path, execute_removal_plan, find_candidates,
 };
 pub use scanner::{
-  measure_path, scan_directory, scan_directory_cooperative, IgnoredMode, ScanControl, ScanError,
-  ScanNode, ScanOptions, ScanOutcome, ScanProgress,
+  BoundedScanOutcome, IgnoredMode, ScanBudget, ScanControl, ScanError, ScanNode, ScanOptions,
+  ScanOutcome, ScanProgress, measure_path, scan_directory, scan_directory_cooperative,
+  scan_directory_cooperative_bounded,
 };

@@ -42,6 +42,13 @@ pub struct ScanControl {
   admitted: Arc<AtomicU64>,
   completed: Arc<AtomicU64>,
   bytes: Arc<AtomicU64>,
+  budget_exhausted: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScanBudget {
+  pub max_admitted_nodes: u64,
+  pub max_estimated_bytes: u64,
 }
 
 impl ScanControl {
@@ -139,6 +146,72 @@ pub enum ScanOutcome {
   Failed(ScanError),
 }
 
+/// Result of the additive bounded API. Kept separate so adding bounded-scan
+/// outcomes does not break exhaustive matches on the established
+/// `ScanOutcome` used by standalone callers.
+#[derive(Debug)]
+pub enum BoundedScanOutcome {
+  Completed {
+    roots: Vec<ScanNode>,
+    progress: ScanProgress,
+  },
+  Cancelled {
+    progress: ScanProgress,
+  },
+  Deadline {
+    progress: ScanProgress,
+  },
+  BudgetExceeded {
+    progress: ScanProgress,
+  },
+  Failed(ScanError),
+}
+
+enum ScanTraversalOutcome {
+  Completed {
+    roots: Vec<ScanNode>,
+    progress: ScanProgress,
+  },
+  Cancelled {
+    progress: ScanProgress,
+  },
+  Deadline {
+    progress: ScanProgress,
+  },
+  BudgetExceeded {
+    progress: ScanProgress,
+  },
+  Failed(ScanError),
+}
+
+impl From<ScanTraversalOutcome> for ScanOutcome {
+  fn from(outcome: ScanTraversalOutcome) -> Self {
+    match outcome {
+      ScanTraversalOutcome::Completed { roots, progress } => Self::Completed { roots, progress },
+      ScanTraversalOutcome::Cancelled { progress } => Self::Cancelled { progress },
+      ScanTraversalOutcome::Deadline { progress } => Self::Deadline { progress },
+      // The legacy entry point supplies no node/byte budget, so this is only
+      // a defensive mapping if a future traversal source adds one internally.
+      ScanTraversalOutcome::BudgetExceeded { .. } => Self::Failed(ScanError {
+        message: "unbounded scan unexpectedly exceeded a budget".into(),
+      }),
+      ScanTraversalOutcome::Failed(error) => Self::Failed(error),
+    }
+  }
+}
+
+impl From<ScanTraversalOutcome> for BoundedScanOutcome {
+  fn from(outcome: ScanTraversalOutcome) -> Self {
+    match outcome {
+      ScanTraversalOutcome::Completed { roots, progress } => Self::Completed { roots, progress },
+      ScanTraversalOutcome::Cancelled { progress } => Self::Cancelled { progress },
+      ScanTraversalOutcome::Deadline { progress } => Self::Deadline { progress },
+      ScanTraversalOutcome::BudgetExceeded { progress } => Self::BudgetExceeded { progress },
+      ScanTraversalOutcome::Failed(error) => Self::Failed(error),
+    }
+  }
+}
+
 type IgnoreStack = Vec<Arc<Gitignore>>;
 type SeenInodes = Arc<Mutex<HashSet<(u64, u64)>>>;
 
@@ -168,8 +241,22 @@ impl TraversalHook for NoopTraversalHook {}
 
 struct WalkContext<'a> {
   control: &'a ScanControl,
+  budget: Option<ScanBudget>,
+  estimated_bytes: AtomicU64,
+  staged_bytes: AtomicU64,
   deadline: Option<Instant>,
   hook: Arc<dyn TraversalHook>,
+}
+
+struct StageGuard<'a> {
+  staged_bytes: &'a AtomicU64,
+  bytes: u64,
+}
+
+impl Drop for StageGuard<'_> {
+  fn drop(&mut self) {
+    self.staged_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -182,22 +269,102 @@ struct NodeState {
 impl WalkContext<'_> {
   fn should_stop(&self) -> bool {
     self.control.is_cancelled()
+      || self.control.budget_exhausted.load(Ordering::Acquire)
       || self
         .deadline
         .is_some_and(|deadline| self.hook.deadline_reached(deadline))
   }
 
-  fn stopped_outcome(&self) -> ScanOutcome {
+  fn stopped_outcome(&self) -> ScanTraversalOutcome {
     let progress = self.control.progress();
-    if self.control.is_cancelled() {
-      ScanOutcome::Cancelled { progress }
+    if self.control.budget_exhausted.load(Ordering::Acquire) {
+      ScanTraversalOutcome::BudgetExceeded { progress }
+    } else if self.control.is_cancelled() {
+      ScanTraversalOutcome::Cancelled { progress }
     } else {
-      ScanOutcome::Deadline { progress }
+      ScanTraversalOutcome::Deadline { progress }
     }
   }
 
-  fn admit(&self) {
-    ScanControl::increment(&self.control.admitted);
+  fn admit(&self, path: &Path) -> bool {
+    let estimate = (path.as_os_str().len() as u64).saturating_add(256);
+    if let Some(budget) = self.budget {
+      if self
+        .estimated_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+          value
+            .checked_add(estimate)
+            .filter(|next| *next <= budget.max_estimated_bytes)
+        })
+        .is_err()
+      {
+        self.control.budget_exhausted.store(true, Ordering::Release);
+        return false;
+      }
+      if self
+        .control
+        .admitted
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+          value
+            .checked_add(1)
+            .filter(|next| *next <= budget.max_admitted_nodes)
+        })
+        .is_err()
+      {
+        self.control.budget_exhausted.store(true, Ordering::Release);
+        return false;
+      }
+    } else {
+      ScanControl::increment(&self.control.admitted);
+    }
+    true
+  }
+
+  fn remaining_entries(&self) -> Option<usize> {
+    self.budget.map(|budget| {
+      budget
+        .max_admitted_nodes
+        .saturating_sub(self.control.admitted.load(Ordering::Acquire))
+        .min(usize::MAX as u64) as usize
+    })
+  }
+
+  fn stage_entries(
+    &self,
+    entries: std::fs::ReadDir,
+  ) -> Option<(Vec<std::io::Result<std::fs::DirEntry>>, StageGuard<'_>)> {
+    let mut staged = Vec::new();
+    let mut guard = StageGuard {
+      staged_bytes: &self.staged_bytes,
+      bytes: 0,
+    };
+    let remaining = self.remaining_entries();
+    for entry in entries {
+      if remaining.is_some_and(|n| staged.len() >= n) {
+        self.control.budget_exhausted.store(true, Ordering::Release);
+        return None;
+      }
+      let estimate = entry.as_ref().map_or(256, |item| {
+        (item.path().as_os_str().len() as u64).saturating_add(256)
+      });
+      if let Some(budget) = self.budget {
+        if self
+          .staged_bytes
+          .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value
+              .checked_add(estimate)
+              .filter(|next| *next <= budget.max_estimated_bytes)
+          })
+          .is_err()
+        {
+          self.control.budget_exhausted.store(true, Ordering::Release);
+          return None;
+        }
+        guard.bytes = guard.bytes.saturating_add(estimate);
+      }
+      staged.push(entry);
+    }
+    Some((staged, guard))
   }
 
   fn visit(&self) {
@@ -223,7 +390,32 @@ pub fn scan_directory_cooperative(
   control: ScanControl,
   deadline: Option<Instant>,
 ) -> ScanOutcome {
-  scan_directory_cooperative_inner(options, control, deadline, Arc::new(NoopTraversalHook))
+  scan_directory_cooperative_inner(
+    options,
+    control,
+    deadline,
+    None,
+    Arc::new(NoopTraversalHook),
+  )
+  .into()
+}
+
+/// Rejects an incomplete traversal before exposing a tree. Admission and estimated
+/// retained-node bytes are charged atomically before recursive work starts.
+pub fn scan_directory_cooperative_bounded(
+  options: ScanOptions,
+  control: ScanControl,
+  deadline: Option<Instant>,
+  budget: ScanBudget,
+) -> BoundedScanOutcome {
+  scan_directory_cooperative_inner(
+    options,
+    control,
+    deadline,
+    Some(budget),
+    Arc::new(NoopTraversalHook),
+  )
+  .into()
 }
 
 #[cfg(test)]
@@ -233,18 +425,22 @@ fn scan_directory_cooperative_with_hook(
   deadline: Option<Instant>,
   hook: Arc<dyn TraversalHook>,
 ) -> ScanOutcome {
-  scan_directory_cooperative_inner(options, control, deadline, hook)
+  scan_directory_cooperative_inner(options, control, deadline, None, hook).into()
 }
 
 fn scan_directory_cooperative_inner(
   options: ScanOptions,
   control: ScanControl,
   deadline: Option<Instant>,
+  budget: Option<ScanBudget>,
   hook: Arc<dyn TraversalHook>,
-) -> ScanOutcome {
+) -> ScanTraversalOutcome {
   let seen_inodes = Arc::new(Mutex::new(HashSet::new()));
   let context = WalkContext {
     control: &control,
+    budget,
+    estimated_bytes: AtomicU64::new(0),
+    staged_bytes: AtomicU64::new(0),
     deadline,
     hook,
   };
@@ -254,7 +450,9 @@ fn scan_directory_cooperative_inner(
     if context.should_stop() {
       return context.stopped_outcome();
     }
-    context.admit();
+    if !context.admit(directory) {
+      return context.stopped_outcome();
+    }
     match scan_path(
       directory,
       &[],
@@ -270,11 +468,11 @@ fn scan_directory_cooperative_inner(
       WalkOutcome::Completed(root) => roots.push(root),
       WalkOutcome::Skipped => {}
       WalkOutcome::Cancelled => return context.stopped_outcome(),
-      WalkOutcome::Failed(error) => return ScanOutcome::Failed(error),
+      WalkOutcome::Failed(error) => return ScanTraversalOutcome::Failed(error),
     }
   }
 
-  ScanOutcome::Completed {
+  ScanTraversalOutcome::Completed {
     roots,
     progress: control.progress(),
   }
@@ -366,7 +564,9 @@ fn scan_path(
 
   let children = match std::fs::read_dir(path) {
     Ok(entries) => {
-      let entries = entries.collect::<Vec<_>>();
+      let Some((entries, _staging)) = context.stage_entries(entries) else {
+        return WalkOutcome::Cancelled;
+      };
       context.hook.after_enumeration(path);
       if context.should_stop() {
         return WalkOutcome::Cancelled;
@@ -405,7 +605,9 @@ fn scan_path(
           if context.should_stop() {
             return WalkOutcome::Cancelled;
           }
-          context.admit();
+          if !context.admit(&entry_path) {
+            return WalkOutcome::Cancelled;
+          }
           scan_path(
             &entry_path,
             &current_stack,
@@ -587,8 +789,11 @@ fn summarize_dir_children_cooperative(
   if context.should_stop() {
     return WalkOutcome::Cancelled;
   }
-  let entries = match std::fs::read_dir(path) {
-    Ok(entries) => entries.collect::<Vec<_>>(),
+  let (entries, _staging) = match std::fs::read_dir(path) {
+    Ok(entries) => match context.stage_entries(entries) {
+      Some(staged) => staged,
+      None => return WalkOutcome::Cancelled,
+    },
     Err(_) => return WalkOutcome::Completed(0),
   };
   context.hook.after_enumeration(path);
@@ -612,7 +817,9 @@ fn summarize_dir_children_cooperative(
       if context.should_stop() {
         return WalkOutcome::Cancelled;
       }
-      context.admit();
+      if !context.admit(&entry_path) {
+        return WalkOutcome::Cancelled;
+      }
       summarize_path_cooperative(&entry_path, seen_inodes, context)
     })
     .collect::<Vec<_>>();
@@ -710,7 +917,7 @@ fn inode_key(path: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
   use std::os::windows::io::AsRawHandle;
   use windows_sys::Win32::Foundation::HANDLE;
   use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
   };
 
   if metadata.is_dir() {

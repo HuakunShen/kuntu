@@ -1,12 +1,95 @@
 use super::*;
 use std::fs::{create_dir_all, hard_link, remove_dir_all, write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn legacy_scan_outcome_remains_exhaustively_matchable() {
+  let fixture = TestDir::new("legacy-outcome");
+  let outcome = scan_directory_cooperative(options(&fixture), ScanControl::default(), None);
+  let completed = match outcome {
+    ScanOutcome::Completed { .. } => true,
+    ScanOutcome::Cancelled { .. } | ScanOutcome::Deadline { .. } | ScanOutcome::Failed(_) => false,
+  };
+  assert!(completed);
+}
+
+#[test]
+fn bounded_scan_stops_before_recursive_tree_allocation() {
+  let fixture = TestDir::new("bounded-scan");
+  let root = fixture.path.join("root");
+  create_dir_all(&root).unwrap();
+  for index in 0..12 {
+    write(root.join(format!("file-{index}")), b"data").unwrap();
+  }
+  let control = ScanControl::default();
+  let mut scan_options = options(&fixture);
+  scan_options.directories = vec![root.clone()];
+  let outcome = scan_directory_cooperative_bounded(
+    scan_options.clone(),
+    control.clone(),
+    None,
+    ScanBudget {
+      max_admitted_nodes: 3,
+      max_estimated_bytes: 4096,
+    },
+  );
+  assert!(matches!(outcome, BoundedScanOutcome::BudgetExceeded { .. }));
+  assert_eq!(
+    control.progress().admitted,
+    1,
+    "read_dir fails before child admission"
+  );
+  let byte_limited = scan_directory_cooperative_bounded(
+    scan_options,
+    ScanControl::default(),
+    None,
+    ScanBudget {
+      max_admitted_nodes: 100,
+      max_estimated_bytes: 1,
+    },
+  );
+  assert!(matches!(
+    byte_limited,
+    BoundedScanOutcome::BudgetExceeded { .. }
+  ));
+}
+
+#[test]
+fn wide_long_names_exhaust_shared_staging_bytes_before_admission() {
+  let fixture = TestDir::new("wide-long-budget");
+  for index in 0..24 {
+    write(
+      fixture.path.join(format!("{index:03}-{}", "x".repeat(160))),
+      b"x",
+    )
+    .unwrap();
+  }
+  let root_estimate = fixture.path.as_os_str().len() as u64 + 256;
+  let child_estimate = fixture
+    .path
+    .join(format!("000-{}", "x".repeat(160)))
+    .as_os_str()
+    .len() as u64
+    + 256;
+  let control = ScanControl::default();
+  let outcome = scan_directory_cooperative_bounded(
+    options(&fixture),
+    control.clone(),
+    None,
+    ScanBudget {
+      max_admitted_nodes: 1000,
+      max_estimated_bytes: root_estimate + child_estimate + 1,
+    },
+  );
+  assert!(matches!(outcome, BoundedScanOutcome::BudgetExceeded { .. }));
+  assert_eq!(control.progress().admitted, 1);
+}
 
 struct TestDir {
   path: PathBuf,
@@ -713,7 +796,7 @@ mod legacy_reference {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-      GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+      BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
     if metadata.is_dir() {
