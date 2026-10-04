@@ -10,6 +10,7 @@ version = "0.2.0"
 
 [dependencies]
 ignore = "0.4"
+libc = "0.2"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 windows-sys = { version = "0.61", features = [

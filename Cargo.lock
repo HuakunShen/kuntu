@@ -1085,6 +1085,7 @@ name = "kuntu-scan"
 version = "0.2.0"
 dependencies = [
  "ignore",
+ "libc",
  "objc2",
  "objc2-foundation",
  "rayon",

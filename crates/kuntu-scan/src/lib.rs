@@ -9,6 +9,7 @@
 pub mod clean;
 pub mod cloud;
 pub mod git;
+pub mod local_scan;
 pub mod scanner;
 pub mod snapshot;
 
@@ -22,4 +23,8 @@ pub use clean::{
   CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome, RemovalPlan,
 };
 pub use git::{find_dirty_git_repos, DirtyGitRepo, DirtyGitRepoOptions};
+pub use local_scan::{
+  scan_local_directory, scan_local_directory_with_progress, LocalScanCancellation, LocalScanNode,
+  LocalScanProgress, LocalScanReport, ScanCoverage, ScanIssue, ScanVolume,
+};
 pub use scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};
