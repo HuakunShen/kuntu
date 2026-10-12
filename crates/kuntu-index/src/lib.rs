@@ -1179,6 +1179,9 @@ CREATE INDEX IF NOT EXISTS idx_entries_root_deleted_path_lower ON entries(root_i
 ";
 
 #[cfg(test)]
+mod fixture;
+
+#[cfg(test)]
 mod tests {
   use std::fs;
 
@@ -2087,5 +2090,93 @@ mod tests {
       !path.exists(),
       "a database must not be created at a lossy alias"
     );
+  }
+
+  /// Release-mode latency gate on the generated realistic fixture (see
+  /// `fixture.rs`). Rows come from `KUNTU_BENCH_ROWS` (default 100,000; the
+  /// owner runs 1,000,000 via `just benchmark-1m`), the cache directory from
+  /// `KUNTU_BENCH_DIR`. Each query class runs three times and the best run is
+  /// compared with its ceiling, so a cold page cache does not fail the gate.
+  ///
+  /// Ceilings are the measured warm numbers of the fixed implementation at
+  /// 1,000,000 rows (turso 0.7.2, M4 Pro, external disk) with generous headroom
+  /// for a slow disk and a loaded machine. They are regression guards, not
+  /// targets. The unfixed implementation fails the non-ASCII miss (full terms
+  /// scan) and then the broad classes (per-batch root scan) by orders of
+  /// magnitude.
+  #[test]
+  #[ignore = "latency gate on a generated fixture; run in release mode via just benchmark"]
+  fn realistic_fixture_latency_gate() {
+    let rows: usize = std::env::var("KUNTU_BENCH_ROWS")
+      .ok()
+      .and_then(|value| value.parse().ok())
+      .unwrap_or(100_000);
+    let fixture = fixture::open_or_build(rows);
+    eprintln!(
+      "GATE fixture rows={} bytes={} build_secs={:?}",
+      fixture.rows, fixture.db_bytes, fixture.build_secs
+    );
+    let queries = &fixture.queries;
+    // (class, query text, ceiling in milliseconds)
+    let classes: Vec<(&str, String, u128)> = vec![
+      ("miss", "zzqqx".to_string(), 25),
+      ("miss_non_ascii", "zzqqé".to_string(), 25),
+      ("rare", queries.rare.clone(), 50),
+      ("mid", queries.mid.clone(), 100),
+      ("broad", queries.broad.clone(), 400),
+      ("prefix3", queries.prefix3.clone(), 400),
+      ("mixed", queries.mixed.clone(), 300),
+      ("all_rows", queries.all_rows.clone(), 600),
+      ("prefix1", queries.prefix1.clone(), 800),
+    ];
+    for (class, text, ceiling_ms) in classes {
+      let query = SearchQuery::new(text).with_limit(20);
+      let mut best = std::time::Duration::MAX;
+      let mut outcome = None;
+      for run in 0..3 {
+        let started = std::time::Instant::now();
+        let current = fixture
+          .index
+          .search_with_metrics(&fixture.config, &query)
+          .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+          "GATE rows={rows} class={class} run={run} ms={:.1} candidates={} results={} coverage={:?}",
+          elapsed.as_secs_f64() * 1000.0,
+          current.candidate_count,
+          current.results.len(),
+          current.coverage
+        );
+        best = best.min(elapsed);
+        outcome = Some(current);
+        // A hopeless run is not repeated.
+        if elapsed.as_millis() > ceiling_ms * 20 {
+          break;
+        }
+      }
+      let outcome = outcome.unwrap();
+      match class {
+        "miss" | "miss_non_ascii" => {
+          assert_eq!(outcome.candidate_count, 0, "{class}");
+          assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{class}");
+        }
+        "rare" => assert!(outcome.candidate_count >= 1, "{class}"),
+        "mid" => assert!(outcome.candidate_count >= 10, "{class}"),
+        "broad" | "prefix3" => assert!(outcome.candidate_count >= 1_000, "{class}"),
+        "mixed" => {
+          // Mixed selectivity must be exact: every row with both tokens.
+          assert_eq!(outcome.candidate_count, queries.mixed_truth, "{class}");
+          assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{class}");
+        }
+        "all_rows" | "prefix1" => {
+          assert_eq!(outcome.coverage, CandidateCoverage::Truncated, "{class}")
+        }
+        other => unreachable!("{other}"),
+      }
+      assert!(
+        best.as_millis() <= ceiling_ms,
+        "{class}: best of 3 runs took {best:?}, ceiling {ceiling_ms} ms"
+      );
+    }
   }
 }
