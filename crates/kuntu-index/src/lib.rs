@@ -629,7 +629,9 @@ impl KuntuIndex {
       'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
         let mut admitted: HashMap<i64, CandidateRow> = HashMap::new();
         for entry in fetch_entries_by_id(&self.conn, chunk).await? {
-          if !verify_tokens.is_empty() && !path_has_prefix_tokens(&entry.path, &verify_tokens) {
+          if !verify_tokens.is_empty()
+            && !verify_candidate_tokens(&self.conn, entry.id, &entry.path, &verify_tokens).await?
+          {
             continue;
           }
           let id = entry.id;
@@ -856,28 +858,77 @@ impl CandidateScope {
   }
 }
 
-/// True when every token is a prefix of some token of the path. The terms
-/// table holds exactly the tokens of the path components, so this is the same
-/// predicate the index evaluates per token, applied to one row.
-///
-/// Verification must never invent a match the terms table cannot hold, so it
-/// tokenizes a path exactly the way `insert_terms_tx` derived the terms:
-/// component by component, and only from components that are valid UTF-8.
-/// `entries.path` is stored lossy, so a component that was not valid UTF-8 is
-/// recognizable only by its U+FFFD replacement; it contributed no terms at
-/// index time and contributes no token here (review P2).
+/// True when every token is a prefix of some token of the path, counting only
+/// the components that were certainly indexed: `insert_terms_tx` derives the
+/// terms component by component from valid UTF-8, so a component containing
+/// the U+FFFD replacement character is ambiguous (see
+/// [`verify_candidate_tokens`]) and is not trusted here.
 fn path_has_prefix_tokens(path: &Path, tokens: &[String]) -> bool {
-  let path_tokens: Vec<String> = path
-    .components()
-    .filter_map(|component| component.as_os_str().to_str())
-    .filter(|component| !component.contains('\u{FFFD}'))
-    .flat_map(tokenize)
-    .collect();
+  let path_tokens = trusted_path_tokens(path);
   tokens.iter().all(|token| {
     path_tokens
       .iter()
       .any(|candidate| candidate.starts_with(token.as_str()))
   })
+}
+
+/// The tokens of the path components that were certainly indexed.
+fn trusted_path_tokens(path: &Path) -> Vec<String> {
+  path
+    .components()
+    .filter_map(|component| component.as_os_str().to_str())
+    .filter(|component| !component.contains('\u{FFFD}'))
+    .flat_map(tokenize)
+    .collect()
+}
+
+/// True when any component of the stored path carries the U+FFFD replacement
+/// character.
+fn path_has_lossy_component(path: &Path) -> bool {
+  path
+    .components()
+    .any(|component| component.as_os_str().to_string_lossy().contains('\u{FFFD}'))
+}
+
+/// The one statement the lossy-path fallback reads: a single entry's stored
+/// terms, including its extension term, through `idx_terms_entry`.
+fn entry_terms_sql() -> &'static str {
+  "SELECT term FROM terms WHERE entry_id = ?1"
+}
+
+/// Stage-2 verification of the driver's remaining tokens against one row.
+///
+/// A stored path cannot tell a legitimate U+FFFD character from the shadow of
+/// invalid bytes: insertion indexes the first and skips the second (while
+/// still indexing its valid extension), so neither inventing nor dropping a
+/// match can be decided from the path text alone. Only the U+FFFD-free
+/// components are trusted; when a token matches none of them and the path
+/// carries U+FFFD anywhere, the tokens are verified against the entry's own
+/// stored terms — exactly the predicate `v0.4.0`'s posting intersection
+/// required. A path without U+FFFD is byte-identical to what was indexed, so
+/// it needs no lookup.
+async fn verify_candidate_tokens(
+  conn: &turso::Connection,
+  entry_id: i64,
+  path: &Path,
+  tokens: &[String],
+) -> Result<bool> {
+  if path_has_prefix_tokens(path, tokens) {
+    return Ok(true);
+  }
+  if !path_has_lossy_component(path) {
+    return Ok(false);
+  }
+  let mut remaining: Vec<&str> = tokens.iter().map(String::as_str).collect();
+  let mut rows = conn.query(entry_terms_sql(), params![entry_id]).await?;
+  while let Some(row) = rows.next().await? {
+    let term = row.get::<String>(0)?;
+    remaining.retain(|token| !term.starts_with(token));
+    if remaining.is_empty() {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 /// Rows read from the terms table to decide whether a token's whole posting
@@ -2916,6 +2967,29 @@ mod tests {
     assert!(path_has_prefix_tokens(path, &[]));
   }
 
+  /// The lossy-path fallback must stay an index seek: one entry's stored
+  /// terms are read through `idx_terms_entry`, never by scanning the terms
+  /// table (recheck P2).
+  #[test]
+  fn entry_terms_fallback_uses_the_entry_id_index() {
+    let index = KuntuIndex::open_memory().unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", entry_terms_sql());
+    let details = block_on(async {
+      let mut rows = index
+        .conn
+        .query(&sql, params![Value::from(1i64)])
+        .await
+        .unwrap();
+      let mut details = Vec::new();
+      while let Some(row) = rows.next().await.unwrap() {
+        details.push(row.get::<String>(3).unwrap());
+      }
+      details
+    });
+    let plan = details.join(" | ");
+    assert!(plan.contains("idx_terms_entry"), "plan: {plan}");
+  }
+
   /// A file name whose bytes are not valid UTF-8 (`common<0xff>.md`).
   /// `upsert_entry_tx` stores the path lossy and `insert_terms_tx` skips the
   /// component, so the terms table holds no `common*` token for that row —
@@ -2924,28 +2998,15 @@ mod tests {
   /// v0.4.0's posting intersection excluded). macOS refuses to create such a
   /// file on disk (`EILSEQ` from `open`), so the invalid bytes go through the
   /// real insertion path instead of the filesystem.
+  /// Plant the row the write path stores for a file named `common<0xff>.md`:
+  /// the lossy path, and terms derived by `insert_terms_tx` itself (the file
+  /// name and its invalid component are skipped, the `md` extension and the
+  /// valid path components survive).
   #[cfg(unix)]
-  #[test]
-  fn path_verification_skips_components_the_indexer_never_tokenized() {
+  fn plant_invalid_byte_entry(index: &mut KuntuIndex, root: &Path) {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let root = temp_dir("non-utf8-verify");
-    fs::create_dir_all(root.join("rareword")).unwrap();
-    for number in 0..3 {
-      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
-    }
-
-    let mut index = KuntuIndex::open_memory().unwrap();
-    let config = SearchConfig {
-      roots: vec![SearchRoot::new(&root)],
-    };
-    index.rebuild(&config).unwrap();
-
-    // Exactly what the write path stores for a file named `common<0xff>.md`:
-    // the lossy path, and terms derived by `insert_terms_tx` itself (the file
-    // name and its invalid component are skipped, the `md` extension and the
-    // valid path components survive).
     let root = kuntu_core::normalize_root_path(root.to_path_buf());
     let invalid_path = root
       .join("rareword")
@@ -2998,6 +3059,23 @@ mod tests {
       insert_terms_tx(&tx, entry_id, &invalid_path).await.unwrap();
       tx.commit().await.unwrap();
     });
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn path_verification_skips_components_the_indexer_never_tokenized() {
+    let root = temp_dir("non-utf8-verify");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    plant_invalid_byte_entry(&mut index, &root);
 
     // The rare token drives the search and `common` is verified against the
     // driving row's own path; the invalid-name file must not pass that check.
@@ -3009,6 +3087,67 @@ mod tests {
     assert_eq!(outcome.candidate_count, 0);
     assert_eq!(outcome.coverage, CandidateCoverage::Complete);
     assert!(outcome.results.is_empty());
+  }
+
+  /// A legitimate U+FFFD is valid UTF-8: `insert_terms_tx` indexes a file
+  /// named `common<U+FFFD>.md` like any other name, so `rareword common`
+  /// must find it even though the stored path is indistinguishable from a
+  /// lossy one (recheck P2: verification must not drop this match).
+  #[test]
+  fn legitimate_replacement_characters_are_found_by_their_indexed_terms() {
+    let root = temp_dir("legit-replacement");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    fs::write(root.join("rareword").join("common\u{FFFD}.md"), "a\n").unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword common"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 1);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results[0].path.ends_with("common\u{FFFD}.md"));
+  }
+
+  /// The invalid-byte file's extension term is real: `insert_terms_tx` skips
+  /// the name component but still indexes the valid `md` extension, so
+  /// `rareword md` must find the row through its stored terms (recheck P2).
+  #[cfg(unix)]
+  #[test]
+  fn invalid_byte_names_are_found_through_their_stored_extension_term() {
+    let root = temp_dir("non-utf8-extension");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    plant_invalid_byte_entry(&mut index, &root);
+
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword md"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 1);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results[0]
+      .path
+      .to_string_lossy()
+      .ends_with("common\u{FFFD}.md"));
   }
 
   /// The latency gate's timing policy (review P2): the first run pays the
