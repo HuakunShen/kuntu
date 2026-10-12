@@ -1006,20 +1006,24 @@ fn placeholders(count: usize) -> String {
     .join(",")
 }
 
+/// Range predicate for one query token: every term that starts with `term`.
+/// Terms are compared bytewise, so the exclusive upper bound is the prefix with
+/// its last ASCII byte incremented, or, for anything non-ASCII, the prefix
+/// followed by U+10FFFF (a noncharacter that never occurs in a term). A range
+/// is a seek on the covering primary-key index; `LIKE` is a scan of the table.
 fn term_prefix_clause(term: &str) -> (String, Vec<Value>) {
-  if let Some(upper_bound) = ascii_prefix_upper_bound(term) {
-    (
-      "t.term >= ? AND t.term < ?".to_string(),
-      vec![Value::from(term.to_string()), Value::from(upper_bound)],
-    )
-  } else {
-    (
-      "t.term LIKE ?".to_string(),
-      vec![Value::from(format!("{term}%"))],
-    )
-  }
+  (
+    "term >= ? AND term < ?".to_string(),
+    vec![
+      Value::from(term.to_string()),
+      Value::from(term_prefix_upper_bound(term)),
+    ],
+  )
 }
 
+fn term_prefix_upper_bound(prefix: &str) -> String {
+  ascii_prefix_upper_bound(prefix).unwrap_or_else(|| format!("{prefix}\u{10FFFF}"))
+}
 fn ascii_prefix_upper_bound(prefix: &str) -> Option<String> {
   if prefix.is_empty() || !prefix.is_ascii() {
     return None;
@@ -2178,5 +2182,48 @@ mod tests {
         "{class}: best of 3 runs took {best:?}, ceiling {ceiling_ms} ms"
       );
     }
+  }
+
+  #[test]
+  fn non_ascii_prefixes_use_a_range_not_like() {
+    for term in ["é", "café", "计划", "zzqqé"] {
+      let (clause, values) = term_prefix_clause(term);
+      assert!(!clause.contains("LIKE"), "{term}: {clause}");
+      assert_eq!(values.len(), 2, "{term}");
+    }
+  }
+
+  #[test]
+  fn non_ascii_tokens_are_found_by_prefix_and_misses_are_empty() {
+    let root = temp_dir("non-ascii-prefix");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("café-menu.txt"), "a\n").unwrap();
+    fs::write(root.join("计划书A.md"), "b\n").unwrap();
+    fs::write(root.join("plain.txt"), "c\n").unwrap();
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for (query, expected) in [
+      ("caf", "café-menu.txt"),
+      ("café", "café-menu.txt"),
+      ("计", "计划书A.md"),
+      ("计划", "计划书A.md"),
+    ] {
+      let outcome = index
+        .search_with_metrics(&config, &SearchQuery::new(query))
+        .unwrap();
+      assert_eq!(outcome.results.len(), 1, "{query}");
+      assert!(outcome.results[0].path.ends_with(expected), "{query}");
+    }
+    let miss = index
+      .search_with_metrics(&config, &SearchQuery::new("zzqqé"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(miss.candidate_count, 0);
+    assert_eq!(miss.coverage, CandidateCoverage::Complete);
   }
 }
