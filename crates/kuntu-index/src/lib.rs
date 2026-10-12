@@ -560,55 +560,60 @@ impl KuntuIndex {
         return Ok(empty);
       }
 
-      // Candidate selection runs in two stages. Stage 1 resolves each query
-      // token to a bounded, distinct entry-id set straight off the terms
-      // primary key (a range seek — the production-proven shape; turso's
-      // planner full-scans the joined form). The id sets are intersected in
-      // Rust. Stage 2 loads the intersection in chunks with every scope,
-      // kind and policy predicate in SQL, so nothing outside the configured
-      // scope, kind or policy can become a candidate, and no stage scans a
-      // whole root. There is no non-indexed fallback: a token that matches
-      // nothing ends the search with empty complete coverage.
-      let mut intersection: Option<std::collections::BTreeSet<i64>> = None;
-      let mut any_token_saturated = false;
+      // Stage 1: posting lists, one range seek per unique token.
+      //
+      // A token's list is cheap to load, but two broad tokens cannot be
+      // intersected by capping each list (a selective token plus a common one
+      // would silently lose rows: the common list is cut at the work bound and
+      // most of the selective token's rows fall outside it). Instead the
+      // smallest *complete* list drives the search: its entries are fetched
+      // and every other token is verified against the row's own path, which is
+      // exactly the predicate the terms table encodes. Only when every token
+      // is too broad to load completely are the capped lists intersected, and
+      // the result is then reported as truncated.
+      let unique_terms: std::collections::BTreeSet<String> = query_terms.into_iter().collect();
 
-      // A repeated token would repeat an up-to-50k-row scan without
-      // changing the intersection or the ranking.
-      let unique_terms: std::collections::BTreeSet<&String> = query_terms.iter().collect();
-      for term in unique_terms {
-        let (term_clause, mut values) = term_prefix_clause(term);
-        let term_clause = term_clause.replace("t.term", "term_index.term");
-        let sql = format!(
-          "SELECT DISTINCT term_index.entry_id FROM terms AS term_index WHERE {term_clause} ORDER BY term_index.entry_id LIMIT ?"
-        );
-        values.push(Value::from(MAX_KFS_CANDIDATE_ROWS as i64 + 1));
-        let mut rows = self.conn.query(&sql, params_from_iter(values)).await?;
-        let mut ids = std::collections::BTreeSet::new();
-        while let Some(row) = rows.next().await? {
-          if ids.len() == MAX_KFS_CANDIDATE_ROWS {
-            any_token_saturated = true;
-            break;
-          }
-          ids.insert(row.get::<i64>(0)?);
+      let mut lists: Vec<(String, TokenPostings)> = Vec::new();
+      for term in &unique_terms {
+        let postings = load_postings(&self.conn, term, DRIVER_PROBE_ROWS, usize::MAX).await?;
+        if postings.complete && postings.ids.is_empty() {
+          // A token that matches nothing ends the search: empty and complete.
+          return Ok(empty);
         }
-
-        intersection = Some(match intersection {
-          None => ids,
-          Some(previous) => previous
-            .intersection(&ids)
-            .copied()
-            .collect::<std::collections::BTreeSet<i64>>(),
-        });
-        if intersection.as_ref().is_some_and(|ids| ids.is_empty()) {
-          break;
-        }
+        lists.push((term.clone(), postings));
       }
-
-      let intersected = intersection.unwrap_or_default();
-      let id_list: Vec<i64> = intersected.into_iter().collect();
-
-      let verify_tokens: Vec<String> = Vec::new();
-
+      let mut driver = smallest_complete(&lists);
+      if driver.is_none() {
+        lists.clear();
+        for term in &unique_terms {
+          let postings = load_postings(
+            &self.conn,
+            term,
+            MAX_KFS_CANDIDATE_ROWS * 3,
+            MAX_KFS_CANDIDATE_ROWS,
+          )
+          .await?;
+          lists.push((term.clone(), postings));
+        }
+        driver = smallest_complete(&lists);
+      }
+      let (id_list, verify_tokens, any_token_saturated): (Vec<i64>, Vec<String>, bool) =
+        match driver {
+          Some(position) => {
+            let verify_tokens = lists
+              .iter()
+              .enumerate()
+              .filter(|(index, _)| *index != position)
+              .map(|(_, (term, _))| term.clone())
+              .collect();
+            (rank_ids(&[&lists[position].1.ids]), verify_tokens, false)
+          }
+          None => {
+            let id_maps: Vec<&std::collections::BTreeMap<i64, bool>> =
+              lists.iter().map(|(_, postings)| &postings.ids).collect();
+            (rank_ids(&id_maps), Vec::new(), true)
+          }
+        };
       // Stage 2: load the candidate rows by id and filter in Rust.
       //
       // The fetch statement carries no predicate at all. turso's planner turns
@@ -861,6 +866,93 @@ fn path_has_prefix_tokens(path: &Path, tokens: &[String]) -> bool {
       .iter()
       .any(|candidate| candidate.starts_with(token.as_str()))
   })
+}
+
+/// Rows read from the terms table to decide whether a token's whole posting
+/// list is small enough to drive a search.
+const DRIVER_PROBE_ROWS: usize = 1_000;
+
+/// One token's posting list: entry id -> whether the token hit the file name
+/// (field 1) of that entry.
+struct TokenPostings {
+  ids: std::collections::BTreeMap<i64, bool>,
+  /// False when a row or distinct-id limit cut the list short.
+  complete: bool,
+}
+
+/// Load the posting rows of every term that starts with `term`, stopping after
+/// `row_limit` rows or `distinct_cap` distinct ids. The statement is a plain
+/// range over the covering primary-key index: no `DISTINCT`, no `ORDER BY`
+/// (either makes turso choose the non-covering `idx_terms_term` and a sorter).
+async fn load_postings(
+  conn: &turso::Connection,
+  term: &str,
+  row_limit: usize,
+  distinct_cap: usize,
+) -> Result<TokenPostings> {
+  let (clause, mut values) = term_prefix_clause(term);
+  let sql = format!("SELECT entry_id, field FROM terms WHERE {clause} LIMIT ?");
+  values.push(Value::from(
+    i64::try_from(row_limit).unwrap_or(i64::MAX - 1) + 1,
+  ));
+  let mut rows = conn.query(&sql, params_from_iter(values)).await?;
+  let mut ids = std::collections::BTreeMap::new();
+  let mut seen_rows = 0usize;
+  let mut complete = true;
+  while let Some(row) = rows.next().await? {
+    if seen_rows == row_limit {
+      complete = false;
+      break;
+    }
+    seen_rows += 1;
+    let id = row.get::<i64>(0)?;
+    let name_hit = row.get::<i64>(1)? == 1;
+    if !ids.contains_key(&id) && ids.len() == distinct_cap {
+      complete = false;
+      break;
+    }
+    let entry = ids.entry(id).or_insert(false);
+    *entry = *entry || name_hit;
+  }
+  Ok(TokenPostings { ids, complete })
+}
+
+/// Position of the complete list with the fewest entries.
+fn smallest_complete(lists: &[(String, TokenPostings)]) -> Option<usize> {
+  lists
+    .iter()
+    .enumerate()
+    .filter(|(_, (_, postings))| postings.complete)
+    .min_by_key(|(_, (_, postings))| postings.ids.len())
+    .map(|(position, _)| position)
+}
+
+/// Ids present in every list, file-name hits first (by how many tokens hit
+/// the file name), then by id, so a truncated search keeps the strongest rows
+/// and stays deterministic.
+fn rank_ids(lists: &[&std::collections::BTreeMap<i64, bool>]) -> Vec<i64> {
+  let Some((first, rest)) = lists.split_first() else {
+    return Vec::new();
+  };
+  let mut ranked: Vec<(usize, i64)> = Vec::new();
+  for (&id, &name_hit) in first.iter() {
+    let mut name_hits = usize::from(name_hit);
+    let mut in_every_list = true;
+    for other in rest {
+      match other.get(&id) {
+        Some(&hit) => name_hits += usize::from(hit),
+        None => {
+          in_every_list = false;
+          break;
+        }
+      }
+    }
+    if in_every_list {
+      ranked.push((name_hits, id));
+    }
+  }
+  ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+  ranked.into_iter().map(|(_, id)| id).collect()
 }
 
 #[derive(Debug)]
@@ -2653,5 +2745,156 @@ mod tests {
     assert_eq!(wide.candidate_count, MAX_KFS_CANDIDATE_ROWS);
     assert_eq!(wide.coverage, CandidateCoverage::Truncated);
     fixture.cleanup();
+  }
+
+  #[test]
+  fn every_query_token_must_match_and_tokens_match_by_prefix() {
+    let root = temp_dir("multi-token");
+    fs::create_dir_all(root.join("alphabet")).unwrap();
+    fs::write(root.join("alphabet/beta-notes.md"), "a\n").unwrap();
+    fs::write(root.join("alphabet/gamma-notes.md"), "b\n").unwrap();
+    fs::write(root.join("other.md"), "c\n").unwrap();
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let both = index
+      .search_with_metrics(&config, &SearchQuery::new("alph bet"))
+      .unwrap();
+    let one_missing = index
+      .search_with_metrics(&config, &SearchQuery::new("alph delta"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(both.candidate_count, 1);
+    assert!(both.results[0].path.ends_with("alphabet/beta-notes.md"));
+    assert_eq!(both.coverage, CandidateCoverage::Complete);
+    assert_eq!(one_missing.candidate_count, 0);
+    assert_eq!(one_missing.coverage, CandidateCoverage::Complete);
+  }
+
+  /// Plant `relative` with `token` recorded as a directory-component hit only
+  /// (field 3), as the indexer does for a token that appears only in the path.
+  fn plant_path_only_entry(index: &KuntuIndex, root: &Path, relative: &str, token: &str) {
+    plant_entry(index, root, relative, 1, (false, false, false), &[token]);
+    let full = kuntu_core::normalize_root_path(root.to_path_buf()).join(relative);
+    block_on(async {
+      index
+        .conn
+        .execute(
+          "UPDATE terms SET field = 3 WHERE entry_id = (SELECT id FROM entries WHERE path = ?1)",
+          params![full.to_string_lossy()],
+        )
+        .await
+        .unwrap();
+    });
+  }
+
+  #[test]
+  fn file_name_hits_are_fetched_before_path_only_hits_when_the_budget_binds() {
+    // Five path-only matches take the lowest ids, five file-name matches come
+    // after them. With a budget of 5 the file-name matches must win.
+    let root = temp_dir("name-first");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..5 {
+      plant_path_only_entry(
+        &index,
+        &root,
+        &format!("tokenword-dir/aaa-{number}.md"),
+        "tokenword",
+      );
+    }
+    for number in 0..5 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("zzz-tokenword-{number}.md"),
+        1,
+        (false, false, false),
+        &["tokenword"],
+      );
+    }
+    let outcome = index
+      .search_with_options(
+        &config,
+        &SearchQuery::new("tokenword").with_limit(20),
+        SearchOptions { fetch_budget: 5 },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 5);
+    assert_eq!(outcome.coverage, CandidateCoverage::Truncated);
+    assert!(outcome.results.iter().all(|result| result
+      .path
+      .file_name()
+      .is_some_and(|name| name.to_string_lossy().starts_with("zzz-"))));
+  }
+
+  /// The multi-token recall bug: a selective token plus a common one. 60,000
+  /// entries carry `common`; 33 also carry `rareword`. Eight of them have ids
+  /// below the 50,000-id work bound, 25 above it. Capping each token's list
+  /// and intersecting returns only the 8; driving from the rare token returns
+  /// all 33 and stays `Complete`.
+  #[test]
+  #[ignore = "60k-row fixture; run in release mode via just benchmark"]
+  fn rarest_token_drives_the_search_and_recall_is_exact() {
+    let rare_positions: Vec<usize> = (0..8).chain(55_000..55_025).collect();
+    let fixture = recall_fixture("recall", &rare_positions);
+    for text in ["rareword common", "common rareword", "rare common"] {
+      let outcome = fixture
+        .index
+        .search_with_metrics(&fixture.config, &SearchQuery::new(text).with_limit(1_000))
+        .unwrap();
+      assert_eq!(outcome.candidate_count, 33, "{text}");
+      assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{text}");
+      assert_eq!(outcome.results.len(), 33, "{text}");
+    }
+    fixture.cleanup();
+  }
+
+  #[test]
+  fn rank_ids_intersects_and_puts_file_name_hits_first() {
+    let first = std::collections::BTreeMap::from([(1, false), (2, true), (3, true), (4, false)]);
+    let second = std::collections::BTreeMap::from([(2, false), (3, true), (4, true), (9, true)]);
+    // Present in both: 2, 3, 4. Name hits: 3 -> 2, 2 -> 1, 4 -> 1.
+    assert_eq!(rank_ids(&[&first, &second]), vec![3, 2, 4]);
+    assert_eq!(rank_ids(&[&first]), vec![2, 3, 1, 4]);
+    assert!(rank_ids(&[]).is_empty());
+  }
+
+  #[test]
+  fn smallest_complete_ignores_truncated_lists() {
+    let list = |ids: &[i64], complete: bool| TokenPostings {
+      ids: ids.iter().map(|id| (*id, false)).collect(),
+      complete,
+    };
+    let lists = vec![
+      ("big".to_string(), list(&[1, 2, 3, 4], true)),
+      ("cut".to_string(), list(&[1], false)),
+      ("small".to_string(), list(&[1, 2], true)),
+    ];
+    assert_eq!(smallest_complete(&lists), Some(2));
+    assert_eq!(smallest_complete(&lists[1..2]), None);
+  }
+
+  #[test]
+  fn path_tokens_are_matched_by_prefix_case_insensitively() {
+    let path = Path::new("/home/me/Alphabet/beta-notes.md");
+    assert!(path_has_prefix_tokens(
+      path,
+      &["alph".to_string(), "bet".to_string()]
+    ));
+    assert!(!path_has_prefix_tokens(
+      path,
+      &["alph".to_string(), "gamma".to_string()]
+    ));
+    assert!(path_has_prefix_tokens(path, &[]));
   }
 }
