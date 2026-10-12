@@ -2077,16 +2077,19 @@ mod tests {
     run_bounded_fixture("bounded-60k", 60_000, 5, 60);
   }
 
-  /// The plan's one-million-row benchmark. Debug-profile turso inserts grow
-  /// superlinearly past ~200k rows, so this runs ignored; measure with
+  /// The single-term one-million-row benchmark: one posting list of 1,000,000
+  /// rows. The miss is a seek (about 1 ms) and the wide-budget broad query
+  /// loads exactly `MAX_KFS_CANDIDATE_ROWS` candidates. This fixture is
+  /// pathological on purpose; the realistic 1M benchmark is
+  /// `realistic_fixture_latency_gate` (`just benchmark-1m`). Debug-profile
+  /// turso inserts grow superlinearly past ~200k rows, so this runs ignored;
+  /// measure with
   /// `cargo test --release -p kuntu-index one_million -- --ignored --nocapture`.
   ///
-  /// KNOWN ENGINE GAP, measured 2026-09-14 on turso 0.7.2 (release, M-series
-  /// Mac): the planner does not seek the terms primary key for a range
-  /// predicate — it full-scans the terms table, so a miss costs ~7.5 s at 1M
-  /// rows instead of the O(1) a seek would give. The scan predates this
-  /// change (v0.2.x ran the same range shape), and the no-fallback contract
-  /// this test guards (empty result, candidate_count 0) holds regardless.
+  /// History: before v0.5.0 this test failed its broad ceiling (1,005 s) because
+  /// the candidate fetch scanned the whole root once per batch. The README's
+  /// earlier note blaming the terms range predicate (a "7.5 s miss") was wrong:
+  /// the range was always a seek.
   #[test]
   #[ignore = "one-million-row benchmark; run in release mode"]
   fn one_million_row_root_stays_bounded_on_miss_and_broad_prefix() {
