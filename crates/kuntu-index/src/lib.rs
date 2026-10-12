@@ -130,6 +130,31 @@ pub struct KuntuIndex {
   conn: turso::Connection,
 }
 
+/// Default number of candidates one search loads and ranks. Candidates are
+/// counted after scope, kind, extension and policy filtering, so rows the
+/// caller may not see never consume the budget. Reaching it reports
+/// [`CandidateCoverage::Truncated`].
+pub const DEFAULT_FETCH_BUDGET: usize = 5_000;
+
+/// Ids per `IN (...)` statement when loading candidate rows.
+const FETCH_CHUNK_IDS: usize = 1_000;
+
+/// Per-search tuning. `search_with_metrics` uses the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+  /// Maximum admitted candidates to load and rank. Clamped to
+  /// `1..=MAX_KFS_CANDIDATE_ROWS`.
+  pub fetch_budget: usize,
+}
+
+impl Default for SearchOptions {
+  fn default() -> Self {
+    Self {
+      fetch_budget: DEFAULT_FETCH_BUDGET,
+    }
+  }
+}
+
 impl MetadataIndex for KuntuIndex {
   fn rebuild_index(
     &mut self,
@@ -501,6 +526,19 @@ impl KuntuIndex {
     config: &SearchConfig,
     query: &SearchQuery,
   ) -> Result<IndexedSearchOutcome> {
+    self.search_with_options(config, query, SearchOptions::default())
+  }
+
+  /// Search with explicit options. Scope, kind, extension and policy filters
+  /// apply to every candidate before ranking and before the fetch budget and
+  /// the result window, exactly as in `search_with_metrics`.
+  pub fn search_with_options(
+    &self,
+    config: &SearchConfig,
+    query: &SearchQuery,
+    options: SearchOptions,
+  ) -> Result<IndexedSearchOutcome> {
+    let budget = options.fetch_budget.clamp(1, MAX_KFS_CANDIDATE_ROWS);
     block_on(async {
       let empty = IndexedSearchOutcome {
         candidate_count: 0,
@@ -569,74 +607,44 @@ impl KuntuIndex {
       let intersected = intersection.unwrap_or_default();
       let id_list: Vec<i64> = intersected.into_iter().collect();
 
-      let mut clauses = vec!["entries_main.deleted = 0".to_string()];
-      clauses.push(format!(
-        "entries_main.root_id IN ({})",
-        placeholders(root_ids.len())
-      ));
-      match (query.include_files, query.include_directories) {
-        (true, true) => {}
-        (true, false) => {
-          clauses.push(format!(
-            "entries_main.kind = {}",
-            kind_to_int(EntryKind::File)
-          ));
-        }
-        (false, true) => {
-          clauses.push(format!(
-            "entries_main.kind = {}",
-            kind_to_int(EntryKind::Directory)
-          ));
-        }
-        (false, false) => unreachable!("handled by the early return above"),
-      }
-      // A row is visible when it is clean, or the query relaxes the flag,
-      // or its own root was configured to allow it (the crawler only indexed
-      // rows its root permitted).
-      clauses.push("(entries_main.hidden = 0 OR ? OR roots_pri.include_hidden = 1)".to_string());
-      clauses.push("(entries_main.ignored = 0 OR ? OR roots_pri.include_ignored = 1)".to_string());
-      clauses.push("entries_main.sensitive = 0".to_string());
-      if !query.extensions.is_empty() {
-        clauses.push(format!(
-          "entries_main.extension IN ({})",
-          placeholders(query.extensions.len())
-        ));
-      }
-      let predicate_clause = clauses.join(" AND ");
+      let verify_tokens: Vec<String> = Vec::new();
 
+      // Stage 2: load the candidate rows by id and filter in Rust.
+      //
+      // The fetch statement carries no predicate at all. turso's planner turns
+      // any indexed predicate beside the id list (root_id, extension) into a
+      // scan of that index, which costs a whole-root scan per batch; the bare
+      // `id IN (...)` is a rowid seek. Scope, kind, extension and policy are
+      // therefore applied to each fetched row before it can become a
+      // candidate, so nothing outside the configured scope or policy is ever
+      // ranked, and the budget counts only admitted rows.
+      let scope = CandidateScope::load(&self.conn, &root_ids, query).await?;
       let mut candidates: Vec<CandidateRow> = Vec::new();
-      for chunk in id_list.chunks(400) {
-        let sql = format!(
-          "SELECT entries_main.path, entries_main.kind, roots_pri.priority, entries_main.size, entries_main.mtime
-             FROM entries AS entries_main
-             JOIN roots AS roots_pri ON roots_pri.id = entries_main.root_id
-             WHERE entries_main.id IN ({}) AND {predicate_clause}",
-          placeholders(chunk.len())
-        );
-        let mut values: Vec<Value> = chunk.iter().copied().map(Value::from).collect();
-        values.extend(root_ids.iter().copied().map(Value::from));
-        values.push(Value::from(query.include_hidden));
-        values.push(Value::from(query.include_ignored));
-        if !query.extensions.is_empty() {
-          values.extend(
-            query
-              .extensions
-              .iter()
-              .map(|extension| Value::from(extension.trim_start_matches('.').to_ascii_lowercase())),
-          );
+      let mut examined = 0usize;
+      'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
+        let mut admitted: HashMap<i64, CandidateRow> = HashMap::new();
+        for entry in fetch_entries_by_id(&self.conn, chunk).await? {
+          if !verify_tokens.is_empty() && !path_has_prefix_tokens(&entry.path, &verify_tokens) {
+            continue;
+          }
+          let id = entry.id;
+          if let Some(candidate) = scope.admit(query, entry) {
+            admitted.insert(id, candidate);
+          }
         }
-        let mut rows = self.conn.query(&sql, params_from_iter(values)).await?;
-        while let Some(row) = rows.next().await? {
-          let mtime: Option<i64> = row.get(4)?;
-          candidates.push(CandidateRow {
-            path: PathBuf::from(row.get::<String>(0)?),
-            kind: int_to_kind(row.get::<i64>(1)?),
-            root_priority: row.get::<i32>(2)?,
-            byte_size: u64::try_from(row.get::<i64>(3).unwrap_or(-1)).ok(),
-            modified_unix_seconds: u64::try_from(mtime.unwrap_or(-1)).ok(),
-          });
+        for id in chunk {
+          examined += 1;
+          if let Some(candidate) = admitted.remove(id) {
+            candidates.push(candidate);
+            if candidates.len() == budget {
+              break 'chunks;
+            }
+          }
         }
       }
+      // The budget stopped the search before every id was examined.
+      let budget_truncated = candidates.len() == budget && examined < id_list.len();
+      let any_token_saturated = any_token_saturated || budget_truncated;
       let candidate_count = candidates.len();
       let candidate_saturated = any_token_saturated;
 
@@ -708,6 +716,151 @@ impl KuntuIndex {
       Ok(collected)
     })
   }
+}
+
+/// One `entries` row as stored, fetched by id.
+struct FetchedEntry {
+  id: i64,
+  root_id: i64,
+  path: PathBuf,
+  kind: EntryKind,
+  size: Option<u64>,
+  mtime: Option<u64>,
+  extension: Option<String>,
+  hidden: bool,
+  ignored: bool,
+  sensitive: bool,
+  deleted: bool,
+}
+
+/// The candidate fetch. Keep it free of predicates: see the note at stage 2 of
+/// `search_with_options` and the plan test that pins this statement.
+fn entry_fetch_sql(id_count: usize) -> String {
+  format!(
+    "SELECT id, root_id, path, kind, size, mtime, extension, hidden, ignored, sensitive, deleted
+       FROM entries WHERE id IN ({})",
+    placeholders(id_count)
+  )
+}
+
+async fn fetch_entries_by_id(conn: &turso::Connection, ids: &[i64]) -> Result<Vec<FetchedEntry>> {
+  let values: Vec<Value> = ids.iter().copied().map(Value::from).collect();
+  let mut rows = conn
+    .query(&entry_fetch_sql(ids.len()), params_from_iter(values))
+    .await?;
+  let mut fetched = Vec::with_capacity(ids.len());
+  while let Some(row) = rows.next().await? {
+    let mtime: Option<i64> = row.get(5)?;
+    fetched.push(FetchedEntry {
+      id: row.get::<i64>(0)?,
+      root_id: row.get::<i64>(1)?,
+      path: PathBuf::from(row.get::<String>(2)?),
+      kind: int_to_kind(row.get::<i64>(3)?),
+      size: u64::try_from(row.get::<i64>(4).unwrap_or(-1)).ok(),
+      mtime: u64::try_from(mtime.unwrap_or(-1)).ok(),
+      extension: row.get(6)?,
+      hidden: row.get::<i64>(7)? != 0,
+      ignored: row.get::<i64>(8)? != 0,
+      sensitive: row.get::<i64>(9)? != 0,
+      deleted: row.get::<i64>(10)? != 0,
+    });
+  }
+  Ok(fetched)
+}
+
+/// Everything a fetched row is checked against before it can be ranked.
+struct CandidateScope {
+  allowed_roots: HashSet<i64>,
+  /// root id -> (priority, include_hidden, include_ignored)
+  root_meta: HashMap<i64, (i32, bool, bool)>,
+  extensions: Vec<String>,
+}
+
+impl CandidateScope {
+  async fn load(conn: &turso::Connection, root_ids: &[i64], query: &SearchQuery) -> Result<Self> {
+    let mut root_meta = HashMap::new();
+    let mut rows = conn
+      .query(
+        "SELECT id, priority, include_hidden, include_ignored FROM roots",
+        (),
+      )
+      .await?;
+    while let Some(row) = rows.next().await? {
+      root_meta.insert(
+        row.get::<i64>(0)?,
+        (
+          row.get::<i32>(1)?,
+          row.get::<i64>(2)? != 0,
+          row.get::<i64>(3)? != 0,
+        ),
+      );
+    }
+    Ok(Self {
+      allowed_roots: root_ids.iter().copied().collect(),
+      root_meta,
+      extensions: query
+        .extensions
+        .iter()
+        .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+        .collect(),
+    })
+  }
+
+  /// The v0.4.0 admission rules, unchanged: a row is a candidate only if it is
+  /// live, not sensitive, inside a configured root, of a requested kind, has a
+  /// requested extension, and is either clean or allowed by the query flag or
+  /// by its own root's allowance.
+  fn admit(&self, query: &SearchQuery, entry: FetchedEntry) -> Option<CandidateRow> {
+    if entry.deleted || entry.sensitive || !self.allowed_roots.contains(&entry.root_id) {
+      return None;
+    }
+    let kind_allowed = match entry.kind {
+      EntryKind::File => query.include_files,
+      EntryKind::Directory => query.include_directories,
+      EntryKind::Other => query.include_files && query.include_directories,
+    };
+    if !kind_allowed {
+      return None;
+    }
+    let (priority, root_hidden, root_ignored) = self
+      .root_meta
+      .get(&entry.root_id)
+      .copied()
+      .unwrap_or((0, false, false));
+    if entry.hidden && !(query.include_hidden || root_hidden) {
+      return None;
+    }
+    if entry.ignored && !(query.include_ignored || root_ignored) {
+      return None;
+    }
+    if !self.extensions.is_empty()
+      && !entry
+        .extension
+        .as_ref()
+        .is_some_and(|extension| self.extensions.contains(extension))
+    {
+      return None;
+    }
+    Some(CandidateRow {
+      path: entry.path,
+      kind: entry.kind,
+      root_priority: priority,
+      byte_size: entry.size,
+      modified_unix_seconds: entry.mtime,
+    })
+  }
+}
+
+/// True when every token is a prefix of some token of the path. The terms
+/// table holds exactly the tokens of the path components, so this is the same
+/// predicate the index evaluates per token, applied to one row.
+fn path_has_prefix_tokens(path: &Path, tokens: &[String]) -> bool {
+  let path_tokens = tokenize(&path.to_string_lossy());
+  tokens.iter().all(|token| {
+    path_tokens
+      .iter()
+      .any(|candidate| candidate.starts_with(token.as_str()))
+  })
 }
 
 #[derive(Debug)]
@@ -1794,7 +1947,13 @@ mod tests {
 
     let broad_started = std::time::Instant::now();
     let broad = index
-      .search_with_metrics(&config, &SearchQuery::new("batchfile").with_limit(100))
+      .search_with_options(
+        &config,
+        &SearchQuery::new("batchfile").with_limit(100),
+        SearchOptions {
+          fetch_budget: MAX_KFS_CANDIDATE_ROWS,
+        },
+      )
       .unwrap();
     let broad_elapsed = broad_started.elapsed();
 
@@ -2225,5 +2384,274 @@ mod tests {
 
     assert_eq!(miss.candidate_count, 0);
     assert_eq!(miss.coverage, CandidateCoverage::Complete);
+  }
+
+  #[test]
+  fn entry_fetch_is_a_rowid_seek_not_an_index_scan() {
+    let index = KuntuIndex::open_memory().unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", entry_fetch_sql(3));
+    let details = block_on(async {
+      let mut rows = index
+        .conn
+        .query(
+          &sql,
+          params_from_iter(vec![
+            Value::from(1i64),
+            Value::from(2i64),
+            Value::from(3i64),
+          ]),
+        )
+        .await
+        .unwrap();
+      let mut details = Vec::new();
+      while let Some(row) = rows.next().await.unwrap() {
+        details.push(row.get::<String>(3).unwrap());
+      }
+      details
+    });
+    let plan = details.join(" | ");
+    assert!(plan.contains("rowid=?"), "plan: {plan}");
+    assert!(!plan.contains("autoindex"), "plan: {plan}");
+  }
+
+  #[test]
+  fn default_fetch_budget_is_five_thousand() {
+    assert_eq!(DEFAULT_FETCH_BUDGET, 5_000);
+    assert_eq!(SearchOptions::default().fetch_budget, 5_000);
+  }
+
+  #[test]
+  fn fetch_budget_counts_admitted_candidates_not_ids() {
+    // 120 directories hold the lowest ids, then 30 files. A files-only search
+    // with a budget of 10 must still return files: the budget counts admitted
+    // rows, it is not a window over raw ids.
+    let root = temp_dir("budget-window");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..120 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("plan-dir-{number:03}"),
+        2,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    for number in 0..30 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("plan-file-{number:02}.md"),
+        1,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    let files_only = SearchQuery {
+      include_directories: false,
+      ..SearchQuery::new("plan").with_limit(100)
+    };
+
+    let tight = index
+      .search_with_options(&config, &files_only, SearchOptions { fetch_budget: 10 })
+      .unwrap();
+    assert_eq!(tight.candidate_count, 10);
+    assert_eq!(tight.results.len(), 10);
+    assert!(tight.results.iter().all(|r| r.kind == EntryKind::File));
+    assert_eq!(tight.coverage, CandidateCoverage::Truncated);
+
+    let exact = index
+      .search_with_options(&config, &files_only, SearchOptions { fetch_budget: 30 })
+      .unwrap();
+    assert_eq!(exact.candidate_count, 30);
+    assert_eq!(exact.coverage, CandidateCoverage::Complete);
+
+    let roomy = index.search_with_metrics(&config, &files_only).unwrap();
+    assert_eq!(roomy.candidate_count, 30);
+    assert_eq!(roomy.coverage, CandidateCoverage::Complete);
+    remove_dir_all_if_exists(&root).unwrap();
+  }
+
+  #[test]
+  fn policy_filters_apply_before_the_budget_not_after() {
+    // Forbidden rows (hidden, ignored, sensitive) take the lowest ids. With a
+    // budget of 2 the two allowed files behind them must still be returned.
+    let root = temp_dir("budget-policy");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..6 {
+      let flags = match number % 3 {
+        0 => (true, false, false),
+        1 => (false, true, false),
+        _ => (false, false, true),
+      };
+      plant_entry(
+        &index,
+        &root,
+        &format!("hidden-{number}/plan-secret-{number}.md"),
+        1,
+        flags,
+        &["plan"],
+      );
+    }
+    for number in 0..2 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("docs/plan-ok-{number}.md"),
+        1,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    let outcome = index
+      .search_with_options(
+        &config,
+        &SearchQuery::new("plan").with_limit(10),
+        SearchOptions { fetch_budget: 2 },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 2);
+    assert!(outcome
+      .results
+      .iter()
+      .all(|r| r.path.to_string_lossy().contains("plan-ok-")));
+  }
+
+  #[test]
+  fn fetch_budget_is_clamped_to_a_sane_range() {
+    let root = temp_dir("budget-clamp");
+    fs::create_dir_all(&root).unwrap();
+    for name in ["plan-a.md", "plan-b.md", "plan-c.md"] {
+      fs::write(root.join(name), "x\n").unwrap();
+    }
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let query = SearchQuery::new("plan").with_limit(10);
+
+    let zero = index
+      .search_with_options(&config, &query, SearchOptions { fetch_budget: 0 })
+      .unwrap();
+    assert_eq!(zero.candidate_count, 1);
+    assert_eq!(zero.coverage, CandidateCoverage::Truncated);
+
+    let huge = index
+      .search_with_options(
+        &config,
+        &query,
+        SearchOptions {
+          fetch_budget: usize::MAX,
+        },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+    assert_eq!(huge.candidate_count, 3);
+    assert_eq!(huge.coverage, CandidateCoverage::Complete);
+  }
+
+  /// 60,000 file entries named `common-N.md`; the entries at `rare_positions`
+  /// are named `rareword-common-N.md`. File-backed, planted in bulk.
+  struct RecallFixture {
+    index: KuntuIndex,
+    config: SearchConfig,
+    root: PathBuf,
+    db_dir: PathBuf,
+  }
+
+  impl RecallFixture {
+    fn cleanup(self) {
+      let _ = remove_dir_all_if_exists(&self.db_dir);
+      let _ = remove_dir_all_if_exists(&self.root);
+    }
+  }
+
+  fn recall_fixture(name: &str, rare_positions: &[usize]) -> RecallFixture {
+    let root = temp_dir(name);
+    fs::create_dir_all(&root).unwrap();
+    let root = kuntu_core::normalize_root_path(root);
+    let db_dir = temp_dir(&format!("{name}-db"));
+    fs::create_dir_all(&db_dir).unwrap();
+    let mut index = KuntuIndex::open(db_dir.join("recall.sqlite")).unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let root_id: i64 = block_on(async {
+      let mut rows = index
+        .conn
+        .query(
+          "SELECT id FROM roots WHERE path = ?1",
+          params![root.to_string_lossy()],
+        )
+        .await
+        .unwrap();
+      rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    });
+    block_on(async {
+      index.conn.execute("DELETE FROM entries", ()).await.unwrap();
+    });
+    let rare: HashSet<usize> = rare_positions.iter().copied().collect();
+    let rows: Vec<fixture::RowSpec> = (0..60_000usize)
+      .map(|number| {
+        let file_name = if rare.contains(&number) {
+          format!("rareword-common-{number}.md")
+        } else {
+          format!("common-{number}.md")
+        };
+        fixture::RowSpec {
+          path: format!("{}/{file_name}", root.to_string_lossy()),
+          is_dir: false,
+        }
+      })
+      .collect();
+    fixture::insert_rows(&mut index, root_id, &rows, 1);
+    RecallFixture {
+      index,
+      config,
+      root,
+      db_dir,
+    }
+  }
+
+  #[test]
+  #[ignore = "60k-row fixture; run in release mode via just benchmark"]
+  fn default_budget_bounds_a_broad_single_token() {
+    let fixture = recall_fixture("budget-broad", &[]);
+    let query = SearchQuery::new("common").with_limit(50);
+
+    let outcome = fixture
+      .index
+      .search_with_metrics(&fixture.config, &query)
+      .unwrap();
+    assert_eq!(outcome.candidate_count, DEFAULT_FETCH_BUDGET);
+    assert_eq!(outcome.coverage, CandidateCoverage::Truncated);
+    assert_eq!(outcome.results.len(), 50);
+    assert!(outcome.truncated);
+
+    let wide = fixture
+      .index
+      .search_with_options(
+        &fixture.config,
+        &query,
+        SearchOptions {
+          fetch_budget: MAX_KFS_CANDIDATE_ROWS,
+        },
+      )
+      .unwrap();
+    assert_eq!(wide.candidate_count, MAX_KFS_CANDIDATE_ROWS);
+    assert_eq!(wide.coverage, CandidateCoverage::Truncated);
+    fixture.cleanup();
   }
 }
