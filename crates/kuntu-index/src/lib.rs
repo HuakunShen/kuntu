@@ -859,8 +859,20 @@ impl CandidateScope {
 /// True when every token is a prefix of some token of the path. The terms
 /// table holds exactly the tokens of the path components, so this is the same
 /// predicate the index evaluates per token, applied to one row.
+///
+/// Verification must never invent a match the terms table cannot hold, so it
+/// tokenizes a path exactly the way `insert_terms_tx` derived the terms:
+/// component by component, and only from components that are valid UTF-8.
+/// `entries.path` is stored lossy, so a component that was not valid UTF-8 is
+/// recognizable only by its U+FFFD replacement; it contributed no terms at
+/// index time and contributes no token here (review P2).
 fn path_has_prefix_tokens(path: &Path, tokens: &[String]) -> bool {
-  let path_tokens = tokenize(&path.to_string_lossy());
+  let path_tokens: Vec<String> = path
+    .components()
+    .filter_map(|component| component.as_os_str().to_str())
+    .filter(|component| !component.contains('\u{FFFD}'))
+    .flat_map(tokenize)
+    .collect();
   tokens.iter().all(|token| {
     path_tokens
       .iter()
@@ -2899,5 +2911,100 @@ mod tests {
       &["alph".to_string(), "gamma".to_string()]
     ));
     assert!(path_has_prefix_tokens(path, &[]));
+  }
+
+  /// A file name whose bytes are not valid UTF-8 (`common<0xff>.md`).
+  /// `upsert_entry_tx` stores the path lossy and `insert_terms_tx` skips the
+  /// component, so the terms table holds no `common*` token for that row —
+  /// and path verification must not invent one (review P2: tokenizing the
+  /// stored lossy path turns `common\ufffd` into a `common*` match, which
+  /// v0.4.0's posting intersection excluded). macOS refuses to create such a
+  /// file on disk (`EILSEQ` from `open`), so the invalid bytes go through the
+  /// real insertion path instead of the filesystem.
+  #[cfg(unix)]
+  #[test]
+  fn path_verification_skips_components_the_indexer_never_tokenized() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = temp_dir("non-utf8-verify");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+
+    // Exactly what the write path stores for a file named `common<0xff>.md`:
+    // the lossy path, and terms derived by `insert_terms_tx` itself (the file
+    // name and its invalid component are skipped, the `md` extension and the
+    // valid path components survive).
+    let root = kuntu_core::normalize_root_path(root.to_path_buf());
+    let invalid_path = root
+      .join("rareword")
+      .join(OsStr::from_bytes(b"common\xff.md"));
+    block_on(async {
+      let root_id: i64 = {
+        let mut rows = index
+          .conn
+          .query(
+            "SELECT id FROM roots WHERE path = ?1",
+            params![root.to_string_lossy()],
+          )
+          .await
+          .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+      };
+      let stored = invalid_path.to_string_lossy().into_owned();
+      let name = invalid_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      index
+        .conn
+        .execute(
+          "INSERT INTO entries (root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, 'md', 1, 4, NULL, 0, 0, 0, 0, 0)",
+          params![
+            root_id,
+            stored.clone(),
+            stored.to_ascii_lowercase(),
+            name.clone(),
+            name.to_ascii_lowercase(),
+          ],
+        )
+        .await
+        .unwrap();
+      let entry_id: i64 = {
+        let mut rows = index
+          .conn
+          .query(
+            "SELECT id FROM entries WHERE root_id = ?1 AND path = ?2",
+            params![root_id, stored],
+          )
+          .await
+          .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+      };
+      let tx = index.conn.transaction().await.unwrap();
+      insert_terms_tx(&tx, entry_id, &invalid_path).await.unwrap();
+      tx.commit().await.unwrap();
+    });
+
+    // The rare token drives the search and `common` is verified against the
+    // driving row's own path; the invalid-name file must not pass that check.
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword common"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 0);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results.is_empty());
   }
 }
