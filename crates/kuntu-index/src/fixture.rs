@@ -418,3 +418,20 @@ pub fn open_or_build(rows: usize) -> Fixture {
     db_bytes,
   }
 }
+
+/// Measured runs of one gate class, after the untimed warm-up.
+pub const TIMED_RUNS: usize = 3;
+
+/// Timing policy of the latency gate: one untimed warm-up run, then the best
+/// of [`TIMED_RUNS`] measured runs. The warm-up absorbs the cold page cache
+/// and the freshly opened database; no measured run is abandoned early,
+/// because an early break would let the first cold run decide the gate
+/// instead of the warm runs the policy is about (review P2).
+pub fn measure_warm_best(mut run: impl FnMut() -> std::time::Duration) -> std::time::Duration {
+  run();
+  let mut best = std::time::Duration::MAX;
+  for _ in 0..TIMED_RUNS {
+    best = best.min(run());
+  }
+  best
+}

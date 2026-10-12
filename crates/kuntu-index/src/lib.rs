@@ -2365,8 +2365,9 @@ mod tests {
   /// Release-mode latency gate on the generated realistic fixture (see
   /// `fixture.rs`). Rows come from `KUNTU_BENCH_ROWS` (default 100,000; the
   /// owner runs 1,000,000 via `just benchmark-1m`), the cache directory from
-  /// `KUNTU_BENCH_DIR`. Each query class runs three times and the best run is
-  /// compared with its ceiling, so a cold page cache does not fail the gate.
+  /// `KUNTU_BENCH_DIR`. Each query class spends one untimed warm-up run and
+  /// then compares the best of `fixture::TIMED_RUNS` measured runs with its
+  /// ceiling, so a cold page cache does not fail the gate.
   ///
   /// Ceilings are the measured warm numbers of the fixed implementation at
   /// 1,000,000 rows (turso 0.7.2, M4 Pro, external disk) with generous headroom
@@ -2401,29 +2402,30 @@ mod tests {
     ];
     for (class, text, ceiling_ms) in classes {
       let query = SearchQuery::new(text).with_limit(20);
-      let mut best = std::time::Duration::MAX;
+      let runs = std::cell::Cell::new(0usize);
       let mut outcome = None;
-      for run in 0..3 {
+      // One untimed warm-up run, then the measured runs; none of them is
+      // abandoned early, so the cold first run can never decide the gate.
+      let best = fixture::measure_warm_best(|| {
         let started = std::time::Instant::now();
         let current = fixture
           .index
           .search_with_metrics(&fixture.config, &query)
           .unwrap();
         let elapsed = started.elapsed();
+        let run = runs.get();
+        runs.set(run + 1);
         eprintln!(
-          "GATE rows={rows} class={class} run={run} ms={:.1} candidates={} results={} coverage={:?}",
+          "GATE rows={rows} class={class} run={run}{} ms={:.1} candidates={} results={} coverage={:?}",
+          if run == 0 { " (warm-up, not gated)" } else { "" },
           elapsed.as_secs_f64() * 1000.0,
           current.candidate_count,
           current.results.len(),
           current.coverage
         );
-        best = best.min(elapsed);
         outcome = Some(current);
-        // A hopeless run is not repeated.
-        if elapsed.as_millis() > ceiling_ms * 20 {
-          break;
-        }
-      }
+        elapsed
+      });
       let outcome = outcome.unwrap();
       match class {
         "miss" | "miss_non_ascii" => {
@@ -2445,7 +2447,8 @@ mod tests {
       }
       assert!(
         best.as_millis() <= ceiling_ms,
-        "{class}: best of 3 runs took {best:?}, ceiling {ceiling_ms} ms"
+        "{class}: best of {} warm runs took {best:?}, ceiling {ceiling_ms} ms",
+        fixture::TIMED_RUNS
       );
     }
   }
@@ -3006,5 +3009,26 @@ mod tests {
     assert_eq!(outcome.candidate_count, 0);
     assert_eq!(outcome.coverage, CandidateCoverage::Complete);
     assert!(outcome.results.is_empty());
+  }
+
+  /// The latency gate's timing policy (review P2): the first run pays the
+  /// cold page cache, so it is spent as an untimed warm-up; the gate judges
+  /// the best of the measured runs after it, and no measured run is
+  /// abandoned early (an early break lets the cold run decide the gate).
+  #[test]
+  fn gate_timing_warms_up_untimed_then_judges_the_best_of_three() {
+    use std::cell::Cell;
+
+    let calls = Cell::new(0usize);
+    // The cold call first (1001 ms against a 25 ms ceiling), then the warm
+    // ones that must decide the gate.
+    let best = fixture::measure_warm_best(|| {
+      let call = calls.get();
+      calls.set(call + 1);
+      std::time::Duration::from_millis([1001, 4, 1, 3][call])
+    });
+
+    assert_eq!(calls.get(), 4, "one warm-up plus three measured runs");
+    assert_eq!(best, std::time::Duration::from_millis(1));
   }
 }
