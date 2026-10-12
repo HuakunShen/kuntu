@@ -130,6 +130,31 @@ pub struct KuntuIndex {
   conn: turso::Connection,
 }
 
+/// Default number of candidates one search loads and ranks. Candidates are
+/// counted after scope, kind, extension and policy filtering, so rows the
+/// caller may not see never consume the budget. Reaching it reports
+/// [`CandidateCoverage::Truncated`].
+pub const DEFAULT_FETCH_BUDGET: usize = 5_000;
+
+/// Ids per `IN (...)` statement when loading candidate rows.
+const FETCH_CHUNK_IDS: usize = 1_000;
+
+/// Per-search tuning. `search_with_metrics` uses the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+  /// Maximum admitted candidates to load and rank. Clamped to
+  /// `1..=MAX_KFS_CANDIDATE_ROWS`.
+  pub fetch_budget: usize,
+}
+
+impl Default for SearchOptions {
+  fn default() -> Self {
+    Self {
+      fetch_budget: DEFAULT_FETCH_BUDGET,
+    }
+  }
+}
+
 impl MetadataIndex for KuntuIndex {
   fn rebuild_index(
     &mut self,
@@ -501,6 +526,19 @@ impl KuntuIndex {
     config: &SearchConfig,
     query: &SearchQuery,
   ) -> Result<IndexedSearchOutcome> {
+    self.search_with_options(config, query, SearchOptions::default())
+  }
+
+  /// Search with explicit options. Scope, kind, extension and policy filters
+  /// apply to every candidate before ranking and before the fetch budget and
+  /// the result window, exactly as in `search_with_metrics`.
+  pub fn search_with_options(
+    &self,
+    config: &SearchConfig,
+    query: &SearchQuery,
+    options: SearchOptions,
+  ) -> Result<IndexedSearchOutcome> {
+    let budget = options.fetch_budget.clamp(1, MAX_KFS_CANDIDATE_ROWS);
     block_on(async {
       let empty = IndexedSearchOutcome {
         candidate_count: 0,
@@ -522,121 +560,98 @@ impl KuntuIndex {
         return Ok(empty);
       }
 
-      // Candidate selection runs in two stages. Stage 1 resolves each query
-      // token to a bounded, distinct entry-id set straight off the terms
-      // primary key (a range seek — the production-proven shape; turso's
-      // planner full-scans the joined form). The id sets are intersected in
-      // Rust. Stage 2 loads the intersection in chunks with every scope,
-      // kind and policy predicate in SQL, so nothing outside the configured
-      // scope, kind or policy can become a candidate, and no stage scans a
-      // whole root. There is no non-indexed fallback: a token that matches
-      // nothing ends the search with empty complete coverage.
-      let mut intersection: Option<std::collections::BTreeSet<i64>> = None;
-      let mut any_token_saturated = false;
+      // Stage 1: posting lists, one range seek per unique token.
+      //
+      // A token's list is cheap to load, but two broad tokens cannot be
+      // intersected by capping each list (a selective token plus a common one
+      // would silently lose rows: the common list is cut at the work bound and
+      // most of the selective token's rows fall outside it). Instead the
+      // smallest *complete* list drives the search: its entries are fetched
+      // and every other token is verified against the row's own path, which is
+      // exactly the predicate the terms table encodes. Only when every token
+      // is too broad to load completely are the capped lists intersected, and
+      // the result is then reported as truncated.
+      let unique_terms: std::collections::BTreeSet<String> = query_terms.into_iter().collect();
 
-      // A repeated token would repeat an up-to-50k-row scan without
-      // changing the intersection or the ranking.
-      let unique_terms: std::collections::BTreeSet<&String> = query_terms.iter().collect();
-      for term in unique_terms {
-        let (term_clause, mut values) = term_prefix_clause(term);
-        let term_clause = term_clause.replace("t.term", "term_index.term");
-        let sql = format!(
-          "SELECT DISTINCT term_index.entry_id FROM terms AS term_index WHERE {term_clause} ORDER BY term_index.entry_id LIMIT ?"
-        );
-        values.push(Value::from(MAX_KFS_CANDIDATE_ROWS as i64 + 1));
-        let mut rows = self.conn.query(&sql, params_from_iter(values)).await?;
-        let mut ids = std::collections::BTreeSet::new();
-        while let Some(row) = rows.next().await? {
-          if ids.len() == MAX_KFS_CANDIDATE_ROWS {
-            any_token_saturated = true;
-            break;
-          }
-          ids.insert(row.get::<i64>(0)?);
+      let mut lists: Vec<(String, TokenPostings)> = Vec::new();
+      for term in &unique_terms {
+        let postings = load_postings(&self.conn, term, DRIVER_PROBE_ROWS, usize::MAX).await?;
+        if postings.complete && postings.ids.is_empty() {
+          // A token that matches nothing ends the search: empty and complete.
+          return Ok(empty);
         }
-
-        intersection = Some(match intersection {
-          None => ids,
-          Some(previous) => previous
-            .intersection(&ids)
-            .copied()
-            .collect::<std::collections::BTreeSet<i64>>(),
-        });
-        if intersection.as_ref().is_some_and(|ids| ids.is_empty()) {
-          break;
-        }
+        lists.push((term.clone(), postings));
       }
-
-      let intersected = intersection.unwrap_or_default();
-      let id_list: Vec<i64> = intersected.into_iter().collect();
-
-      let mut clauses = vec!["entries_main.deleted = 0".to_string()];
-      clauses.push(format!(
-        "entries_main.root_id IN ({})",
-        placeholders(root_ids.len())
-      ));
-      match (query.include_files, query.include_directories) {
-        (true, true) => {}
-        (true, false) => {
-          clauses.push(format!(
-            "entries_main.kind = {}",
-            kind_to_int(EntryKind::File)
-          ));
+      let mut driver = smallest_complete(&lists);
+      if driver.is_none() {
+        lists.clear();
+        for term in &unique_terms {
+          let postings = load_postings(
+            &self.conn,
+            term,
+            MAX_KFS_CANDIDATE_ROWS * 3,
+            MAX_KFS_CANDIDATE_ROWS,
+          )
+          .await?;
+          lists.push((term.clone(), postings));
         }
-        (false, true) => {
-          clauses.push(format!(
-            "entries_main.kind = {}",
-            kind_to_int(EntryKind::Directory)
-          ));
-        }
-        (false, false) => unreachable!("handled by the early return above"),
+        driver = smallest_complete(&lists);
       }
-      // A row is visible when it is clean, or the query relaxes the flag,
-      // or its own root was configured to allow it (the crawler only indexed
-      // rows its root permitted).
-      clauses.push("(entries_main.hidden = 0 OR ? OR roots_pri.include_hidden = 1)".to_string());
-      clauses.push("(entries_main.ignored = 0 OR ? OR roots_pri.include_ignored = 1)".to_string());
-      clauses.push("entries_main.sensitive = 0".to_string());
-      if !query.extensions.is_empty() {
-        clauses.push(format!(
-          "entries_main.extension IN ({})",
-          placeholders(query.extensions.len())
-        ));
-      }
-      let predicate_clause = clauses.join(" AND ");
-
-      let mut candidates: Vec<CandidateRow> = Vec::new();
-      for chunk in id_list.chunks(400) {
-        let sql = format!(
-          "SELECT entries_main.path, entries_main.kind, roots_pri.priority, entries_main.size, entries_main.mtime
-             FROM entries AS entries_main
-             JOIN roots AS roots_pri ON roots_pri.id = entries_main.root_id
-             WHERE entries_main.id IN ({}) AND {predicate_clause}",
-          placeholders(chunk.len())
-        );
-        let mut values: Vec<Value> = chunk.iter().copied().map(Value::from).collect();
-        values.extend(root_ids.iter().copied().map(Value::from));
-        values.push(Value::from(query.include_hidden));
-        values.push(Value::from(query.include_ignored));
-        if !query.extensions.is_empty() {
-          values.extend(
-            query
-              .extensions
+      let (id_list, verify_tokens, any_token_saturated): (Vec<i64>, Vec<String>, bool) =
+        match driver {
+          Some(position) => {
+            let verify_tokens = lists
               .iter()
-              .map(|extension| Value::from(extension.trim_start_matches('.').to_ascii_lowercase())),
-          );
+              .enumerate()
+              .filter(|(index, _)| *index != position)
+              .map(|(_, (term, _))| term.clone())
+              .collect();
+            (rank_ids(&[&lists[position].1.ids]), verify_tokens, false)
+          }
+          None => {
+            let id_maps: Vec<&std::collections::BTreeMap<i64, bool>> =
+              lists.iter().map(|(_, postings)| &postings.ids).collect();
+            (rank_ids(&id_maps), Vec::new(), true)
+          }
+        };
+      // Stage 2: load the candidate rows by id and filter in Rust.
+      //
+      // The fetch statement carries no predicate at all. turso's planner turns
+      // any indexed predicate beside the id list (root_id, extension) into a
+      // scan of that index, which costs a whole-root scan per batch; the bare
+      // `id IN (...)` is a rowid seek. Scope, kind, extension and policy are
+      // therefore applied to each fetched row before it can become a
+      // candidate, so nothing outside the configured scope or policy is ever
+      // ranked, and the budget counts only admitted rows.
+      let scope = CandidateScope::load(&self.conn, &root_ids, query).await?;
+      let mut candidates: Vec<CandidateRow> = Vec::new();
+      let mut examined = 0usize;
+      'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
+        let mut admitted: HashMap<i64, CandidateRow> = HashMap::new();
+        for entry in fetch_entries_by_id(&self.conn, chunk).await? {
+          if !verify_tokens.is_empty()
+            && !verify_candidate_tokens(&self.conn, entry.id, &entry.path, &verify_tokens).await?
+          {
+            continue;
+          }
+          let id = entry.id;
+          if let Some(candidate) = scope.admit(query, entry) {
+            admitted.insert(id, candidate);
+          }
         }
-        let mut rows = self.conn.query(&sql, params_from_iter(values)).await?;
-        while let Some(row) = rows.next().await? {
-          let mtime: Option<i64> = row.get(4)?;
-          candidates.push(CandidateRow {
-            path: PathBuf::from(row.get::<String>(0)?),
-            kind: int_to_kind(row.get::<i64>(1)?),
-            root_priority: row.get::<i32>(2)?,
-            byte_size: u64::try_from(row.get::<i64>(3).unwrap_or(-1)).ok(),
-            modified_unix_seconds: u64::try_from(mtime.unwrap_or(-1)).ok(),
-          });
+        for id in chunk {
+          examined += 1;
+          if let Some(candidate) = admitted.remove(id) {
+            candidates.push(candidate);
+            if candidates.len() == budget {
+              break 'chunks;
+            }
+          }
         }
       }
+      // The budget stopped the search before every id was examined.
+      let budget_truncated = candidates.len() == budget && examined < id_list.len();
+      let any_token_saturated = any_token_saturated || budget_truncated;
       let candidate_count = candidates.len();
       let candidate_saturated = any_token_saturated;
 
@@ -708,6 +723,299 @@ impl KuntuIndex {
       Ok(collected)
     })
   }
+}
+
+/// One `entries` row as stored, fetched by id.
+struct FetchedEntry {
+  id: i64,
+  root_id: i64,
+  path: PathBuf,
+  kind: EntryKind,
+  size: Option<u64>,
+  mtime: Option<u64>,
+  extension: Option<String>,
+  hidden: bool,
+  ignored: bool,
+  sensitive: bool,
+  deleted: bool,
+}
+
+/// The candidate fetch. Keep it free of predicates: see the note at stage 2 of
+/// `search_with_options` and the plan test that pins this statement.
+fn entry_fetch_sql(id_count: usize) -> String {
+  format!(
+    "SELECT id, root_id, path, kind, size, mtime, extension, hidden, ignored, sensitive, deleted
+       FROM entries WHERE id IN ({})",
+    placeholders(id_count)
+  )
+}
+
+async fn fetch_entries_by_id(conn: &turso::Connection, ids: &[i64]) -> Result<Vec<FetchedEntry>> {
+  let values: Vec<Value> = ids.iter().copied().map(Value::from).collect();
+  let mut rows = conn
+    .query(&entry_fetch_sql(ids.len()), params_from_iter(values))
+    .await?;
+  let mut fetched = Vec::with_capacity(ids.len());
+  while let Some(row) = rows.next().await? {
+    let mtime: Option<i64> = row.get(5)?;
+    fetched.push(FetchedEntry {
+      id: row.get::<i64>(0)?,
+      root_id: row.get::<i64>(1)?,
+      path: PathBuf::from(row.get::<String>(2)?),
+      kind: int_to_kind(row.get::<i64>(3)?),
+      size: u64::try_from(row.get::<i64>(4).unwrap_or(-1)).ok(),
+      mtime: u64::try_from(mtime.unwrap_or(-1)).ok(),
+      extension: row.get(6)?,
+      hidden: row.get::<i64>(7)? != 0,
+      ignored: row.get::<i64>(8)? != 0,
+      sensitive: row.get::<i64>(9)? != 0,
+      deleted: row.get::<i64>(10)? != 0,
+    });
+  }
+  Ok(fetched)
+}
+
+/// Everything a fetched row is checked against before it can be ranked.
+struct CandidateScope {
+  allowed_roots: HashSet<i64>,
+  /// root id -> (priority, include_hidden, include_ignored)
+  root_meta: HashMap<i64, (i32, bool, bool)>,
+  extensions: Vec<String>,
+}
+
+impl CandidateScope {
+  async fn load(conn: &turso::Connection, root_ids: &[i64], query: &SearchQuery) -> Result<Self> {
+    let mut root_meta = HashMap::new();
+    let mut rows = conn
+      .query(
+        "SELECT id, priority, include_hidden, include_ignored FROM roots",
+        (),
+      )
+      .await?;
+    while let Some(row) = rows.next().await? {
+      root_meta.insert(
+        row.get::<i64>(0)?,
+        (
+          row.get::<i32>(1)?,
+          row.get::<i64>(2)? != 0,
+          row.get::<i64>(3)? != 0,
+        ),
+      );
+    }
+    Ok(Self {
+      allowed_roots: root_ids.iter().copied().collect(),
+      root_meta,
+      extensions: query
+        .extensions
+        .iter()
+        .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+        .collect(),
+    })
+  }
+
+  /// The v0.4.0 admission rules, unchanged: a row is a candidate only if it is
+  /// live, not sensitive, inside a configured root, of a requested kind, has a
+  /// requested extension, and is either clean or allowed by the query flag or
+  /// by its own root's allowance.
+  fn admit(&self, query: &SearchQuery, entry: FetchedEntry) -> Option<CandidateRow> {
+    if entry.deleted || entry.sensitive || !self.allowed_roots.contains(&entry.root_id) {
+      return None;
+    }
+    let kind_allowed = match entry.kind {
+      EntryKind::File => query.include_files,
+      EntryKind::Directory => query.include_directories,
+      EntryKind::Other => query.include_files && query.include_directories,
+    };
+    if !kind_allowed {
+      return None;
+    }
+    let (priority, root_hidden, root_ignored) = self
+      .root_meta
+      .get(&entry.root_id)
+      .copied()
+      .unwrap_or((0, false, false));
+    if entry.hidden && !(query.include_hidden || root_hidden) {
+      return None;
+    }
+    if entry.ignored && !(query.include_ignored || root_ignored) {
+      return None;
+    }
+    if !self.extensions.is_empty()
+      && !entry
+        .extension
+        .as_ref()
+        .is_some_and(|extension| self.extensions.contains(extension))
+    {
+      return None;
+    }
+    Some(CandidateRow {
+      path: entry.path,
+      kind: entry.kind,
+      root_priority: priority,
+      byte_size: entry.size,
+      modified_unix_seconds: entry.mtime,
+    })
+  }
+}
+
+/// True when every token is a prefix of some token of the path, counting only
+/// the components that were certainly indexed: `insert_terms_tx` derives the
+/// terms component by component from valid UTF-8, so a component containing
+/// the U+FFFD replacement character is ambiguous (see
+/// [`verify_candidate_tokens`]) and is not trusted here.
+fn path_has_prefix_tokens(path: &Path, tokens: &[String]) -> bool {
+  let path_tokens = trusted_path_tokens(path);
+  tokens.iter().all(|token| {
+    path_tokens
+      .iter()
+      .any(|candidate| candidate.starts_with(token.as_str()))
+  })
+}
+
+/// The tokens of the path components that were certainly indexed.
+fn trusted_path_tokens(path: &Path) -> Vec<String> {
+  path
+    .components()
+    .filter_map(|component| component.as_os_str().to_str())
+    .filter(|component| !component.contains('\u{FFFD}'))
+    .flat_map(tokenize)
+    .collect()
+}
+
+/// True when any component of the stored path carries the U+FFFD replacement
+/// character.
+fn path_has_lossy_component(path: &Path) -> bool {
+  path
+    .components()
+    .any(|component| component.as_os_str().to_string_lossy().contains('\u{FFFD}'))
+}
+
+/// The one statement the lossy-path fallback reads: a single entry's stored
+/// terms, including its extension term, through `idx_terms_entry`.
+fn entry_terms_sql() -> &'static str {
+  "SELECT term FROM terms WHERE entry_id = ?1"
+}
+
+/// Stage-2 verification of the driver's remaining tokens against one row.
+///
+/// A stored path cannot tell a legitimate U+FFFD character from the shadow of
+/// invalid bytes: insertion indexes the first and skips the second (while
+/// still indexing its valid extension), so neither inventing nor dropping a
+/// match can be decided from the path text alone. Only the U+FFFD-free
+/// components are trusted; when a token matches none of them and the path
+/// carries U+FFFD anywhere, the tokens are verified against the entry's own
+/// stored terms — exactly the predicate `v0.4.0`'s posting intersection
+/// required. A path without U+FFFD is byte-identical to what was indexed, so
+/// it needs no lookup.
+async fn verify_candidate_tokens(
+  conn: &turso::Connection,
+  entry_id: i64,
+  path: &Path,
+  tokens: &[String],
+) -> Result<bool> {
+  if path_has_prefix_tokens(path, tokens) {
+    return Ok(true);
+  }
+  if !path_has_lossy_component(path) {
+    return Ok(false);
+  }
+  let mut remaining: Vec<&str> = tokens.iter().map(String::as_str).collect();
+  let mut rows = conn.query(entry_terms_sql(), params![entry_id]).await?;
+  while let Some(row) = rows.next().await? {
+    let term = row.get::<String>(0)?;
+    remaining.retain(|token| !term.starts_with(token));
+    if remaining.is_empty() {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+/// Rows read from the terms table to decide whether a token's whole posting
+/// list is small enough to drive a search.
+const DRIVER_PROBE_ROWS: usize = 1_000;
+
+/// One token's posting list: entry id -> whether the token hit the file name
+/// (field 1) of that entry.
+struct TokenPostings {
+  ids: std::collections::BTreeMap<i64, bool>,
+  /// False when a row or distinct-id limit cut the list short.
+  complete: bool,
+}
+
+/// Load the posting rows of every term that starts with `term`, stopping after
+/// `row_limit` rows or `distinct_cap` distinct ids. The statement is a plain
+/// range over the covering primary-key index: no `DISTINCT`, no `ORDER BY`
+/// (either makes turso choose the non-covering `idx_terms_term` and a sorter).
+async fn load_postings(
+  conn: &turso::Connection,
+  term: &str,
+  row_limit: usize,
+  distinct_cap: usize,
+) -> Result<TokenPostings> {
+  let (clause, mut values) = term_prefix_clause(term);
+  let sql = format!("SELECT entry_id, field FROM terms WHERE {clause} LIMIT ?");
+  values.push(Value::from(
+    i64::try_from(row_limit).unwrap_or(i64::MAX - 1) + 1,
+  ));
+  let mut rows = conn.query(&sql, params_from_iter(values)).await?;
+  let mut ids = std::collections::BTreeMap::new();
+  let mut seen_rows = 0usize;
+  let mut complete = true;
+  while let Some(row) = rows.next().await? {
+    if seen_rows == row_limit {
+      complete = false;
+      break;
+    }
+    seen_rows += 1;
+    let id = row.get::<i64>(0)?;
+    let name_hit = row.get::<i64>(1)? == 1;
+    if !ids.contains_key(&id) && ids.len() == distinct_cap {
+      complete = false;
+      break;
+    }
+    let entry = ids.entry(id).or_insert(false);
+    *entry = *entry || name_hit;
+  }
+  Ok(TokenPostings { ids, complete })
+}
+
+/// Position of the complete list with the fewest entries.
+fn smallest_complete(lists: &[(String, TokenPostings)]) -> Option<usize> {
+  lists
+    .iter()
+    .enumerate()
+    .filter(|(_, (_, postings))| postings.complete)
+    .min_by_key(|(_, (_, postings))| postings.ids.len())
+    .map(|(position, _)| position)
+}
+
+/// Ids present in every list, file-name hits first (by how many tokens hit
+/// the file name), then by id, so a truncated search keeps the strongest rows
+/// and stays deterministic.
+fn rank_ids(lists: &[&std::collections::BTreeMap<i64, bool>]) -> Vec<i64> {
+  let Some((first, rest)) = lists.split_first() else {
+    return Vec::new();
+  };
+  let mut ranked: Vec<(usize, i64)> = Vec::new();
+  for (&id, &name_hit) in first.iter() {
+    let mut name_hits = usize::from(name_hit);
+    let mut in_every_list = true;
+    for other in rest {
+      match other.get(&id) {
+        Some(&hit) => name_hits += usize::from(hit),
+        None => {
+          in_every_list = false;
+          break;
+        }
+      }
+    }
+    if in_every_list {
+      ranked.push((name_hits, id));
+    }
+  }
+  ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+  ranked.into_iter().map(|(_, id)| id).collect()
 }
 
 #[derive(Debug)]
@@ -1006,20 +1314,24 @@ fn placeholders(count: usize) -> String {
     .join(",")
 }
 
+/// Range predicate for one query token: every term that starts with `term`.
+/// Terms are compared bytewise, so the exclusive upper bound is the prefix with
+/// its last ASCII byte incremented, or, for anything non-ASCII, the prefix
+/// followed by U+10FFFF (a noncharacter that never occurs in a term). A range
+/// is a seek on the covering primary-key index; `LIKE` is a scan of the table.
 fn term_prefix_clause(term: &str) -> (String, Vec<Value>) {
-  if let Some(upper_bound) = ascii_prefix_upper_bound(term) {
-    (
-      "t.term >= ? AND t.term < ?".to_string(),
-      vec![Value::from(term.to_string()), Value::from(upper_bound)],
-    )
-  } else {
-    (
-      "t.term LIKE ?".to_string(),
-      vec![Value::from(format!("{term}%"))],
-    )
-  }
+  (
+    "term >= ? AND term < ?".to_string(),
+    vec![
+      Value::from(term.to_string()),
+      Value::from(term_prefix_upper_bound(term)),
+    ],
+  )
 }
 
+fn term_prefix_upper_bound(prefix: &str) -> String {
+  ascii_prefix_upper_bound(prefix).unwrap_or_else(|| format!("{prefix}\u{10FFFF}"))
+}
 fn ascii_prefix_upper_bound(prefix: &str) -> Option<String> {
   if prefix.is_empty() || !prefix.is_ascii() {
     return None;
@@ -1177,6 +1489,9 @@ CREATE INDEX IF NOT EXISTS idx_terms_term ON terms(term);
 CREATE INDEX IF NOT EXISTS idx_terms_entry ON terms(entry_id);
 CREATE INDEX IF NOT EXISTS idx_entries_root_deleted_path_lower ON entries(root_id, deleted, path_lower);
 ";
+
+#[cfg(test)]
+mod fixture;
 
 #[cfg(test)]
 mod tests {
@@ -1787,7 +2102,13 @@ mod tests {
 
     let broad_started = std::time::Instant::now();
     let broad = index
-      .search_with_metrics(&config, &SearchQuery::new("batchfile").with_limit(100))
+      .search_with_options(
+        &config,
+        &SearchQuery::new("batchfile").with_limit(100),
+        SearchOptions {
+          fetch_budget: MAX_KFS_CANDIDATE_ROWS,
+        },
+      )
       .unwrap();
     let broad_elapsed = broad_started.elapsed();
 
@@ -1819,16 +2140,19 @@ mod tests {
     run_bounded_fixture("bounded-60k", 60_000, 5, 60);
   }
 
-  /// The plan's one-million-row benchmark. Debug-profile turso inserts grow
-  /// superlinearly past ~200k rows, so this runs ignored; measure with
+  /// The single-term one-million-row benchmark: one posting list of 1,000,000
+  /// rows. The miss is a seek (about 1 ms) and the wide-budget broad query
+  /// loads exactly `MAX_KFS_CANDIDATE_ROWS` candidates. This fixture is
+  /// pathological on purpose; the realistic 1M benchmark is
+  /// `realistic_fixture_latency_gate` (`just benchmark-1m`). Debug-profile
+  /// turso inserts grow superlinearly past ~200k rows, so this runs ignored;
+  /// measure with
   /// `cargo test --release -p kuntu-index one_million -- --ignored --nocapture`.
   ///
-  /// KNOWN ENGINE GAP, measured 2026-09-14 on turso 0.7.2 (release, M-series
-  /// Mac): the planner does not seek the terms primary key for a range
-  /// predicate — it full-scans the terms table, so a miss costs ~7.5 s at 1M
-  /// rows instead of the O(1) a seek would give. The scan predates this
-  /// change (v0.2.x ran the same range shape), and the no-fallback contract
-  /// this test guards (empty result, candidate_count 0) holds regardless.
+  /// History: before v0.5.0 this test failed its broad ceiling (1,005 s) because
+  /// the candidate fetch scanned the whole root once per batch. The README's
+  /// earlier note blaming the terms range predicate (a "7.5 s miss") was wrong:
+  /// the range was always a seek.
   #[test]
   #[ignore = "one-million-row benchmark; run in release mode"]
   fn one_million_row_root_stays_bounded_on_miss_and_broad_prefix() {
@@ -2087,5 +2411,763 @@ mod tests {
       !path.exists(),
       "a database must not be created at a lossy alias"
     );
+  }
+
+  /// Release-mode latency gate on the generated realistic fixture (see
+  /// `fixture.rs`). Rows come from `KUNTU_BENCH_ROWS` (default 100,000; the
+  /// owner runs 1,000,000 via `just benchmark-1m`), the cache directory from
+  /// `KUNTU_BENCH_DIR`. Each query class spends one untimed warm-up run and
+  /// then compares the best of `fixture::TIMED_RUNS` measured runs with its
+  /// ceiling, so a cold page cache does not fail the gate.
+  ///
+  /// Ceilings are the measured warm numbers of the fixed implementation at
+  /// 1,000,000 rows (turso 0.7.2, M4 Pro, external disk) with generous headroom
+  /// for a slow disk and a loaded machine. They are regression guards, not
+  /// targets. The unfixed implementation fails the non-ASCII miss (full terms
+  /// scan) and then the broad classes (per-batch root scan) by orders of
+  /// magnitude.
+  #[test]
+  #[ignore = "latency gate on a generated fixture; run in release mode via just benchmark"]
+  fn realistic_fixture_latency_gate() {
+    let rows: usize = std::env::var("KUNTU_BENCH_ROWS")
+      .ok()
+      .and_then(|value| value.parse().ok())
+      .unwrap_or(100_000);
+    let fixture = fixture::open_or_build(rows);
+    eprintln!(
+      "GATE fixture rows={} bytes={} build_secs={:?}",
+      fixture.rows, fixture.db_bytes, fixture.build_secs
+    );
+    let queries = &fixture.queries;
+    // (class, query text, ceiling in milliseconds)
+    let classes: Vec<(&str, String, u128)> = vec![
+      ("miss", "zzqqx".to_string(), 25),
+      ("miss_non_ascii", "zzqqé".to_string(), 25),
+      ("rare", queries.rare.clone(), 50),
+      ("mid", queries.mid.clone(), 100),
+      ("broad", queries.broad.clone(), 400),
+      ("prefix3", queries.prefix3.clone(), 400),
+      ("mixed", queries.mixed.clone(), 300),
+      ("all_rows", queries.all_rows.clone(), 600),
+      ("prefix1", queries.prefix1.clone(), 800),
+    ];
+    for (class, text, ceiling_ms) in classes {
+      let query = SearchQuery::new(text).with_limit(20);
+      let runs = std::cell::Cell::new(0usize);
+      let mut outcome = None;
+      // One untimed warm-up run, then the measured runs; none of them is
+      // abandoned early, so the cold first run can never decide the gate.
+      let best = fixture::measure_warm_best(|| {
+        let started = std::time::Instant::now();
+        let current = fixture
+          .index
+          .search_with_metrics(&fixture.config, &query)
+          .unwrap();
+        let elapsed = started.elapsed();
+        let run = runs.get();
+        runs.set(run + 1);
+        eprintln!(
+          "GATE rows={rows} class={class} run={run}{} ms={:.1} candidates={} results={} coverage={:?}",
+          if run == 0 { " (warm-up, not gated)" } else { "" },
+          elapsed.as_secs_f64() * 1000.0,
+          current.candidate_count,
+          current.results.len(),
+          current.coverage
+        );
+        outcome = Some(current);
+        elapsed
+      });
+      let outcome = outcome.unwrap();
+      match class {
+        "miss" | "miss_non_ascii" => {
+          assert_eq!(outcome.candidate_count, 0, "{class}");
+          assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{class}");
+        }
+        "rare" => assert!(outcome.candidate_count >= 1, "{class}"),
+        "mid" => assert!(outcome.candidate_count >= 10, "{class}"),
+        "broad" | "prefix3" => assert!(outcome.candidate_count >= 1_000, "{class}"),
+        "mixed" => {
+          // Mixed selectivity must be exact: every row with both tokens.
+          assert_eq!(outcome.candidate_count, queries.mixed_truth, "{class}");
+          assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{class}");
+        }
+        "all_rows" | "prefix1" => {
+          assert_eq!(outcome.coverage, CandidateCoverage::Truncated, "{class}")
+        }
+        other => unreachable!("{other}"),
+      }
+      assert!(
+        best.as_millis() <= ceiling_ms,
+        "{class}: best of {} warm runs took {best:?}, ceiling {ceiling_ms} ms",
+        fixture::TIMED_RUNS
+      );
+    }
+  }
+
+  #[test]
+  fn non_ascii_prefixes_use_a_range_not_like() {
+    for term in ["é", "café", "计划", "zzqqé"] {
+      let (clause, values) = term_prefix_clause(term);
+      assert!(!clause.contains("LIKE"), "{term}: {clause}");
+      assert_eq!(values.len(), 2, "{term}");
+    }
+  }
+
+  #[test]
+  fn non_ascii_tokens_are_found_by_prefix_and_misses_are_empty() {
+    let root = temp_dir("non-ascii-prefix");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("café-menu.txt"), "a\n").unwrap();
+    fs::write(root.join("计划书A.md"), "b\n").unwrap();
+    fs::write(root.join("plain.txt"), "c\n").unwrap();
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for (query, expected) in [
+      ("caf", "café-menu.txt"),
+      ("café", "café-menu.txt"),
+      ("计", "计划书A.md"),
+      ("计划", "计划书A.md"),
+    ] {
+      let outcome = index
+        .search_with_metrics(&config, &SearchQuery::new(query))
+        .unwrap();
+      assert_eq!(outcome.results.len(), 1, "{query}");
+      assert!(outcome.results[0].path.ends_with(expected), "{query}");
+    }
+    let miss = index
+      .search_with_metrics(&config, &SearchQuery::new("zzqqé"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(miss.candidate_count, 0);
+    assert_eq!(miss.coverage, CandidateCoverage::Complete);
+  }
+
+  #[test]
+  fn entry_fetch_is_a_rowid_seek_not_an_index_scan() {
+    let index = KuntuIndex::open_memory().unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", entry_fetch_sql(3));
+    let details = block_on(async {
+      let mut rows = index
+        .conn
+        .query(
+          &sql,
+          params_from_iter(vec![
+            Value::from(1i64),
+            Value::from(2i64),
+            Value::from(3i64),
+          ]),
+        )
+        .await
+        .unwrap();
+      let mut details = Vec::new();
+      while let Some(row) = rows.next().await.unwrap() {
+        details.push(row.get::<String>(3).unwrap());
+      }
+      details
+    });
+    let plan = details.join(" | ");
+    assert!(plan.contains("rowid=?"), "plan: {plan}");
+    assert!(!plan.contains("autoindex"), "plan: {plan}");
+  }
+
+  #[test]
+  fn default_fetch_budget_is_five_thousand() {
+    assert_eq!(DEFAULT_FETCH_BUDGET, 5_000);
+    assert_eq!(SearchOptions::default().fetch_budget, 5_000);
+  }
+
+  #[test]
+  fn fetch_budget_counts_admitted_candidates_not_ids() {
+    // 120 directories hold the lowest ids, then 30 files. A files-only search
+    // with a budget of 10 must still return files: the budget counts admitted
+    // rows, it is not a window over raw ids.
+    let root = temp_dir("budget-window");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..120 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("plan-dir-{number:03}"),
+        2,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    for number in 0..30 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("plan-file-{number:02}.md"),
+        1,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    let files_only = SearchQuery {
+      include_directories: false,
+      ..SearchQuery::new("plan").with_limit(100)
+    };
+
+    let tight = index
+      .search_with_options(&config, &files_only, SearchOptions { fetch_budget: 10 })
+      .unwrap();
+    assert_eq!(tight.candidate_count, 10);
+    assert_eq!(tight.results.len(), 10);
+    assert!(tight.results.iter().all(|r| r.kind == EntryKind::File));
+    assert_eq!(tight.coverage, CandidateCoverage::Truncated);
+
+    let exact = index
+      .search_with_options(&config, &files_only, SearchOptions { fetch_budget: 30 })
+      .unwrap();
+    assert_eq!(exact.candidate_count, 30);
+    assert_eq!(exact.coverage, CandidateCoverage::Complete);
+
+    let roomy = index.search_with_metrics(&config, &files_only).unwrap();
+    assert_eq!(roomy.candidate_count, 30);
+    assert_eq!(roomy.coverage, CandidateCoverage::Complete);
+    remove_dir_all_if_exists(&root).unwrap();
+  }
+
+  #[test]
+  fn policy_filters_apply_before_the_budget_not_after() {
+    // Forbidden rows (hidden, ignored, sensitive) take the lowest ids. With a
+    // budget of 2 the two allowed files behind them must still be returned.
+    let root = temp_dir("budget-policy");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..6 {
+      let flags = match number % 3 {
+        0 => (true, false, false),
+        1 => (false, true, false),
+        _ => (false, false, true),
+      };
+      plant_entry(
+        &index,
+        &root,
+        &format!("hidden-{number}/plan-secret-{number}.md"),
+        1,
+        flags,
+        &["plan"],
+      );
+    }
+    for number in 0..2 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("docs/plan-ok-{number}.md"),
+        1,
+        (false, false, false),
+        &["plan"],
+      );
+    }
+    let outcome = index
+      .search_with_options(
+        &config,
+        &SearchQuery::new("plan").with_limit(10),
+        SearchOptions { fetch_budget: 2 },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 2);
+    assert!(outcome
+      .results
+      .iter()
+      .all(|r| r.path.to_string_lossy().contains("plan-ok-")));
+  }
+
+  #[test]
+  fn fetch_budget_is_clamped_to_a_sane_range() {
+    let root = temp_dir("budget-clamp");
+    fs::create_dir_all(&root).unwrap();
+    for name in ["plan-a.md", "plan-b.md", "plan-c.md"] {
+      fs::write(root.join(name), "x\n").unwrap();
+    }
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let query = SearchQuery::new("plan").with_limit(10);
+
+    let zero = index
+      .search_with_options(&config, &query, SearchOptions { fetch_budget: 0 })
+      .unwrap();
+    assert_eq!(zero.candidate_count, 1);
+    assert_eq!(zero.coverage, CandidateCoverage::Truncated);
+
+    let huge = index
+      .search_with_options(
+        &config,
+        &query,
+        SearchOptions {
+          fetch_budget: usize::MAX,
+        },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+    assert_eq!(huge.candidate_count, 3);
+    assert_eq!(huge.coverage, CandidateCoverage::Complete);
+  }
+
+  /// 60,000 file entries named `common-N.md`; the entries at `rare_positions`
+  /// are named `rareword-common-N.md`. File-backed, planted in bulk.
+  struct RecallFixture {
+    index: KuntuIndex,
+    config: SearchConfig,
+    root: PathBuf,
+    db_dir: PathBuf,
+  }
+
+  impl RecallFixture {
+    fn cleanup(self) {
+      let _ = remove_dir_all_if_exists(&self.db_dir);
+      let _ = remove_dir_all_if_exists(&self.root);
+    }
+  }
+
+  fn recall_fixture(name: &str, rare_positions: &[usize]) -> RecallFixture {
+    let root = temp_dir(name);
+    fs::create_dir_all(&root).unwrap();
+    let root = kuntu_core::normalize_root_path(root);
+    let db_dir = temp_dir(&format!("{name}-db"));
+    fs::create_dir_all(&db_dir).unwrap();
+    let mut index = KuntuIndex::open(db_dir.join("recall.sqlite")).unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let root_id: i64 = block_on(async {
+      let mut rows = index
+        .conn
+        .query(
+          "SELECT id FROM roots WHERE path = ?1",
+          params![root.to_string_lossy()],
+        )
+        .await
+        .unwrap();
+      rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    });
+    block_on(async {
+      index.conn.execute("DELETE FROM entries", ()).await.unwrap();
+    });
+    let rare: HashSet<usize> = rare_positions.iter().copied().collect();
+    let rows: Vec<fixture::RowSpec> = (0..60_000usize)
+      .map(|number| {
+        let file_name = if rare.contains(&number) {
+          format!("rareword-common-{number}.md")
+        } else {
+          format!("common-{number}.md")
+        };
+        fixture::RowSpec {
+          path: format!("{}/{file_name}", root.to_string_lossy()),
+          is_dir: false,
+        }
+      })
+      .collect();
+    fixture::insert_rows(&mut index, root_id, &rows, 1);
+    RecallFixture {
+      index,
+      config,
+      root,
+      db_dir,
+    }
+  }
+
+  #[test]
+  #[ignore = "60k-row fixture; run in release mode via just benchmark"]
+  fn default_budget_bounds_a_broad_single_token() {
+    let fixture = recall_fixture("budget-broad", &[]);
+    let query = SearchQuery::new("common").with_limit(50);
+
+    let outcome = fixture
+      .index
+      .search_with_metrics(&fixture.config, &query)
+      .unwrap();
+    assert_eq!(outcome.candidate_count, DEFAULT_FETCH_BUDGET);
+    assert_eq!(outcome.coverage, CandidateCoverage::Truncated);
+    assert_eq!(outcome.results.len(), 50);
+    assert!(outcome.truncated);
+
+    let wide = fixture
+      .index
+      .search_with_options(
+        &fixture.config,
+        &query,
+        SearchOptions {
+          fetch_budget: MAX_KFS_CANDIDATE_ROWS,
+        },
+      )
+      .unwrap();
+    assert_eq!(wide.candidate_count, MAX_KFS_CANDIDATE_ROWS);
+    assert_eq!(wide.coverage, CandidateCoverage::Truncated);
+    fixture.cleanup();
+  }
+
+  #[test]
+  fn every_query_token_must_match_and_tokens_match_by_prefix() {
+    let root = temp_dir("multi-token");
+    fs::create_dir_all(root.join("alphabet")).unwrap();
+    fs::write(root.join("alphabet/beta-notes.md"), "a\n").unwrap();
+    fs::write(root.join("alphabet/gamma-notes.md"), "b\n").unwrap();
+    fs::write(root.join("other.md"), "c\n").unwrap();
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    let both = index
+      .search_with_metrics(&config, &SearchQuery::new("alph bet"))
+      .unwrap();
+    let one_missing = index
+      .search_with_metrics(&config, &SearchQuery::new("alph delta"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(both.candidate_count, 1);
+    assert!(both.results[0].path.ends_with("alphabet/beta-notes.md"));
+    assert_eq!(both.coverage, CandidateCoverage::Complete);
+    assert_eq!(one_missing.candidate_count, 0);
+    assert_eq!(one_missing.coverage, CandidateCoverage::Complete);
+  }
+
+  /// Plant `relative` with `token` recorded as a directory-component hit only
+  /// (field 3), as the indexer does for a token that appears only in the path.
+  fn plant_path_only_entry(index: &KuntuIndex, root: &Path, relative: &str, token: &str) {
+    plant_entry(index, root, relative, 1, (false, false, false), &[token]);
+    let full = kuntu_core::normalize_root_path(root.to_path_buf()).join(relative);
+    block_on(async {
+      index
+        .conn
+        .execute(
+          "UPDATE terms SET field = 3 WHERE entry_id = (SELECT id FROM entries WHERE path = ?1)",
+          params![full.to_string_lossy()],
+        )
+        .await
+        .unwrap();
+    });
+  }
+
+  #[test]
+  fn file_name_hits_are_fetched_before_path_only_hits_when_the_budget_binds() {
+    // Five path-only matches take the lowest ids, five file-name matches come
+    // after them. With a budget of 5 the file-name matches must win.
+    let root = temp_dir("name-first");
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    for number in 0..5 {
+      plant_path_only_entry(
+        &index,
+        &root,
+        &format!("tokenword-dir/aaa-{number}.md"),
+        "tokenword",
+      );
+    }
+    for number in 0..5 {
+      plant_entry(
+        &index,
+        &root,
+        &format!("zzz-tokenword-{number}.md"),
+        1,
+        (false, false, false),
+        &["tokenword"],
+      );
+    }
+    let outcome = index
+      .search_with_options(
+        &config,
+        &SearchQuery::new("tokenword").with_limit(20),
+        SearchOptions { fetch_budget: 5 },
+      )
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 5);
+    assert_eq!(outcome.coverage, CandidateCoverage::Truncated);
+    assert!(outcome.results.iter().all(|result| result
+      .path
+      .file_name()
+      .is_some_and(|name| name.to_string_lossy().starts_with("zzz-"))));
+  }
+
+  /// The multi-token recall bug: a selective token plus a common one. 60,000
+  /// entries carry `common`; 33 also carry `rareword`. Eight of them have ids
+  /// below the 50,000-id work bound, 25 above it. Capping each token's list
+  /// and intersecting returns only the 8; driving from the rare token returns
+  /// all 33 and stays `Complete`.
+  #[test]
+  #[ignore = "60k-row fixture; run in release mode via just benchmark"]
+  fn rarest_token_drives_the_search_and_recall_is_exact() {
+    let rare_positions: Vec<usize> = (0..8).chain(55_000..55_025).collect();
+    let fixture = recall_fixture("recall", &rare_positions);
+    for text in ["rareword common", "common rareword", "rare common"] {
+      let outcome = fixture
+        .index
+        .search_with_metrics(&fixture.config, &SearchQuery::new(text).with_limit(1_000))
+        .unwrap();
+      assert_eq!(outcome.candidate_count, 33, "{text}");
+      assert_eq!(outcome.coverage, CandidateCoverage::Complete, "{text}");
+      assert_eq!(outcome.results.len(), 33, "{text}");
+    }
+    fixture.cleanup();
+  }
+
+  #[test]
+  fn rank_ids_intersects_and_puts_file_name_hits_first() {
+    let first = std::collections::BTreeMap::from([(1, false), (2, true), (3, true), (4, false)]);
+    let second = std::collections::BTreeMap::from([(2, false), (3, true), (4, true), (9, true)]);
+    // Present in both: 2, 3, 4. Name hits: 3 -> 2, 2 -> 1, 4 -> 1.
+    assert_eq!(rank_ids(&[&first, &second]), vec![3, 2, 4]);
+    assert_eq!(rank_ids(&[&first]), vec![2, 3, 1, 4]);
+    assert!(rank_ids(&[]).is_empty());
+  }
+
+  #[test]
+  fn smallest_complete_ignores_truncated_lists() {
+    let list = |ids: &[i64], complete: bool| TokenPostings {
+      ids: ids.iter().map(|id| (*id, false)).collect(),
+      complete,
+    };
+    let lists = vec![
+      ("big".to_string(), list(&[1, 2, 3, 4], true)),
+      ("cut".to_string(), list(&[1], false)),
+      ("small".to_string(), list(&[1, 2], true)),
+    ];
+    assert_eq!(smallest_complete(&lists), Some(2));
+    assert_eq!(smallest_complete(&lists[1..2]), None);
+  }
+
+  #[test]
+  fn path_tokens_are_matched_by_prefix_case_insensitively() {
+    let path = Path::new("/home/me/Alphabet/beta-notes.md");
+    assert!(path_has_prefix_tokens(
+      path,
+      &["alph".to_string(), "bet".to_string()]
+    ));
+    assert!(!path_has_prefix_tokens(
+      path,
+      &["alph".to_string(), "gamma".to_string()]
+    ));
+    assert!(path_has_prefix_tokens(path, &[]));
+  }
+
+  /// The lossy-path fallback must stay an index seek: one entry's stored
+  /// terms are read through `idx_terms_entry`, never by scanning the terms
+  /// table (recheck P2).
+  #[test]
+  fn entry_terms_fallback_uses_the_entry_id_index() {
+    let index = KuntuIndex::open_memory().unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", entry_terms_sql());
+    let details = block_on(async {
+      let mut rows = index
+        .conn
+        .query(&sql, params![Value::from(1i64)])
+        .await
+        .unwrap();
+      let mut details = Vec::new();
+      while let Some(row) = rows.next().await.unwrap() {
+        details.push(row.get::<String>(3).unwrap());
+      }
+      details
+    });
+    let plan = details.join(" | ");
+    assert!(plan.contains("idx_terms_entry"), "plan: {plan}");
+  }
+
+  /// A file name whose bytes are not valid UTF-8 (`common<0xff>.md`).
+  /// `upsert_entry_tx` stores the path lossy and `insert_terms_tx` skips the
+  /// component, so the terms table holds no `common*` token for that row —
+  /// and path verification must not invent one (review P2: tokenizing the
+  /// stored lossy path turns `common\ufffd` into a `common*` match, which
+  /// v0.4.0's posting intersection excluded). macOS refuses to create such a
+  /// file on disk (`EILSEQ` from `open`), so the invalid bytes go through the
+  /// real insertion path instead of the filesystem.
+  /// Plant the row the write path stores for a file named `common<0xff>.md`:
+  /// the lossy path, and terms derived by `insert_terms_tx` itself (the file
+  /// name and its invalid component are skipped, the `md` extension and the
+  /// valid path components survive).
+  #[cfg(unix)]
+  fn plant_invalid_byte_entry(index: &mut KuntuIndex, root: &Path) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = kuntu_core::normalize_root_path(root.to_path_buf());
+    let invalid_path = root
+      .join("rareword")
+      .join(OsStr::from_bytes(b"common\xff.md"));
+    block_on(async {
+      let root_id: i64 = {
+        let mut rows = index
+          .conn
+          .query(
+            "SELECT id FROM roots WHERE path = ?1",
+            params![root.to_string_lossy()],
+          )
+          .await
+          .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+      };
+      let stored = invalid_path.to_string_lossy().into_owned();
+      let name = invalid_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      index
+        .conn
+        .execute(
+          "INSERT INTO entries (root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, 'md', 1, 4, NULL, 0, 0, 0, 0, 0)",
+          params![
+            root_id,
+            stored.clone(),
+            stored.to_ascii_lowercase(),
+            name.clone(),
+            name.to_ascii_lowercase(),
+          ],
+        )
+        .await
+        .unwrap();
+      let entry_id: i64 = {
+        let mut rows = index
+          .conn
+          .query(
+            "SELECT id FROM entries WHERE root_id = ?1 AND path = ?2",
+            params![root_id, stored],
+          )
+          .await
+          .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+      };
+      let tx = index.conn.transaction().await.unwrap();
+      insert_terms_tx(&tx, entry_id, &invalid_path).await.unwrap();
+      tx.commit().await.unwrap();
+    });
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn path_verification_skips_components_the_indexer_never_tokenized() {
+    let root = temp_dir("non-utf8-verify");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    plant_invalid_byte_entry(&mut index, &root);
+
+    // The rare token drives the search and `common` is verified against the
+    // driving row's own path; the invalid-name file must not pass that check.
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword common"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 0);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results.is_empty());
+  }
+
+  /// A legitimate U+FFFD is valid UTF-8: `insert_terms_tx` indexes a file
+  /// named `common<U+FFFD>.md` like any other name, so `rareword common`
+  /// must find it even though the stored path is indistinguishable from a
+  /// lossy one (recheck P2: verification must not drop this match).
+  #[test]
+  fn legitimate_replacement_characters_are_found_by_their_indexed_terms() {
+    let root = temp_dir("legit-replacement");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    fs::write(root.join("rareword").join("common\u{FFFD}.md"), "a\n").unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword common"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 1);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results[0].path.ends_with("common\u{FFFD}.md"));
+  }
+
+  /// The invalid-byte file's extension term is real: `insert_terms_tx` skips
+  /// the name component but still indexes the valid `md` extension, so
+  /// `rareword md` must find the row through its stored terms (recheck P2).
+  #[cfg(unix)]
+  #[test]
+  fn invalid_byte_names_are_found_through_their_stored_extension_term() {
+    let root = temp_dir("non-utf8-extension");
+    fs::create_dir_all(root.join("rareword")).unwrap();
+    for number in 0..3 {
+      fs::write(root.join(format!("plain-common-{number}.md")), "b\n").unwrap();
+    }
+
+    let mut index = KuntuIndex::open_memory().unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    index.rebuild(&config).unwrap();
+    plant_invalid_byte_entry(&mut index, &root);
+
+    let outcome = index
+      .search_with_metrics(&config, &SearchQuery::new("rareword md"))
+      .unwrap();
+    remove_dir_all_if_exists(&root).unwrap();
+
+    assert_eq!(outcome.candidate_count, 1);
+    assert_eq!(outcome.coverage, CandidateCoverage::Complete);
+    assert!(outcome.results[0]
+      .path
+      .to_string_lossy()
+      .ends_with("common\u{FFFD}.md"));
+  }
+
+  /// The latency gate's timing policy (review P2): the first run pays the
+  /// cold page cache, so it is spent as an untimed warm-up; the gate judges
+  /// the best of the measured runs after it, and no measured run is
+  /// abandoned early (an early break lets the cold run decide the gate).
+  #[test]
+  fn gate_timing_warms_up_untimed_then_judges_the_best_of_three() {
+    use std::cell::Cell;
+
+    let calls = Cell::new(0usize);
+    // The cold call first (1001 ms against a 25 ms ceiling), then the warm
+    // ones that must decide the gate.
+    let best = fixture::measure_warm_best(|| {
+      let call = calls.get();
+      calls.set(call + 1);
+      std::time::Duration::from_millis([1001, 4, 1, 3][call])
+    });
+
+    assert_eq!(calls.get(), 4, "one warm-up plus three measured runs");
+    assert_eq!(best, std::time::Duration::from_millis(1));
   }
 }

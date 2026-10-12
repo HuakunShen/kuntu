@@ -11,7 +11,7 @@ use kuntu_core::{
   IndexRebuildStats, IndexRefreshStats, IndexRepairStats, IndexRootStatus, MatchKind, SearchConfig,
   SearchQuery, SearchResult, SearchRoot,
 };
-use kuntu_index::{IndexedSearchOutcome, KuntuIndex};
+use kuntu_index::{IndexedSearchOutcome, KuntuIndex, SearchOptions};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -221,6 +221,16 @@ impl Task for StatusTask {
   }
 }
 
+/// Candidate budget of the JS search entry points. The addon's DTO exposes
+/// only `candidate_count` and `results` — never `IndexedSearchOutcome::
+/// coverage` — so JavaScript has no way to learn that a search was cut short.
+/// The budget therefore stays at the v0.4.0 hard bound: a match beyond
+/// `DEFAULT_FETCH_BUDGET` would otherwise disappear with no truncation
+/// signal (M1 review P2). The frozen JS surface is unchanged.
+const JS_CANDIDATE_BUDGET: SearchOptions = SearchOptions {
+  fetch_budget: kuntu_index::MAX_KFS_CANDIDATE_ROWS,
+};
+
 pub struct SearchTask {
   db_path: String,
   request: SearchRequest,
@@ -235,7 +245,7 @@ impl Task for SearchTask {
     let config = config_from_roots(&self.request.roots);
     let query = query_from_request(&self.request);
     let outcome = index
-      .search_with_metrics(&config, &query)
+      .search_with_options(&config, &query, JS_CANDIDATE_BUDGET)
       .map_err(napi_error)?;
     Ok(outcome.into())
   }
@@ -372,5 +382,82 @@ impl From<IndexedSearchOutcome> for IndexedSearchOutcomeDto {
       candidate_count: count_to_u32(outcome.candidate_count),
       results: outcome.results.into_iter().map(Into::into).collect(),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::fs;
+  use std::path::PathBuf;
+
+  use kuntu_core::{SearchConfig, SearchRoot};
+  use kuntu_index::KuntuIndex;
+
+  use super::*;
+
+  /// The JS surface cannot see `IndexedSearchOutcome::coverage` — the addon's
+  /// DTO keeps only `candidate_count` and `results` — so a search through the
+  /// addon must keep the v0.4.0 result quality on its own. With 6,001
+  /// matching files, the exact basename planted last (highest id, strongest
+  /// match) has to come back; the 5,000-candidate Rust default would drop it
+  /// with no truncation signal in JavaScript (M1 review P2).
+  #[test]
+  fn search_returns_the_exact_basename_beyond_the_rust_default_budget() {
+    let nonce = std::process::id();
+    let root: PathBuf = std::env::temp_dir().join(format!("kuntu-napi-budget-root-{nonce}"));
+    let db_dir: PathBuf = std::env::temp_dir().join(format!("kuntu-napi-budget-db-{nonce}"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&db_dir);
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&db_dir).unwrap();
+    for number in 0..6_000 {
+      fs::write(root.join(format!("common-{number:05}.md")), "x\n").unwrap();
+    }
+    // Planted last: the highest id, and the exact basename for the query.
+    fs::write(root.join("common.md"), "x\n").unwrap();
+    let db_path = db_dir.join("budget.sqlite");
+
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    let mut index = KuntuIndex::open(&db_path).unwrap();
+    index.rebuild(&config).unwrap();
+    drop(index);
+
+    let mut task = SearchTask {
+      db_path: db_path.to_string_lossy().into_owned(),
+      request: SearchRequest {
+        roots: vec![SearchRootInput {
+          path: root.to_string_lossy().into_owned(),
+          enabled: None,
+          priority: None,
+          include_hidden: None,
+          include_ignored: None,
+        }],
+        query: "common".to_string(),
+        limit: None,
+        include_hidden: None,
+        include_ignored: None,
+        extensions: None,
+      },
+    };
+    let outcome = task.compute().unwrap();
+
+    let _ = fs::remove_dir_all(&db_dir);
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(outcome.candidate_count, 6_001);
+    assert!(
+      outcome
+        .results
+        .iter()
+        .any(|result| result.path.ends_with("common.md")),
+      "the exact basename must survive the candidate budget; results: {:?}",
+      outcome
+        .results
+        .iter()
+        .map(|result| result.path.clone())
+        .collect::<Vec<_>>()
+    );
   }
 }
