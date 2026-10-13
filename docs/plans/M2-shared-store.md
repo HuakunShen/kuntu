@@ -16084,3 +16084,13 @@ The separate M2 gate applies the unchanged targets and records every class befor
 - D12 remains macOS first. Linux/Android acceptance is not run and Windows shared-store support is not implemented by this Unix VFS. The four-host smoke uses independent NAPI stand-ins; actual Xross mapping migration and Kunkun helper signing/TCC are M2-X/M2-K under D16, outside this write set and not claimed complete.
 
 The P1 regression contracts pass with this payload and fail under their named defects. This writer did not independently review the result. Any P1 left by the final external review becomes a named test-first RED item; the performance misses above remain open acceptance work.
+
+## Round-3 review: tracked items (no P1 remains)
+
+The final recheck (gpt-6.1-sol/high, 2026-10-14) returned PASS WITH FIXES. All six round-2 P1 findings are closed under D16. The remaining items are P2. They ship as tracked items, and **M2 performance acceptance stays incomplete** until they are green:
+
+1. **M2 search acceptance remains RED.** Run-4 measured mid 15.990 ms (ceiling 10 ms), broad 61.163 ms, 1-character prefix 58.972 ms, and slowest 50k case 525.845 ms.
+   - The implementer reruns `realistic_fixture_m2_latency_acceptance` after M2.10 and records the numbers.
+   - Do not loosen any ceiling. A miss is reported as open.
+2. **Internal-SSD acceptance has not been run.** The runner must accept a data root on the internal disk through an explicit, validated path contract (absolute path, not under /Volumes, owner-run).
+3. **The cleanup deadline is cooperative.** A hard 100 ms helper bound is not proved. Keep the measurement in the report and track a hard bound as a follow-up.
