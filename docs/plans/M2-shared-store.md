@@ -88,7 +88,7 @@ Import snapshots the source main file and sidecars through read-only opened dire
 
 M2.1–M2.10 each have a named regression (plus deterministic lock-creation and slow-delete boundary regressions) and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
 
-The final replay installs every complete file from the committed plan in task order, runs all ten tasks with twelve RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
+The final replay installs every complete file from the committed plan in task order, runs all ten tasks with thirteen RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
 
 
 ## Task M2.1: descriptor-safe foundation and bootstrap
@@ -450,14 +450,14 @@ impl Home {
   pub fn lifetime(&self, epoch: u32) -> Result<ReaderGuard> {
     let lock = format!("epoch-{epoch}.lock");
     let locks = directory(&self.dir, std::ffi::OsStr::new("locks"), false)?;
-    let f: File = openat(
-      &locks,
-      lock.as_str(),
-      OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-      Mode::from_bits_truncate(0o600),
-    )
-    .map_err(err)?
-    .into();
+    let f = create_lock_file(&locks, || {
+      openat(
+        &locks,
+        lock.as_str(),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+      )
+    })?;
     let stat = fstat(&f).map_err(err)?;
     if stat.st_nlink != 1 || stat.st_uid != getuid().as_raw() || stat.st_mode & 0o777 != 0o600 {
       return Err(err("Invalid epoch lock inode."));
@@ -772,6 +772,26 @@ fn transient_lock_creation_retries_only_not_found_under_the_same_directory_fd() 
   .is_err());
   assert_eq!(calls, 1);
   assert!(home.lock("../escape", false).is_err());
+}
+
+#[test]
+fn executed_child_does_not_inherit_the_permanent_writer_lease() {
+  let h = home();
+  let lease = h.lock("indexer.lock", false).unwrap().unwrap();
+  let mut child = std::process::Command::new("/bin/sleep")
+    .arg("1")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+  drop(lease);
+  let reacquired = h.lock("indexer.lock", false).unwrap().is_some();
+  assert!(child.wait().unwrap().success());
+  assert!(
+    reacquired,
+    "an executed child inherited the live writer capability"
+  );
 }
 ````
 
@@ -7482,6 +7502,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Ok(());
   }
   if a[1] == "identity" {
+    let index = KuntuIndex::open_shared(home.clone(), false, "probe")?;
+    drop(index);
     println!("{}", home.id()?);
     return Ok(());
   }
@@ -14108,7 +14130,7 @@ const v3=join(home,'index.v3.db');const before=readFileSync(v3);
 const oldOnV3=call([old,'index','status','--db',v3]);assert.notEqual(oldOnV3.status,0);assert.match(oldOnV3.text,/schema|version|supported/i);assert.deepEqual(readFileSync(v3),before,'previous tag refusal must preserve epoch3 main bytes');cells.previous_refuses_epoch3=oldOnV3.text.trim();
 cells.gc=ok([now,'store','gc'],undefined,{KUNTU_HOME:home});assert.ok(existsSync(db));assert.deepEqual(readFileSync(db),original,'unregistered previous-tag epoch remains preserved');
 cells.other_epoch='epoch2 and epoch3 remain distinct; previous tag refuses user_version3; current private-v2 reader preserves source';
-writeFileSync(join(base,'matrix.json'),JSON.stringify(cells,null,2));console.log(JSON.stringify(cells,null,2));
+writeFileSync(join(base,'matrix.json'),JSON.stringify(cells,null,2));console.log(JSON.stringify(cells,null,2));console.log("PASS previous_tag_epoch_isolation");
 ````
 
 <!-- apply {"task": "M2.10", "file": "scripts/m2-evidence.ts", "mode": "file"} -->
@@ -14124,7 +14146,7 @@ const target=process.env.CARGO_TARGET_DIR??'target';
 const bin=resolve(target,'release/examples/m2_probe');
 mkdirSync(base,{recursive:true});
 const root=join(base,'root-200k');mkdirSync(root,{recursive:true});
-const live=new Set<ChildProcess>();
+const live=new Set<ChildProcess>();const orphaned=new Set<number>();
 function start(op:string,home:string,extra:Record<string,string>={},minor='1') {
  const child=spawn(bin,[op,home,extra.KUNTU_EVIDENCE_ROOT??root,minor],{env:{...process.env,...extra},stdio:['ignore','pipe','pipe']});live.add(child);
  let output='';child.stdout?.on('data',(b:Buffer)=>{output+=b.toString()});child.stderr?.on('data',(b:Buffer)=>{output+=b.toString()});
@@ -14164,7 +14186,7 @@ try {
   const denied=await start('quarantine',fresh).done;assert.notEqual(denied.code,0);held.child.kill('SIGKILL');await held.done;
   const held2Marker=join(base,'held2');rmSync(held2Marker,{force:true});const held2=start('hold',fresh,{KUNTU_FAULT_MARKER:held2Marker});await marker(held2Marker,held2);
   const poll=start('poll',fresh);await Bun.sleep(500);const released=Date.now();held2.child.kill('SIGKILL');await held2.done;const takeover=await poll.done;assert.equal(takeover.code,0,takeover.text);const measured=Date.now()-released;assert.ok(measured<=6000);outcomes.takeover=`${measured} ms after kill; ${takeover.text.trim()}`;
-  const execText=await ok('exec-holder',fresh);const pid=Number(/child_pid=(\d+)/.exec(execText)?.[1]);assert.ok(pid>0);assert.match(await ok('scan',fresh),/check=ok/);try{process.kill(pid,'SIGKILL')}catch{}
+  const execText=await ok('exec-holder',fresh);const pid=Number(/child_pid=(\d+)/.exec(execText)?.[1]);assert.ok(pid>0);orphaned.add(pid);process.kill(pid,0);assert.match(await ok('skew-writer',fresh),/acquired=true/);process.kill(pid,0);process.kill(pid,'SIGKILL');orphaned.delete(pid);outcomes.exec='child alive before and after a second process reacquired the writer lease';
   const source=join(base,'v2-source');rmSync(source,{recursive:true,force:true});await ok('create-v2',source);
   const files=['source.v2.db','source.v2.db-wal','source.v2.db-shm'];const hashes=()=>files.map(f=>{const p=join(source,f);return existsSync(p)?createHash('sha256').update(readFileSync(p)).digest('hex'):null});const before=hashes();
   const imported=join(base,'imported');rmSync(imported,{recursive:true,force:true});const importedResult=spawnSync(resolve(target,'release/kfs'),['store','import',join(source,'source.v2.db')],{env:{...process.env,KUNTU_HOME:imported},encoding:'utf8'});assert.equal(importedResult.status,0,importedResult.stderr);assert.deepEqual(hashes(),before);assert.equal(db(imported,'SELECT count(*) FROM entries'),'[(200001,)]');outcomes.import=importedResult.stdout.trim();
@@ -14186,12 +14208,14 @@ try {
   const cells:Record<string,string>={};
   const h=join(base,'skew');rmSync(h,{recursive:true,force:true});await ok('init',h,{},'0');
   for(const minor of ['0','1']){cells[`same_reader_${minor}`]=await ok('skew-reader',h,{},minor);cells[`same_writer_${minor}`]=await ok('skew-writer',h,{},minor);}
+  cells.current_reader_new_minor=await ok('skew-reader',h,{},'1');cells.current_writer_new_minor=await ok('skew-writer',h,{},'1');
   cells.old_reader_new_minor=await ok('skew-reader',h,{},'0');const old=await start('skew-writer',h,{},'0').done;assert.notEqual(old.code,0);cells.old_writer_new_minor=old.text.trim();
-  db(h,"UPDATE meta SET value=2 WHERE key='min_reader_minor'");for(const minor of ['0','1']){const r=await start('skew-reader',h,{},minor).done;assert.notEqual(r.code,0);cells[`new_reader_floor_${minor}`]=r.text.trim();}
+  db(h,"UPDATE meta SET value=2 WHERE key='min_reader_minor'");const refusedBytes=readFileSync(join(h,'index.v3.db'));for(const minor of ['0','1']){const r=await start('skew-reader',h,{},minor).done;assert.notEqual(r.code,0);cells[`new_reader_floor_${minor}`]=r.text.trim();assert.deepEqual(readFileSync(join(h,'index.v3.db')),refusedBytes,'refused reader preserves database bytes');}
   const epoch4=join(h,'index.v4.db');writeFileSync(epoch4,'future epoch sentinel');const original=readFileSync(epoch4);const cli=spawnSync(resolve(target,'release/kfs'),['store','gc'],{env:{...process.env,KUNTU_HOME:h},encoding:'utf8'});assert.equal(cli.status,0,cli.stderr);assert.deepEqual(readFileSync(epoch4),original);cells.other_epoch='future sentinel unchanged';
   writeFileSync(join(base,'skew.json'),JSON.stringify(cells,null,2));console.log(JSON.stringify(cells,null,2));
  } else throw new Error(`Unknown mode ${mode}`);
 } finally {
+ for(const pid of orphaned){try{process.kill(pid,'SIGKILL')}catch{}}
  const remaining=[...live];
  await Promise.all(remaining.map(child=>new Promise<void>(resolve=>{child.once('close',()=>resolve());child.kill('SIGKILL');})));
 }
@@ -14205,6 +14229,7 @@ import {spawnSync} from 'node:child_process';
 import {strict as assert} from 'node:assert';
 type Case={task:string,file:string,old:string,bad:string,crate:string,test:string};
 const cases:Case[]=[
+ {"task": "M2.2-exec", "file": "crates/kuntu-store/src/lib.rs", "old": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "bad": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "crate": "kuntu-store", "test": "tests::executed_child_does_not_inherit_the_permanent_writer_lease"},
  {task:'M2.1-lock-create',file:'crates/kuntu-store/src/lib.rs',old:'attempts < 100',bad:'attempts < 0',crate:'kuntu-store',test:'tests::transient_lock_creation_retries_only_not_found_under_the_same_directory_fd'},
  {task:'M2.5-cleanup',file:'crates/kuntu-index/src/shared.rs',old:'rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100)',bad:'rows >= 5000',crate:'kuntu-index',test:'m2_tests::slow_delete_triggers_force_the_100_ms_cleanup_boundary'},
  {task:'M2.1',file:'crates/kuntu-store/src/lib.rs',old:'let flags = OFlag::O_RDWR\n      | OFlag::O_NOFOLLOW',bad:'let flags = OFlag::O_RDWR',crate:'kuntu-store',test:'tests::descriptor_open_rejects_symlink_and_private_modes_are_exact'},
@@ -14289,6 +14314,7 @@ run('node',['node','--test','test/index.test.cjs'],'crates/kuntu-napi');run('typ
 run('m1-gate',['cargo','test','--release','-p','kuntu-index','realistic_fixture_latency_gate','--','--ignored','--nocapture']);
 run('m1-recall',['cargo','test','--release','-p','kuntu-index','rarest_token_drives_the_search_and_recall_is_exact','--','--ignored','--nocapture']);
 run('m1-budget',['cargo','test','--release','-p','kuntu-index','default_budget_bounds_a_broad_single_token','--','--ignored','--nocapture']);
+run('sqlite-version',['cargo','test','--release','-p','kuntu-index','bundled_runtime_includes_wal_reset_fix','--','--nocapture']);
 run('size-delete',['cargo','test','--release','-p','kuntu-index','realistic_fixture_reverse_delete_cost_and_size_gate','--','--ignored','--nocapture']);
 run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('cli-build',['cargo','build','--release','-p','kuntu-cli']);
 run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
@@ -14321,7 +14347,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 |---|---|---|
 | 1 Mechanical compile | M2.1, M2.3, M2.8–10 | `plan_apply_write_set_matches_complete_payloads`, fmt/clippy/locked workspace build |
 | 2 Complete engine/fixture port | M2.3 | `realistic_fixture_latency_gate`, all preserved M1 recall/shape tests |
-| 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, joined-service test, daemon queue test, exec/takeover process cases |
+| 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, `executed_child_does_not_inherit_the_permanent_writer_lease`, joined-service test, daemon queue test, exec/takeover process cases |
 | 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, minor skew controller and `previous_tag_epoch_isolation` (v0.4.1 archive) |
 | 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, `slow_delete_triggers_force_the_100_ms_cleanup_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
 | 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
@@ -14332,7 +14358,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 11 NAPI actual access/compat | M2.8 | Node read-only operation test, `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` |
 | 12 Import end to end | M2.9–10 | `store_import_parser_accepts_source_and_rejects_missing_source`, real-turso library import test, process `import` |
 | 13 Production SQL pins/binds | M2.3 | `production_builders_pin_both_postings_reverse_and_rowid`, preserved `entry_fetch_is_a_rowid_seek_not_an_index_scan` |
-| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs twelve pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
+| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs thirteen pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
 | 15 Complete write set | M2.1–10 | `plan_apply_write_set_matches_complete_payloads`, protected-file checks |
 | 16 Patched WAL engine | M2.3 | `bundled_runtime_includes_wal_reset_fix`, stress and query gates |
 | 17 Honest complete evidence | M2.10 | Full foreground replay logs, crash/stress/skew artifacts and the measured table below |
