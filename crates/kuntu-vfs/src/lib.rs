@@ -2,6 +2,9 @@
 use std::sync::OnceLock;
 unsafe extern "C" {
   fn kuntu_vfs_register() -> i32;
+  fn kuntu_thread_cpu_ns() -> u64;
+  fn kuntu_probe_start();
+  fn kuntu_probe_stop(out: *mut ProbeMetrics);
 }
 pub fn register() -> rusqlite::Result<()> {
   static RESULT: OnceLock<i32> = OnceLock::new();
@@ -12,6 +15,56 @@ pub fn register() -> rusqlite::Result<()> {
     Ok(())
   } else {
     Err(rusqlite::Error::InvalidQuery)
+  }
+}
+
+/// Elapsed SQLite sleep/read/stat syscall time on the calling thread.
+/// I/O wall time includes scheduling; it does not isolate device latency.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeMetrics {
+  pub retries: u64,
+  pub sleep_ns: u64,
+  pub io_ns: u64,
+  pub io_calls: u64,
+}
+pub fn thread_cpu_ns() -> u64 {
+  // SAFETY: C reads the calling thread's OS counters and retains no pointers.
+  unsafe { kuntu_thread_cpu_ns() }
+}
+pub fn begin_probe() {
+  // SAFETY: C resets only thread-local counters.
+  unsafe { kuntu_probe_start() }
+}
+pub fn end_probe() -> ProbeMetrics {
+  let mut result = ProbeMetrics::default();
+  // SAFETY: repr(C) matches the four u64 fields; C writes synchronously.
+  unsafe { kuntu_probe_stop(&mut result) };
+  result
+}
+#[cfg(test)]
+mod probe_tests {
+  use super::*;
+  #[test]
+  fn probe_counters_measure_thread_cpu_and_sqlite_file_reads() {
+    register().unwrap();
+    let path = std::env::temp_dir().join(format!("vfs-probe-{}.sqlite", std::process::id()));
+    {
+      let c = rusqlite::Connection::open(&path).unwrap();
+      c.execute_batch("CREATE TABLE IF NOT EXISTS t(x); INSERT INTO t VALUES(1)")
+        .unwrap();
+    }
+    let cpu = thread_cpu_ns();
+    begin_probe();
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let _: i64 = c
+      .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+      .unwrap();
+    let metrics = end_probe();
+    assert!(thread_cpu_ns() > cpu, "thread CPU counter did not advance");
+    assert!(metrics.io_calls > 0 && metrics.io_ns > 0, "{metrics:?}");
+    drop(c);
+    std::fs::remove_file(path).unwrap();
   }
 }
 

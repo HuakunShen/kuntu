@@ -259,6 +259,7 @@ impl KuntuIndex {
       // The unmodified M1 crawler returns a snapshot; SQL batches never span
       // this blocking walk. Re-read policy after the walk and each commit.
       let crawl_config = self.index_config(root_id)?;
+      let crawl_evidence = shared::evidence_span();
       let (entries, stats) =
         walk::crawl_cancellable(&CrawlOptions::new(crawl_config), &self.cancel)?;
       self.check_cancelled()?;
@@ -269,6 +270,9 @@ impl KuntuIndex {
         continue;
       }
       self.check_scan(root_id, gen)?;
+      if let Some(span) = crawl_evidence {
+        span.finish("crawl", serde_json::json!({"entries":entries.len()}))?;
+      }
       let mut offset = 0;
       while offset < entries.len() {
         self.check_cancelled()?;
@@ -297,7 +301,25 @@ impl KuntuIndex {
           }
         }
         tx.conn.raw.execute("UPDATE root_state SET entry_count=(SELECT count(*) FROM entries WHERE root_id=?1) WHERE root_id=?1",params![root_id])?;
+        let commit_evidence = shared::evidence_span();
         block_on(tx.commit())?;
+        if let Some(span) = commit_evidence {
+          span.finish(
+            "batch_commit",
+            serde_json::json!({"rows":rows,"entries":offset,"scan_gen":gen}),
+          )?;
+          // Evidence-only explicit checkpoints are recorded separately from
+          // commit's unchanged native 1000-page autocheckpoint policy.
+          let checkpoint = shared::evidence_span().expect("evidence configured");
+          let result: (i64, i64, i64) =
+            self
+              .conn
+              .raw
+              .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+              })?;
+          checkpoint.finish("checkpoint", serde_json::json!({"kind":"explicit_passive","busy":result.0,"wal_pages":result.1,"checkpointed_pages":result.2}))?;
+        }
         #[cfg(test)]
         m2_tests::record_batch(rows);
         let threshold = std::env::var("KUNTU_FAULT_ROWS")

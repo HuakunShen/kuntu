@@ -149,29 +149,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       );
     }
     "reader" => {
+      let committed = index.count_entries()?;
+      if committed == 0 {
+        return Err("reader requires committed entries before sampling".into());
+      }
       let start = Instant::now();
+      let start_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_micros();
+      let done = std::env::var_os("KUNTU_SAMPLING_DONE").map(std::path::PathBuf::from);
       let mut samples = Vec::new();
       let mut errors = 0;
-      while start.elapsed() < Duration::from_secs(60) {
+      let mut cpu_total = 0_u128;
+      let mut wall_total = 0_u128;
+      let mut io_total = 0_u128;
+      let mut sleep_total = 0_u128;
+      let mut retries = 0_u64;
+      let mut outliers = Vec::new();
+      while start.elapsed() < Duration::from_secs(60) || done.as_ref().is_some_and(|p| !p.exists())
+      {
+        let timestamp = std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)?
+          .as_micros();
+        let cpu = kuntu_vfs::thread_cpu_ns();
+        kuntu_vfs::begin_probe();
         let t = Instant::now();
-        if (if samples.len().is_multiple_of(2) {
+        let kind = if samples.len().is_multiple_of(2) {
+          "point"
+        } else {
+          "range"
+        };
+        let result = if kind == "point" {
           index.point_probe()
         } else {
           index.range_probe()
-        })
-        .is_err()
-        {
+        };
+        let wall = t.elapsed().as_micros();
+        let measured = kuntu_vfs::end_probe();
+        let cpu = kuntu_vfs::thread_cpu_ns().saturating_sub(cpu) / 1000;
+        if !matches!(result, Ok(n) if n > 0) {
           errors += 1;
         }
-        samples.push(t.elapsed().as_micros());
+        cpu_total += u128::from(cpu);
+        wall_total += wall;
+        io_total += u128::from(measured.io_ns);
+        sleep_total += u128::from(measured.sleep_ns);
+        retries += measured.retries;
+        if wall > 5000 {
+          outliers.push(serde_json::json!({"timestamp_us":timestamp,"kind":kind,"wall_us":wall,"cpu_us":cpu,
+            "sqlite_retries":measured.retries,"sqlite_sleep_us":measured.sleep_ns/1000,"storage_syscall_us":measured.io_ns/1000,"storage_syscalls":measured.io_calls}));
+        }
+        samples.push(wall);
         std::thread::sleep(Duration::from_micros(500));
       }
+      let duration = start.elapsed().as_micros();
+      let end_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_micros();
       samples.sort_unstable();
       let p99 = samples[(samples.len() * 99 / 100).min(samples.len() - 1)];
       let max = *samples.last().unwrap();
       println!(
-        "{{\"queries\":{},\"errors\":{errors},\"p99_us\":{p99},\"max_us\":{max}}}",
-        samples.len()
+        "{}",
+        serde_json::json!({"queries":samples.len(),"errors":errors,"p99_us":p99,"max_us":max,
+        "committed_entries_at_start":committed,"sampling_start_us":start_us,"sampling_end_us":end_us,"sampling_duration_us":duration,
+        "probe_wall_total_us":wall_total,"cpu_total_us":cpu_total,"sqlite_retries":retries,
+        "sqlite_sleep_total_us":sleep_total/1000,"storage_syscall_total_us":io_total/1000,"outliers":outliers})
       );
     }
     "writer" => {

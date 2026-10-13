@@ -4,8 +4,9 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, readdirSync
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { strict as assert } from 'node:assert';
-const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/evidence';
-const fixtureBase='/Volumes/Portable2TB/tmp/kuntu-m2/evidence';
+const scratch=process.env.KUNTU_BENCH_DIR??'/Volumes/Portable2TB/tmp/kuntu-m2impl-bench/bench';
+const base=process.env.KUNTU_EVIDENCE_DIR??join(scratch,'evidence');
+const fixtureBase=process.env.KUNTU_EVIDENCE_FIXTURE_DIR??join(scratch,'evidence-fixtures');
 const target=process.env.CARGO_TARGET_DIR??'target';
 const bin=resolve(target,'release/examples/m2_probe');
 mkdirSync(base,{recursive:true});
@@ -27,7 +28,28 @@ async function killed(op:string,home:string,point:string,rows?:number) {
  await marker(m,p);p.child.kill('SIGKILL');const r=await p.done;assert.equal(r.code,null);return readFileSync(m,'utf8');
 }
 function db(home:string,sql:string){const r=spawnSync('python3',['-c','import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(sys.argv[2]).fetchall()); c.commit()',join(home,'index.v3.db'),sql],{encoding:'utf8',maxBuffer:256*1024*1024});assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
-type ReaderMetric={queries:number,errors:number,p99_us:number,max_us:number};
+type ReaderMetric={queries:number,errors:number,p99_us:number,max_us:number,committed_entries_at_start?:number,sampling_start_us?:number,sampling_end_us?:number,sampling_duration_us?:number,cpu_total_us?:number,probe_wall_total_us?:number,sqlite_retries?:number,sqlite_sleep_total_us?:number,storage_syscall_total_us?:number,outliers?:Record<string,number|string>[]};
+type WriterEvent={phase:string,start_us:number,end_us:number,entries?:number,details?:Record<string,number|string>};
+function stressEvidence(metrics:ReaderMetric[],events:WriterEvent[]):string[]{
+ const misses=readerAcceptanceMisses(metrics);
+ for(const m of metrics){
+  assert.ok(m.queries>0 && (m.committed_entries_at_start??0)>0,'sampling must begin on a populated committed store');
+  assert.ok((m.sampling_duration_us??0)>=60_000_000,'sampling must last at least 60 seconds');
+  assert.ok((m.cpu_total_us??0)>0 && (m.probe_wall_total_us??0)>0,'missing CPU/wall measurements');
+  assert.ok(Number.isFinite(m.sampling_start_us)&&Number.isFinite(m.sampling_end_us),'missing sample timestamps');
+  for(const phase of ['batch_commit','checkpoint','cleanup']){
+   assert.ok(events.some(e=>e.phase===phase&&e.start_us<=m.sampling_end_us!&&e.end_us>=m.sampling_start_us!),`no ${phase} overlap with sampling`);
+  }
+ }
+ return misses;
+}
+function readEvents(path:string):WriterEvent[]{
+ if(!existsSync(path))return [];
+ const text=readFileSync(path,'utf8');
+ return text.slice(0,text.lastIndexOf('\n')+1).split('\n').filter(Boolean).map(line=>JSON.parse(line) as WriterEvent);
+}
+function machineLoad(){const r=spawnSync('uptime',[],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
+
 function readerAcceptanceMisses(metrics:ReaderMetric[]):string[] {
  const misses:string[]=[];
  for(const m of metrics){
@@ -39,7 +61,25 @@ function readerAcceptanceMisses(metrics:ReaderMetric[]):string[] {
 }
 const mode=process.argv[2]??'crash';
 try {
- if(mode==='ceilings') {
+ if(mode==='population-contracts') {
+  const name=process.argv[3];console.log(`RUN ${name}`);
+  const populated:ReaderMetric={queries:1,errors:0,p99_us:1,max_us:1,committed_entries_at_start:5000,sampling_start_us:10,sampling_end_us:60_000_100,sampling_duration_us:60_000_090,cpu_total_us:1,probe_wall_total_us:2};
+  if(name==='reader_sampling_requires_committed_entries') {
+   assert.throws(()=>stressEvidence([{...populated,committed_entries_at_start:0}],[]),/populat/);
+  }else if(name==='sampling_requires_overlapping_writer_phases') {
+   assert.throws(()=>stressEvidence([populated],[]),/overlap/);
+   const phases=['batch_commit','checkpoint','cleanup'];
+   const events=phases.map(phase=>({phase,start_us:20,end_us:30}));
+   assert.equal(stressEvidence([populated],events).length,0);
+   for(const phase of phases)assert.throws(()=>stressEvidence([populated],events.filter(e=>e.phase!==phase)),/overlap/);
+   assert.throws(()=>stressEvidence([populated],events.map(e=>({...e,start_us:70_000_000,end_us:70_000_010}))),/overlap/);
+  }else if(name==='empty_reader_exits_before_sampling') {
+   const home=join(base,'empty-reader-contract');rmSync(home,{recursive:true,force:true});await ok('init',home);
+   const r=spawnSync(bin,['reader',home,root,'1'],{env:process.env,encoding:'utf8',timeout:1000});
+   assert.ok(r.status!==null&&r.status!==0&&r.stderr.includes('committed entries'),'reader sampled an empty database instead of refusing before sampling');
+  }else throw new Error(`Unknown contract ${name}`);
+  console.log(`PASS ${name}`);
+ } else if(mode==='ceilings') {
   const name='m2_reader_ceilings_reject_a_100ms_overrun';console.log(`RUN ${name}`);
   assert.equal(readerAcceptanceMisses([{queries:1,errors:0,p99_us:5000,max_us:100000}]).length,0);
   assert.equal(readerAcceptanceMisses([{queries:1,errors:0,p99_us:100,max_us:100001}]).length,1,'100 ms ceiling was loosened');
@@ -91,15 +131,47 @@ try {
   writeFileSync(join(base,'crash.json'),JSON.stringify(outcomes,null,2));console.log(JSON.stringify(outcomes,null,2));
  } else if(mode==='stress') {
   const stressRoot=join(fixtureBase,'root-1m');mkdirSync(stressRoot,{recursive:true});
-  for(let n=0;n<1_000_000;n++){const p=join(stressRoot,`file-${String(n).padStart(6,'0')}.md`);if(!existsSync(p))writeFileSync(p,'x');}
-  const extra={KUNTU_EVIDENCE_ROOT:stressRoot};
+  for(let n=0;n<1_000_000;n++){
+   const p=join(stressRoot,`file-${String(n).padStart(6,'0')}.md`);if(!existsSync(p))writeFileSync(p,'x');
+   if(n%100_000===99_999)console.log(`M2_STRESS_FIXTURE files=${n+1}`);
+  }
+  const eventsPath=join(base,'stress-events.jsonl'),donePath=join(base,'sampling-done');
+  rmSync(eventsPath,{force:true});rmSync(donePath,{force:true});
+  const extra={KUNTU_EVIDENCE_ROOT:stressRoot,KUNTU_EVIDENCE_EVENTS:eventsPath,KUNTU_SAMPLING_DONE:donePath};
   const home=join(base,'stress-home');rmSync(home,{recursive:true,force:true});await ok('init',home,extra);
-  const started=Date.now();const writers=[start('writer',home,extra),start('writer',home,extra)];const readers=Array.from({length:8},()=>start('reader',home,extra));
-  const results=await Promise.all([...writers,...readers].map(p=>p.done));for(const r of results)assert.equal(r.code,0,r.text);
-  const metrics=results.slice(2).map(r=>JSON.parse(r.text) as ReaderMetric);
-  const report={root_entries:1_000_001,probe:'alternating entry-rowid point and 100-row id range',seconds:(Date.now()-started)/1000,writers:results.slice(0,2).map(r=>r.text.trim()),readers:metrics,integrity:db(home,'PRAGMA integrity_check')};assert.equal(report.integrity,"[('ok',)]");writeFileSync(join(base,'stress.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
+  const loadBefore=machineLoad();
+  const started=Date.now();const writers=[start('writer',home,extra),start('writer',home,extra)];
+  const barrierDeadline=Date.now()+600_000;
+  let firstCommit:WriterEvent|undefined;
+  while(!(firstCommit=readEvents(eventsPath).find(e=>e.phase==='batch_commit'&&Number(e.details?.entries)>0))){
+   assert.ok(writers.some(p=>p.child.exitCode===null),'writers exited before a populated batch commit');
+   assert.ok(Date.now()<barrierDeadline,'populated batch barrier timed out');await Bun.sleep(20);
+  }
+  console.log(`M2_STRESS_POPULATED_BARRIER ${JSON.stringify(firstCommit)}`);
+  const readers=Array.from({length:8},()=>start('reader',home,extra));
+  const loadSamples:{at_us:number,load:string}[]=[];
+  const monitor=setInterval(()=>{
+   const events=readEvents(eventsPath),sample={at_us:Date.now()*1000,load:machineLoad()};loadSamples.push(sample);
+   console.log(`M2_STRESS_PROGRESS ${JSON.stringify({...sample,events:events.length,last:events.at(-1)})}`);
+  },30_000);
+  let writerResults:{code:number|null,text:string}[];
+  try{writerResults=await Promise.all(writers.map(p=>p.done));}finally{clearInterval(monitor);}
+  for(const r of writerResults)assert.equal(r.code,0,r.text);
+  writeFileSync(donePath,'writers joined');
+  const readerResults=await Promise.all(readers.map(p=>p.done));for(const r of readerResults)assert.equal(r.code,0,r.text);
+  const metrics=readerResults.map(r=>JSON.parse(r.text) as ReaderMetric);
+  const events=readEvents(eventsPath);
+  const overlap=metrics.map(m=>Object.fromEntries(['batch_commit','checkpoint','cleanup'].map(phase=>[phase,events.filter(e=>e.phase===phase&&e.start_us<=m.sampling_end_us!&&e.end_us>=m.sampling_start_us!).length])));
+  const outliers=metrics.flatMap((m,reader)=>(m.outliers??[]).map(o=>({...o,reader,overlapping_phases:events.filter(e=>e.start_us<=Number(o.timestamp_us)+Number(o.wall_us)&&e.end_us>=Number(o.timestamp_us)).map(e=>e.phase)})));
+  const report={root_entries:1_000_001,probe:'alternating populated entry-rowid point and 100-row id range; native reader floors',
+   seconds:(Date.now()-started)/1000,load_before:loadBefore,load_after:machineLoad(),load_samples:loadSamples,
+   barrier:firstCommit,checkpoint_note:'native 1000-page autocheckpoint remains enabled; separately recorded explicit PASSIVE checkpoints follow populated batches',
+   storage_note:'read/pread/fstat syscall wall time includes scheduling; mmap/cache accesses do not issue these syscalls',
+   writers:writerResults.map(r=>r.text.trim()),readers:metrics,overlap,outliers,writer_events:events,integrity:db(home,'PRAGMA integrity_check')};
+  assert.equal(report.integrity,"[('ok',)]");writeFileSync(join(base,'stress.json'),JSON.stringify(report,null,2));
+  console.log(JSON.stringify({...report,readers:metrics.map(({outliers,...m})=>({...m,outliers:outliers?.length??0})),outliers:outliers.length,writer_events:events.length},null,2));
   assert.equal(db(home,'SELECT count(*) FROM entries'),'[(1000001,)]');
-  const misses=readerAcceptanceMisses(metrics);assert.equal(misses.length,0,`M2_STRESS_ACCEPTANCE_MISS: ${misses.join('; ')}`);
+  const misses=stressEvidence(metrics,events);assert.equal(misses.length,0,`M2_STRESS_ACCEPTANCE_MISS: ${misses.join('; ')}`);
  } else if(mode==='skew') {
   const cells:Record<string,string>={};
   const h=join(base,'skew');rmSync(h,{recursive:true,force:true});await ok('init',h,{},'0');

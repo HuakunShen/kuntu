@@ -87,6 +87,38 @@ fn confirmed_corruption(checked: rusqlite::Result<String>) -> Result<bool> {
     Err(e) => Err(e.into()),
   }
 }
+pub(crate) struct EvidenceSpan {
+  path: PathBuf,
+  start_us: u128,
+  started: std::time::Instant,
+}
+pub(crate) fn evidence_span() -> Option<EvidenceSpan> {
+  std::env::var_os("KUNTU_EVIDENCE_EVENTS").map(|p| EvidenceSpan {
+    path: p.into(),
+    start_us: SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_micros(),
+    started: std::time::Instant::now(),
+  })
+}
+impl EvidenceSpan {
+  pub(crate) fn finish(self, phase: &str, details: serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let record = serde_json::json!({"pid":std::process::id(),"phase":phase,"start_us":self.start_us,
+      "end_us":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros(),"wall_us":self.started.elapsed().as_micros(),"details":details});
+    let mut bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    std::fs::OpenOptions::new()
+      .append(true)
+      .create(true)
+      .mode(0o600)
+      .open(self.path)?
+      .write_all(&bytes)?;
+    Ok(())
+  }
+}
 impl KuntuIndex {
   pub fn open_shared(home: Home, readonly: bool, consumer: &str) -> Result<Self> {
     Self::open_shared_minor(home, readonly, consumer, BUILD_MINOR)
@@ -668,6 +700,7 @@ impl KuntuIndex {
       return Err(IndexError::LeaseRequired);
     }
     self.check_cancelled()?;
+    let evidence = evidence_span();
     let started = std::time::Instant::now();
     // Limit inspected rows, including other roots and current generations.
     // No root predicate can force SQLite to walk an unbounded gap first.
@@ -708,6 +741,12 @@ impl KuntuIndex {
     }
     block_on(tx.commit())?;
     *cursor = next;
+    if let Some(span) = evidence {
+      span.finish(
+        "cleanup",
+        serde_json::json!({"inspected":inspected,"deleted":deleted,"cursor":next}),
+      )?;
+    }
     fault("cleanup_committed");
     Ok(CleanupBatch {
       inspected,

@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <mach/mach.h>
+#endif
 typedef struct sqlite3_vfs sqlite3_vfs;
 typedef void (*syscall_ptr)(void);
 struct sqlite3_vfs {
@@ -36,6 +42,53 @@ extern int sqlite3_vfs_register(sqlite3_vfs*, int);
 extern int sqlite3_initialize(void);
 static sqlite3_vfs kv;
 static int (*unix_open_directory)(const char*,int*);
+/* Optional per-thread probe counters. Normal connections only take the
+ * disabled branch; measurements include syscall wall time, not pure disk time. */
+struct kuntu_probe_metrics { uint64_t retries, sleep_ns, io_ns, io_calls; };
+static _Thread_local int measuring;
+static _Thread_local struct kuntu_probe_metrics probe;
+static uint64_t monotonic_ns(void) {
+ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+ return (uint64_t)t.tv_sec*1000000000ULL+(uint64_t)t.tv_nsec;
+}
+uint64_t kuntu_thread_cpu_ns(void) {
+#ifdef __APPLE__
+ thread_basic_info_data_t info;
+ mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+ if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+ return ((uint64_t)info.user_time.seconds+(uint64_t)info.system_time.seconds)*1000000000ULL+
+        ((uint64_t)info.user_time.microseconds+(uint64_t)info.system_time.microseconds)*1000ULL;
+#else
+ struct timespec t; if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t))return 0;
+ return (uint64_t)t.tv_sec*1000000000ULL+(uint64_t)t.tv_nsec;
+#endif
+}
+void kuntu_probe_start(void) { memset(&probe,0,sizeof(probe));measuring=1; }
+void kuntu_probe_stop(struct kuntu_probe_metrics *out) { measuring=0;*out=probe; }
+static ssize_t (*unix_pread)(int,void*,size_t,off_t);
+static ssize_t (*unix_read)(int,void*,size_t);
+static int (*unix_fstat)(int,struct stat*);
+static int (*unix_sleep)(sqlite3_vfs*,int);
+static ssize_t measured_pread(int fd,void *b,size_t n,off_t off) {
+ if(!measuring)return unix_pread(fd,b,n,off);
+ uint64_t t=monotonic_ns();ssize_t result=unix_pread(fd,b,n,off);int saved=errno;
+ probe.io_ns+=monotonic_ns()-t;probe.io_calls++;errno=saved;return result;
+}
+static ssize_t measured_read(int fd,void *b,size_t n) {
+ if(!measuring)return unix_read(fd,b,n);
+ uint64_t t=monotonic_ns();ssize_t result=unix_read(fd,b,n);int saved=errno;
+ probe.io_ns+=monotonic_ns()-t;probe.io_calls++;errno=saved;return result;
+}
+static int measured_fstat(int fd,struct stat *s) {
+ if(!measuring)return unix_fstat(fd,s);
+ uint64_t t=monotonic_ns();int result=unix_fstat(fd,s);int saved=errno;
+ probe.io_ns+=monotonic_ns()-t;probe.io_calls++;errno=saved;return result;
+}
+static int measured_sleep(sqlite3_vfs *v,int us) {
+ if(!measuring)return unix_sleep(v,us);
+ uint64_t t=monotonic_ns();int result=unix_sleep(v,us);
+ probe.retries++;probe.sleep_ns+=monotonic_ns()-t;return result;
+}
 #ifdef KUNTU_TEST_HOOKS
 int kuntu_vfs_test_delete(const char *p) { return kv.xDelete(&kv,p,1); }
 #endif
@@ -74,7 +127,14 @@ static int kd(const char *p,int *out) {
 int kuntu_vfs_register(void) {
  if(sqlite3_initialize())return 1;
  sqlite3_vfs*u=sqlite3_vfs_find("unix");if(!u || u->iVersion<3)return 1;
- kv=*u;kv.zName="kuntu-fd";kv.pNext=0;kv.xFullPathname=full;
+ unix_pread=(ssize_t(*)(int,void*,size_t,off_t))u->xGetSystemCall(u,"pread");
+ unix_read=(ssize_t(*)(int,void*,size_t))u->xGetSystemCall(u,"read");
+ unix_fstat=(int(*)(int,struct stat*))u->xGetSystemCall(u,"fstat");
+ if((unix_pread && u->xSetSystemCall(u,"pread",(syscall_ptr)measured_pread)) ||
+    (unix_read && u->xSetSystemCall(u,"read",(syscall_ptr)measured_read)) ||
+    (unix_fstat && u->xSetSystemCall(u,"fstat",(syscall_ptr)measured_fstat)))return 1;
+ unix_sleep=u->xSleep;
+ kv=*u;kv.xSleep=measured_sleep;kv.zName="kuntu-fd";kv.pNext=0;kv.xFullPathname=full;
  unix_open_directory=(int(*)(const char*,int*))u->xGetSystemCall(u,"openDirectory");
  if(!unix_open_directory || u->xSetSystemCall(u,"openDirectory",(syscall_ptr)kd))return 1;
  if(u->xSetSystemCall(u,"open",(syscall_ptr)ko) || u->xSetSystemCall(u,"stat",(syscall_ptr)ks) || u->xSetSystemCall(u,"lstat",(syscall_ptr)kl) || u->xSetSystemCall(u,"access",(syscall_ptr)ka) || u->xSetSystemCall(u,"unlink",(syscall_ptr)ku) || u->xSetSystemCall(u,"readlink",(syscall_ptr)kr))return 1;
