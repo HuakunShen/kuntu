@@ -782,7 +782,6 @@ pub fn register() -> rusqlite::Result<()> {
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <stdio.h>
 typedef struct sqlite3_vfs sqlite3_vfs;
 typedef void (*syscall_ptr)(void);
@@ -816,10 +815,10 @@ static int parse(const char *p, int *fd, const char **leaf) {
  if (n<0 || n>2147483647 || *end!='/' || !end[1] || strchr(end+1,'/') || strstr(end+1,"..")) { errno=EINVAL; return -1; }
  *fd=(int)n; *leaf=end+1; return 1;
 }
-static int ko(const char *p,int flags,...) {
- mode_t mode=0600; int fd; const char *leaf; int r=parse(p,&fd,&leaf);
+static int ko(const char *p,int flags,int mode) {
+ int fd; const char *leaf; int r=parse(p,&fd,&leaf);
  if(r<0)return -1;
- if(r==0) { if(flags&O_CREAT) {va_list a;va_start(a,flags);mode=va_arg(a,int);va_end(a);} return open(p,flags,mode); }
+ if(r==0) return open(p,flags,mode);
  int f=openat(fd,leaf,flags|O_NOFOLLOW|O_CLOEXEC,0600);
  if(f>=0) { struct stat s; if(fstat(f,&s) || !S_ISREG(s.st_mode) || s.st_uid!=getuid() || s.st_nlink!=1 || (s.st_mode&0777)!=0600) {close(f);errno=EACCES;return -1;} }
  return f;
@@ -7300,6 +7299,23 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
     "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3}"
   );
   assert!(bytes <= 550_000_000, "550 MB size gate: {bytes} bytes");
+}
+
+#[test]
+fn fd_vfs_preserves_the_unix_open_abi_for_private_connections() {
+  kuntu_vfs::register().unwrap();
+  let h = home("private-vfs-abi");
+  let path = h.path.join("ordinary.sqlite");
+  let conn = rusqlite::Connection::open(&path).unwrap();
+  conn
+    .execute_batch("CREATE TABLE retained(value TEXT);INSERT INTO retained VALUES('readable')")
+    .unwrap();
+  drop(conn);
+  assert_eq!(
+    std::fs::metadata(&path).unwrap().permissions().mode() & 0o600,
+    0o600
+  );
+  assert!(!std::fs::read(path).unwrap().is_empty());
 }
 ````
 
@@ -14141,7 +14157,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
 | 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
 | 7 Consumer scope | M2.3, M2.8–9 | `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, Node/daemon strict tests, `cli_scope` |
-| 8 FD opens/permissions | M2.1, M2.3 | `descriptor_open_rejects_symlink_and_private_modes_are_exact`, `opened_directory_survives_path_swap_and_sidecars_are_private` |
+| 8 FD opens/permissions | M2.1, M2.3 | `descriptor_open_rejects_symlink_and_private_modes_are_exact`, `opened_directory_survives_path_swap_and_sidecars_are_private`, `fd_vfs_preserves_the_unix_open_abi_for_private_connections` |
 | 9 Atomic random identity | M2.1 | `atomic_identity_is_128_bits_and_existing_document_is_preserved`, concurrent-open test and publication kill |
 | 10 Reader-safe quarantine/GC | M2.4, M2.9 | `live_readers_prevent_quarantine_and_gc_never_touches_future_epochs`, quarantine kill; unregistered private epochs preserved |
 | 11 NAPI actual access/compat | M2.8 | Node read-only operation test, `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` |
