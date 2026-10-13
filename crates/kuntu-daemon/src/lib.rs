@@ -68,6 +68,27 @@ struct SearchResultDto {
   matches: Vec<String>,
 }
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const IO_POLL: Duration = Duration::from_millis(50);
+struct QueuedConnection {
+  stream: TcpStream,
+  deadline: Instant,
+}
+fn io_timeout(
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Duration, BackendError> {
+  if cancelled.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+    return Err(BackendError::new("request cancelled or deadline elapsed"));
+  }
+  Ok(
+    deadline
+      .saturating_duration_since(Instant::now())
+      .min(IO_POLL)
+      .max(Duration::from_millis(1)),
+  )
+}
+
 pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
   validate_bind_addr(&config)?;
   let listener = TcpListener::bind(&config.addr).map_err(BackendError::from)?;
@@ -77,6 +98,8 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
     .map_err(BackendError::from)?
     .to_string();
   let started = Instant::now();
+  let server_deadline = config.duration.map(|d| started + d);
+  let cancelled = std::sync::atomic::AtomicBool::new(false);
   let shared = config
     .db_path
     .file_name()
@@ -109,7 +132,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
   drop(init);
   let mut requests = 0;
   let reader_connections = std::sync::atomic::AtomicUsize::new(0);
-  let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(8);
+  let (sender, receiver) = std::sync::mpsc::sync_channel::<QueuedConnection>(8);
   let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
   thread::scope(|scope| -> Result<(), BackendError> {
     for _ in 0..4 {
@@ -117,14 +140,18 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
       let home = home.clone();
       let config = &config;
       let reader_connections = &reader_connections;
+      let cancelled = &cancelled;
       scope.spawn(move || {
         let mut reader = None;
         let mut writer = None;
         loop {
           let stream = receiver.lock().expect("worker queue").recv();
           let Ok(stream) = stream else { break };
-          let mut stream = stream;
-          let request = match read_http_request(&mut stream) {
+          let QueuedConnection {
+            mut stream,
+            deadline,
+          } = stream;
+          let request = match read_http_request_until(&mut stream, deadline, cancelled) {
             Ok(Some(r)) => r,
             _ => continue,
           };
@@ -147,9 +174,11 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
             match opened {
               Ok(index) => *slot = Some(index),
               Err(e) => {
-                let _ = write_http_response(
+                let _ = write_http_response_until(
                   &mut stream,
                   &json_response(500, json!({"error":e.to_string()})),
+                  deadline,
+                  cancelled,
                 );
                 continue;
               }
@@ -160,32 +189,58 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
             request,
             &config.allowed_roots,
           );
-          let _ = write_http_response(&mut stream, &response);
+          let _ = write_http_response_until(&mut stream, &response, deadline, cancelled);
         }
       });
     }
     let outcome = (|| {
-      loop {
-        if config.duration.is_some_and(|d| started.elapsed() >= d)
-          || config.max_requests.is_some_and(|m| requests >= m)
-        {
+      'accepts: loop {
+        if server_deadline.is_some_and(|d| Instant::now() >= d) {
+          cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+          break;
+        }
+        if config.max_requests.is_some_and(|m| requests >= m) {
           break;
         }
         match listener.accept() {
           Ok((stream, _)) => {
-            sender
-              .send(stream)
-              .map_err(|e| BackendError::new(e.to_string()))?;
+            // macOS inherits nonblocking from accept; normalize it so the
+            // short socket timeouts bound each read/write poll on every Unix.
+            stream.set_nonblocking(false).map_err(BackendError::from)?;
+            let now = Instant::now();
+            let deadline =
+              server_deadline.map_or(now + REQUEST_TIMEOUT, |d| d.min(now + REQUEST_TIMEOUT));
+            let mut queued = QueuedConnection { stream, deadline };
             requests += 1;
+            loop {
+              if server_deadline.is_some_and(|d| Instant::now() >= d) {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                break 'accepts;
+              }
+              if Instant::now() >= queued.deadline {
+                break;
+              }
+              match sender.try_send(queued) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => queued = returned,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                  return Err(BackendError::new("worker queue disconnected"))
+                }
+              }
+              thread::sleep(Duration::from_millis(2));
+            }
           }
           Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            thread::sleep(Duration::from_millis(10))
+            thread::sleep(Duration::from_millis(2))
           }
           Err(e) => return Err(BackendError::from(e)),
         }
       }
       Ok(())
     })();
+    if outcome.is_err() {
+      cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     drop(sender);
     outcome
   })?;
@@ -309,13 +364,25 @@ fn handle_request(
   }
 }
 
+#[cfg(test)]
 fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, BackendError> {
-  stream
-    .set_read_timeout(Some(Duration::from_secs(2)))
-    .map_err(BackendError::from)?;
+  read_http_request_until(
+    stream,
+    Instant::now() + REQUEST_TIMEOUT,
+    &std::sync::atomic::AtomicBool::new(false),
+  )
+}
+fn read_http_request_until(
+  stream: &mut TcpStream,
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<HttpRequest>, BackendError> {
   let mut buffer = Vec::new();
   let mut chunk = [0_u8; 4096];
   loop {
+    stream
+      .set_read_timeout(Some(io_timeout(deadline, cancelled)?))
+      .map_err(BackendError::from)?;
     match stream.read(&mut chunk) {
       Ok(0) => break,
       Ok(count) => {
@@ -324,20 +391,23 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Back
           break;
         }
       }
-      Err(err)
+      Err(e)
         if matches!(
-          err.kind(),
-          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+          e.kind(),
+          std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
         ) =>
       {
-        break;
+        continue
       }
-      Err(err) => return Err(BackendError::from(err)),
+      Err(e) => return Err(BackendError::from(e)),
     }
   }
   if buffer.is_empty() {
     return Ok(None);
   }
+  io_timeout(deadline, cancelled)?;
   parse_http_request(&buffer).map(Some)
 }
 
@@ -389,9 +459,23 @@ fn content_length(headers: &[u8]) -> Option<usize> {
   })
 }
 
+#[cfg(test)]
 fn write_http_response(
   stream: &mut TcpStream,
   response: &HttpResponse,
+) -> Result<(), BackendError> {
+  write_http_response_until(
+    stream,
+    response,
+    Instant::now() + REQUEST_TIMEOUT,
+    &std::sync::atomic::AtomicBool::new(false),
+  )
+}
+fn write_http_response_until(
+  stream: &mut TcpStream,
+  response: &HttpResponse,
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), BackendError> {
   let reason = match response.status {
     200 => "OK",
@@ -407,9 +491,28 @@ fn write_http_response(
         response.body.len(),
         response.body
     );
-  stream
-    .write_all(text.as_bytes())
-    .map_err(BackendError::from)
+  let mut remaining = text.as_bytes();
+  while !remaining.is_empty() {
+    stream
+      .set_write_timeout(Some(io_timeout(deadline, cancelled)?))
+      .map_err(BackendError::from)?;
+    match stream.write(remaining) {
+      Ok(0) => return Err(BackendError::new("response write returned zero")),
+      Ok(n) => remaining = &remaining[n..],
+      Err(e)
+        if matches!(
+          e.kind(),
+          std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+        ) =>
+      {
+        continue
+      }
+      Err(e) => return Err(BackendError::from(e)),
+    }
+  }
+  Ok(())
 }
 
 fn parse_roots_request(
@@ -754,5 +857,121 @@ mod connection_tests {
       samples[0],
       &samples[1..]
     );
+  }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+  use super::*;
+  use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  };
+  fn pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    (listener.accept().unwrap().0, client)
+  }
+  #[test]
+  fn trickled_input_cannot_extend_the_absolute_request_deadline() {
+    let (mut server, mut client) = pair();
+    let trickler = thread::spawn(move || {
+      let end = Instant::now() + Duration::from_secs(3);
+      while Instant::now() < end {
+        if client.write_all(b"x").is_err() {
+          break;
+        }
+        thread::sleep(Duration::from_millis(30));
+      }
+    });
+    let start = Instant::now();
+    assert!(read_http_request(&mut server).is_err());
+    let elapsed = start.elapsed();
+    drop(server);
+    trickler.join().unwrap();
+    assert!(
+      elapsed < Duration::from_millis(2500),
+      "trickled read took {elapsed:?}"
+    );
+  }
+  #[test]
+  fn stalled_response_writes_have_an_absolute_deadline() {
+    let (mut server, client) = pair();
+    let blocked = thread::spawn(move || {
+      thread::sleep(Duration::from_secs(3));
+      drop(client);
+    });
+    let response = HttpResponse {
+      status: 200,
+      body: "x".repeat(64 * 1024 * 1024),
+    };
+    let start = Instant::now();
+    assert!(write_http_response(&mut server, &response).is_err());
+    let elapsed = start.elapsed();
+    drop(server);
+    blocked.join().unwrap();
+    assert!(
+      elapsed < Duration::from_millis(2500),
+      "stalled write took {elapsed:?}"
+    );
+  }
+  #[test]
+  fn shutdown_cancels_busy_workers_and_full_queue_submission() {
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path: std::env::temp_dir().join(format!("daemon-shutdown-{}.sqlite", std::process::id())),
+      addr: addr.clone(),
+      duration: Some(Duration::from_millis(250)),
+      max_requests: None,
+      allowed_roots: vec![],
+      allow_non_loopback: false,
+    };
+    let (done, result) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      done.send(serve(config)).unwrap();
+    });
+    let start = Instant::now();
+    let mut clients = Vec::new();
+    for _ in 0..14 {
+      let stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(stream) => break stream,
+          Err(_) if start.elapsed() < Duration::from_secs(5) => {
+            thread::sleep(Duration::from_millis(1))
+          }
+          Err(e) => panic!("connect: {e}"),
+        }
+      };
+      let mut stream = stream;
+      stream.write_all(b"x").unwrap();
+      clients.push(stream);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let trickle_stop = stop.clone();
+    let trickler = thread::spawn(move || {
+      while !trickle_stop.load(Ordering::Relaxed) {
+        for stream in &mut clients {
+          let _ = stream.write_all(b"x");
+        }
+        thread::sleep(Duration::from_millis(20));
+      }
+    });
+    let timely = result.recv_timeout(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    trickler.join().unwrap();
+    server.join().unwrap();
+    let stats = timely
+      .expect("shutdown blocked behind occupied workers/full queue")
+      .unwrap();
+    eprintln!("SHUTDOWN stats={stats:?}");
+    assert!(
+      stats.requests >= 12,
+      "did not fill four workers and eight queue slots: {stats:?}"
+    );
+    assert!(stats.elapsed_ms < 1000, "{stats:?}");
   }
 }
