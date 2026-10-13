@@ -12,7 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kuntu_core::{BackendError, MetadataIndex, SearchConfig, SearchQuery, SearchRoot};
-use kuntu_index::{match_names, KuntuIndex};
+use kuntu_index::{match_names, KuntuIndex, WriterService};
+use kuntu_store::Home;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -75,54 +76,99 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
     .map_err(BackendError::from)?
     .to_string();
   let started = Instant::now();
-  let mut index =
-    KuntuIndex::open(&config.db_path).map_err(|err| BackendError::new(err.to_string()))?;
-  let mut requests = 0;
-
-  loop {
-    if config
-      .duration
-      .is_some_and(|duration| started.elapsed() >= duration)
-    {
-      break;
-    }
-    if config
-      .max_requests
-      .is_some_and(|max_requests| requests >= max_requests)
-    {
-      break;
-    }
-
-    match listener.accept() {
-      Ok((stream, _addr)) => {
-        handle_connection(&mut index, stream, &config.allowed_roots)?;
-        requests += 1;
-      }
-      Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-        thread::sleep(Duration::from_millis(10));
-      }
-      Err(err) => return Err(BackendError::from(err)),
-    }
+  let shared = config
+    .db_path
+    .file_name()
+    .is_some_and(|n| n == "index.v3.db");
+  let home = if shared {
+    Some(
+      Home::open(
+        config
+          .db_path
+          .parent()
+          .ok_or_else(|| BackendError::new("Missing store home."))?,
+      )
+      .map_err(BackendError::from)?,
+    )
+  } else {
+    None
+  };
+  let _service = home.clone().map(WriterService::start);
+  let init = if let Some(h) = &home {
+    KuntuIndex::open_shared(h.clone(), false, "daemon")
+  } else {
+    KuntuIndex::open(&config.db_path)
   }
-
+  .map_err(|e| BackendError::new(e.to_string()))?;
+  for root in &config.allowed_roots {
+    init
+      .register_root(root)
+      .map_err(|e| BackendError::new(e.to_string()))?;
+  }
+  drop(init);
+  let mut requests = 0;
+  let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(8);
+  let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+  thread::scope(|scope| -> Result<(), BackendError> {
+    for _ in 0..4 {
+      let receiver = receiver.clone();
+      let home = home.clone();
+      let config = &config;
+      scope.spawn(move || loop {
+        let stream = receiver.lock().expect("worker queue").recv();
+        let Ok(stream) = stream else { break };
+        let mut stream = stream;
+        let request = match read_http_request(&mut stream) {
+          Ok(Some(r)) => r,
+          _ => continue,
+        };
+        let readonly = matches!(
+          (request.method.as_str(), request.path.as_str()),
+          ("GET", _) | ("POST", "/search")
+        );
+        let opened = if let Some(h) = &home {
+          KuntuIndex::open_shared(h.clone(), readonly, "daemon")
+        } else if readonly {
+          KuntuIndex::open_read_only(&config.db_path)
+        } else {
+          KuntuIndex::open(&config.db_path)
+        };
+        if let Ok(mut index) = opened {
+          let response = handle_request(&mut index, request, &config.allowed_roots);
+          let _ = write_http_response(&mut stream, &response);
+        }
+      });
+    }
+    let outcome = (|| {
+      loop {
+        if config.duration.is_some_and(|d| started.elapsed() >= d)
+          || config.max_requests.is_some_and(|m| requests >= m)
+        {
+          break;
+        }
+        match listener.accept() {
+          Ok((stream, _)) => {
+            sender
+              .send(stream)
+              .map_err(|e| BackendError::new(e.to_string()))?;
+            requests += 1;
+          }
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(10))
+          }
+          Err(e) => return Err(BackendError::from(e)),
+        }
+      }
+      Ok(())
+    })();
+    drop(sender);
+    outcome
+  })?;
   Ok(DaemonRunStats {
     addr,
     requests,
     elapsed_ms: started.elapsed().as_millis(),
   })
-}
-
-fn handle_connection(
-  index: &mut KuntuIndex,
-  mut stream: TcpStream,
-  allowed_roots: &[SearchRoot],
-) -> Result<(), BackendError> {
-  let request = read_http_request(&mut stream)?;
-  let response = match request {
-    Some(request) => handle_request(index, request, allowed_roots),
-    None => json_response(400, json!({ "error": "empty request" })),
-  };
-  write_http_response(&mut stream, &response)
 }
 
 fn handle_request(
@@ -142,6 +188,7 @@ fn handle_request(
                     "entry_count": root.entry_count,
                     "generation": root.generation,
                     "dirty": root.dirty,
+                    "status": index.root_state_name(&root.path).unwrap_or_else(|_|"dirty".into()),
                     "last_full_scan_at": root.last_full_scan_at,
                     "last_incremental_at": root.last_incremental_at
                 })
@@ -169,6 +216,7 @@ fn handle_request(
                 "coverage": match outcome.coverage {
                     kuntu_index::CandidateCoverage::Complete => "complete",
                     kuntu_index::CandidateCoverage::Truncated => "truncated",
+                    kuntu_index::CandidateCoverage::Building => "building",
                 },
                 "results": outcome.results.into_iter().map(SearchResultDto::from).collect::<Vec<_>>()
             }),
@@ -179,40 +227,56 @@ fn handle_request(
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     ("POST", "/index/rebuild") => match parse_roots_request(&request.body, allowed_roots) {
-      Ok(config) => match index.rebuild_index(&config) {
-        Ok(stats) => json_response(
-          200,
-          json!({
-              "stats": {
-                  "roots": stats.roots,
-                  "entries": stats.entries,
-                  "skipped": stats.skipped,
-                  "errors": stats.errors
-              }
-          }),
-        ),
-        Err(err) => json_response(500, json!({ "error": err.to_string() })),
-      },
+      Ok(config) => {
+        if index.is_shared() {
+          return match index.enqueue("rebuild", &config) {
+            Ok(id) => json_response(202, json!({"request_id":id})),
+            Err(e) => json_response(409, json!({"error":e.to_string()})),
+          };
+        }
+        match index.rebuild_index(&config) {
+          Ok(stats) => json_response(
+            200,
+            json!({
+                "stats": {
+                    "roots": stats.roots,
+                    "entries": stats.entries,
+                    "skipped": stats.skipped,
+                    "errors": stats.errors
+                }
+            }),
+          ),
+          Err(err) => json_response(500, json!({ "error": err.to_string() })),
+        }
+      }
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     ("POST", "/index/refresh") => match parse_roots_request(&request.body, allowed_roots) {
-      Ok(config) => match index.refresh_index(&config) {
-        Ok(stats) => json_response(
-          200,
-          json!({
-              "stats": {
-                  "roots": stats.roots,
-                  "inserted": stats.inserted,
-                  "updated": stats.updated,
-                  "deleted": stats.deleted,
-                  "unchanged": stats.unchanged,
-                  "skipped": stats.skipped,
-                  "errors": stats.errors
-              }
-          }),
-        ),
-        Err(err) => json_response(500, json!({ "error": err.to_string() })),
-      },
+      Ok(config) => {
+        if index.is_shared() {
+          return match index.enqueue("refresh", &config) {
+            Ok(id) => json_response(202, json!({"request_id":id})),
+            Err(e) => json_response(409, json!({"error":e.to_string()})),
+          };
+        }
+        match index.refresh_index(&config) {
+          Ok(stats) => json_response(
+            200,
+            json!({
+                "stats": {
+                    "roots": stats.roots,
+                    "inserted": stats.inserted,
+                    "updated": stats.updated,
+                    "deleted": stats.deleted,
+                    "unchanged": stats.unchanged,
+                    "skipped": stats.skipped,
+                    "errors": stats.errors
+                }
+            }),
+          ),
+          Err(err) => json_response(500, json!({ "error": err.to_string() })),
+        }
+      }
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     _ => json_response(404, json!({ "error": "not found" })),
@@ -532,5 +596,73 @@ mod tests {
       .unwrap()
       .as_nanos();
     std::env::temp_dir().join(format!("kuntu-daemon-{name}-{nonce}"))
+  }
+  #[test]
+  fn non_holder_bulk_endpoint_queues_and_empty_search_is_rejected() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").expect("scratch KUNTU_TEST_DIR"));
+    let home = Home::open(&base.join(format!("daemon-shared-{}", std::process::id()))).unwrap();
+    let root = home.path.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    let roots = vec![SearchRoot::new(&root)];
+    let mut holder = KuntuIndex::open_shared(home.clone(), false, "holder").unwrap();
+    assert!(holder.acquire_writer().unwrap());
+    let mut client = KuntuIndex::open_shared(home, false, "daemon").unwrap();
+    client.register_root(&roots[0]).unwrap();
+    let response = handle_request(
+      &mut client,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/index/rebuild".into(),
+        body: serde_json::to_vec(&json!({"roots":[root.to_string_lossy()]})).unwrap(),
+      },
+      &roots,
+    );
+    assert_eq!(response.status, 202);
+    let response = handle_request(
+      &mut client,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/search".into(),
+        body: br#"{"roots":[],"query":""}"#.to_vec(),
+      },
+      &roots,
+    );
+    assert_eq!(response.status, 400);
+  }
+  #[test]
+  fn strict_daemon_admission_ignores_another_consumers_union() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").expect("scratch directory"));
+    let path = base.join(format!("daemon-policy-{}", std::process::id()));
+    let home = Home::open(&path).unwrap();
+    let root = home.path.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("visible-file.md"), "x").unwrap();
+    std::fs::write(root.join(".hidden-file.md"), "x").unwrap();
+    let allowed = SearchRoot::new(&root);
+    let mut permissive = KuntuIndex::open_shared(home.clone(), false, "permissive").unwrap();
+    let mut broad = allowed.clone();
+    broad.include_hidden = true;
+    permissive.register_root(&broad).unwrap();
+    assert!(permissive.acquire_writer().unwrap());
+    permissive
+      .rebuild(&SearchConfig { roots: vec![broad] })
+      .unwrap();
+    let mut daemon = KuntuIndex::open_shared(home, false, "daemon").unwrap();
+    daemon.register_root(&allowed).unwrap();
+    let response = handle_request(
+      &mut daemon,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/search".into(),
+        body: serde_json::to_vec(
+          &json!({"query":"file","roots":[root.to_string_lossy()],"include_hidden":true}),
+        )
+        .unwrap(),
+      },
+      &[allowed],
+    );
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("visible-file"));
+    assert!(!response.body.contains(".hidden-file"));
   }
 }

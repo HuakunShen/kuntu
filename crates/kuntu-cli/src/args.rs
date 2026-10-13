@@ -36,6 +36,10 @@ pub enum CommandSpec {
   Bench {
     query: SearchQuery,
   },
+  Store {
+    operation: String,
+    source: Option<PathBuf>,
+  },
   Index(IndexCommand),
   Watch {
     duration_ms: u64,
@@ -61,6 +65,26 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
   }
 
   match args[0].as_str() {
+    "store" => {
+      let operation = args.get(1).ok_or_else(usage)?.clone();
+      if !matches!(operation.as_str(), "info" | "gc" | "doctor" | "import") {
+        return Err(usage());
+      }
+      let source = if operation == "import" {
+        Some(PathBuf::from(args.get(2).ok_or_else(usage)?))
+      } else {
+        None
+      };
+      if args.len() != if source.is_some() { 3 } else { 2 } {
+        return Err(usage());
+      }
+      Ok(ParsedArgs {
+        roots: Vec::new(),
+        db_path: None,
+        provider: SearchProvider::Sqlite,
+        command: CommandSpec::Store { operation, source },
+      })
+    }
     "search" => parse_search(&args[1..]),
     "explain" => parse_explain(&args[1..]),
     "bench" => parse_bench(&args[1..]),
@@ -231,9 +255,6 @@ impl CommonArgs {
   }
 
   fn require_db(&self) -> Result<(), String> {
-    if self.db_path.is_none() {
-      return Err("--db is required for this command".to_string());
-    }
     Ok(())
   }
 
@@ -595,5 +616,17 @@ mod tests {
         allow_non_loopback: true
       }
     );
+  }
+  #[test]
+  fn store_import_parser_accepts_source_and_rejects_missing_source() {
+    let a = parse_args(&["store".into(), "import".into(), "/source/v2.db".into()]).unwrap();
+    assert!(matches!(
+      a.command,
+      CommandSpec::Store {
+        source: Some(_),
+        ..
+      }
+    ));
+    assert!(parse_args(&["store".into(), "import".into()]).is_err());
   }
 }
