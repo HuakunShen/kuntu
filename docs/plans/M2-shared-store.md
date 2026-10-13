@@ -778,6 +778,9 @@ fn transient_lock_creation_retries_only_not_found_under_the_same_directory_fd() 
 fn executed_child_does_not_inherit_the_permanent_writer_lease() {
   let h = home();
   let lease = h.lock("indexer.lock", false).unwrap().unwrap();
+  let flags = nix::fcntl::fcntl(&lease.file, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+  let close_on_exec =
+    nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC);
   let mut child = std::process::Command::new("/bin/sleep")
     .arg("1")
     .stdin(std::process::Stdio::null())
