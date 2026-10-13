@@ -74,7 +74,7 @@ Shared homes are absolute paths resolved with no-follow `openat` directory trave
 
 Transient ENOENT during permanent-lock creation is retried at most 100 times through the same validated directory fd; permission/symlink failures fail immediately. Bootstrap serialization covers identity publication and first schema creation. The bootstrap, migration, indexer and epoch lock files are permanent; JSON holder payloads are informational. `KuntuIndex` owns its lease capability. Shared bulk methods refuse a missing capability; private v3 and v2 methods acquire their private lease first. `WriterService::start` is the persistent embedding entry point, used by the shared NAPI factory and the daemon. A service destructor joins its worker. The daemon uses four scoped workers and an eight-connection queue; every return joins them. Read endpoints open read-only connections; bulk requests enter the guarded inbox. The CLI retains `--db` and otherwise resolves the shared home.
 
-Compatibility is validated before WAL configuration or DDL, including read-only opens, `schema_epoch`, store identity and reader/writer floors. Initial schema creation, migrations, inbox/consumer updates, batches, cleanup and completion use `begin_writer_txn`; RAII rollback applies on error. The empty-store bootstrap exception is available only to an exclusive transaction with no existing user tables. A minor-1 holder migrates under `migrate.lock` plus an exclusive transaction; minor-0 readers keep working and minor-0 writers step down. The private v2 compatibility backend retains the old engine and its original file format. It cannot open a shared store; its guarded transactions re-check v2 user_version instead of v3 metadata.
+The compiled `BUILD_MINOR` bounds every shared opener; the skew helper may lower it to 0 but cannot accept a caller claim above the compiled version. Compatibility is validated before WAL configuration or DDL, including read-only opens, `schema_epoch`, store identity and reader/writer floors. Initial schema creation, migrations, inbox/consumer updates, batches, cleanup and completion use `begin_writer_txn`; RAII rollback applies on error. The empty-store bootstrap exception is available only to an exclusive transaction with no existing user tables. A minor-1 holder migrates under `migrate.lock` plus an exclusive transaction; minor-0 readers keep working and minor-0 writers step down. The private v2 compatibility backend retains the old engine and its original file format. It cannot open a shared store; its guarded transactions re-check v2 user_version instead of v3 metadata.
 
 Each scan registers `building` before crawling without holding a SQL transaction. Restart of an interrupted scan with unchanged consumer policy re-walks using the same generation and idempotent upserts; a changed policy starts a new generation. After the walk, every batch, every cleanup transaction and final completion checks the persisted generation and policy revision again. Removed/disabled consumers cannot be revived by an inbox payload. Entries, postings, progress and `meta.generation` commit together, so there is no crash interval between a batch commit and a separate generation bump. Ready is a checked final transaction after bounded stale cleanup. Readers hold no SQL transaction across calls; shared NAPI instances pool one locked reader and re-check reader floors after acquiring that lock. They use `data_version` to detect other connections' commits. Empty queries and misses on a building root report `Building`.
 
@@ -88,7 +88,7 @@ Import snapshots the source main file and sidecars through read-only opened dire
 
 M2.1–M2.10 each have a named regression (plus deterministic lock-creation and slow-delete boundary regressions) and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
 
-The final replay installs every complete file from the committed plan in task order, runs all ten tasks with thirteen RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
+The final replay installs every complete file from the committed plan in task order, runs all ten tasks with fourteen RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
 
 
 ## Task M2.1: descriptor-safe foundation and bootstrap
@@ -2909,9 +2909,17 @@ pub fn fault(point: &str) {
 }
 impl KuntuIndex {
   pub fn open_shared(home: Home, readonly: bool, consumer: &str) -> Result<Self> {
-    Self::open_shared_minor(home, readonly, consumer, 1)
+    Self::open_shared_minor(home, readonly, consumer, BUILD_MINOR)
   }
   pub fn open_shared_minor(home: Home, readonly: bool, consumer: &str, minor: i64) -> Result<Self> {
+    // Lowering the supported minor is conservative (and useful to probes).
+    // A caller cannot claim structures this compiled engine cannot maintain.
+    if !(0..=BUILD_MINOR).contains(&minor) {
+      return Err(IndexError::SchemaTooNew {
+        found: minor,
+        supported: BUILD_MINOR,
+      });
+    }
     let _local = kuntu_store::bootstrap_process_guard()?;
     let _boot = home
       .lock("bootstrap.lock", true)?
@@ -3796,6 +3804,8 @@ pub type Result<T> = std::result::Result<T, IndexError>;
 /// The candidate work bound for one search. A broad indexed prefix stops
 /// yielding candidates here and reports [`CandidateCoverage::Truncated`]
 /// instead of claiming complete coverage over an unbounded root.
+/// Highest schema minor this compiled engine can maintain.
+pub const BUILD_MINOR: i64 = 1;
 pub const MAX_KFS_CANDIDATE_ROWS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7472,6 +7482,31 @@ fn slow_delete_triggers_force_the_100_ms_cleanup_boundary() {
   i.complete_scan(id, gen).unwrap();
   assert_eq!(i.root_state_name(&c.roots[0].path).unwrap(), "ready");
 }
+
+#[test]
+fn caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor() {
+  let (h, _, i) = fixture();
+  let tx = i.conn.begin_writer_txn(false).unwrap();
+  tx.conn
+    .raw
+    .execute(
+      "UPDATE meta SET value=2 WHERE key IN ('schema_minor','min_writer_minor')",
+      [],
+    )
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  drop(i);
+  let ordinary = KuntuIndex::open_shared(h.clone(), false, "ordinary").unwrap();
+  assert_eq!(ordinary.access(), Access::ReadOnly);
+  drop(ordinary);
+  assert!(
+    matches!(
+      KuntuIndex::open_shared_minor(h, false, "claimed-future", 2),
+      Err(IndexError::SchemaTooNew { .. })
+    ),
+    "caller-supplied build version bypassed the compiled minor floor"
+  );
+}
 ````
 
 <!-- apply {"task": "M2.3", "file": "crates/kuntu-index/examples/m2_probe.rs", "mode": "file"} -->
@@ -7651,7 +7686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Task M2.4: access, atomic migrations and quarantine
 
-RED/GREEN: `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`. Also run `every_write_transaction_rechecks_minor_and_rolls_back`, `private_open_cannot_bypass_a_shared_store_lease`, and the process `migration_ddl` / `quarantine_renamed` fault cases. The engine file above contains the complete runner, compatibility path and marker recovery, not unused helpers.
+RED/GREEN: `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`. Also run `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `every_write_transaction_rechecks_minor_and_rolls_back`, `private_open_cannot_bypass_a_shared_store_lease`, and the process `migration_ddl` / `quarantine_renamed` fault cases. The engine file above contains the complete runner, compatibility path and marker recovery, not unused helpers.
 
 ## Task M2.5: guarded batches and reader notification
 
@@ -14233,6 +14268,7 @@ import {spawnSync} from 'node:child_process';
 import {strict as assert} from 'node:assert';
 type Case={task:string,file:string,old:string,bad:string,crate:string,test:string};
 const cases:Case[]=[
+ {task:'M2.4-client-version',file:'crates/kuntu-index/src/shared.rs',old:'if !(0..=BUILD_MINOR).contains(&minor) {',bad:'if minor < 0 {',crate:'kuntu-index',test:'m2_tests::caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor'},
  {"task": "M2.2-exec", "file": "crates/kuntu-store/src/lib.rs", "old": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "bad": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "crate": "kuntu-store", "test": "tests::executed_child_does_not_inherit_the_permanent_writer_lease"},
  {task:'M2.1-lock-create',file:'crates/kuntu-store/src/lib.rs',old:'attempts < 100',bad:'attempts < 0',crate:'kuntu-store',test:'tests::transient_lock_creation_retries_only_not_found_under_the_same_directory_fd'},
  {task:'M2.5-cleanup',file:'crates/kuntu-index/src/shared.rs',old:'rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100)',bad:'rows >= 5000',crate:'kuntu-index',test:'m2_tests::slow_delete_triggers_force_the_100_ms_cleanup_boundary'},
@@ -14342,7 +14378,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | Kill during migration | DDL and metadata roll back together; next holder reruns the additive step. `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`; process `migration`. |
 | Disable/remove consumer during scan | Policy revision invalidates the active generation; no stale completion. `consumer_removal_and_disable_invalidate_inflight_generation`. |
 | Restart recovery while a live holder exists | No recovery writes until lease acquisition. `restart_recovery_waits_for_live_holder_then_resumes_persisted_generation`. |
-| Is supplied state trusted as truth? | No. Membership, allowance, policy revision, minor floors and generation come from the opened store. `strict_consumer_never_inherits_union_or_client_flags`, Node strict-consumer test, daemon strict-admission test and `cli_scope`. |
+| Is supplied state trusted as truth? | No. Membership, allowance, policy revision, minor floors and generation come from the opened store. The supported build minor comes from compiled code; a caller cannot claim a future version. `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `strict_consumer_never_inherits_union_or_client_flags`, Node strict-consumer test, daemon strict-admission test and `cli_scope`. |
 | Re-check after blocking steps? | Minor after transaction lock; generation/revision after crawl and each transaction wait; metadata after migration lock; lifetime under epoch lock. `every_write_transaction_rechecks_minor_and_rolls_back`, consumer-in-flight test, restart-recovery test and process skew cases. |
 
 ## Finding closure map
@@ -14352,7 +14388,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 1 Mechanical compile | M2.1, M2.3, M2.8–10 | `plan_apply_write_set_matches_complete_payloads`, fmt/clippy/locked workspace build |
 | 2 Complete engine/fixture port | M2.3 | `realistic_fixture_latency_gate`, all preserved M1 recall/shape tests |
 | 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, `executed_child_does_not_inherit_the_permanent_writer_lease`, joined-service test, daemon queue test, exec/takeover process cases |
-| 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, minor skew controller and `previous_tag_epoch_isolation` (v0.4.1 archive) |
+| 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, minor skew controller and `previous_tag_epoch_isolation` (v0.4.1 archive) |
 | 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, `slow_delete_triggers_force_the_100_ms_cleanup_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
 | 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
 | 7 Consumer scope | M2.3, M2.8–9 | `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, Node/daemon strict tests, `cli_scope` |
@@ -14362,7 +14398,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 11 NAPI actual access/compat | M2.8 | Node read-only operation test, `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` |
 | 12 Import end to end | M2.9–10 | `store_import_parser_accepts_source_and_rejects_missing_source`, real-turso library import test, process `import` |
 | 13 Production SQL pins/binds | M2.3 | `production_builders_pin_both_postings_reverse_and_rowid`, preserved `entry_fetch_is_a_rowid_seek_not_an_index_scan` |
-| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs thirteen pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
+| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs fourteen pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
 | 15 Complete write set | M2.1–10 | `plan_apply_write_set_matches_complete_payloads`, protected-file checks |
 | 16 Patched WAL engine | M2.3 | `bundled_runtime_includes_wal_reset_fix`, stress and query gates |
 | 17 Honest complete evidence | M2.10 | Full foreground replay logs, crash/stress/skew artifacts and the measured table below |
@@ -14375,55 +14411,4 @@ Sensitivity tests use release optimization with LTO disabled and 16 codegen unit
 
 ## Replay results
 
-Measurement snapshot: **complete foreground replay 8**, committed source `49e1fc23f8b714bb97bbfb1cf2dd29097febc031`, 2026-10-13. The scratch worktree started at `e164d67`; the controller consumed `git show HEAD:docs/plans/M2-shared-store.md`, installed **34 complete files**, and finished every task and evidence command. Hardware: Apple M4 Pro, 48 GiB RAM, macOS 27.0.1, Rust 1.98.1; data/targets on the external APFS volume. These are measurements of this host and these probes, not installed-product or cross-platform acceptance.
-
-The final documentation-only commit adds this snapshot without altering an executable block. It is then replayed from its own committed blob using the same foreground invocation. Per-file SHA-256 records must remain identical to this snapshot. SHA-256 of the snapshot's `payload-sha256.json`: `99283950046907d3e5b5082bf7658cd3800a4450f4cf6a66e87dc39e89a2032d`. Logs and artifacts are retained in `/Volumes/Portable2TB/tmp/kuntu-m2/accepted-replay-8/`; the final verification log is `/Volumes/Portable2TB/tmp/kuntu-m2/replay-9.log`. The detached scratch worktree is deleted after that verification.
-
-| Check | Measured outcome |
-|---|---|
-| Mechanical application | 34 declared files matched 34 complete payloads; every installed file retained its payload hash |
-| fmt / clippy | Both passed; clippy used workspace/all-targets/locked and `-D warnings` |
-| Task sensitivity | **13 RED named assertion failures and 13 GREEN passes**, covering all ten tasks; no compile-error or zero-test RED counted |
-| Locked workspace suite | **163 passed**, 6 ignored benchmark tests; the required gate/recall/budget/storage benchmarks ran separately |
-| NAPI | Generated JS/d.ts byte-equal; **5 Node tests passed**; TypeScript passed; exact v2 path/unrelated-DB Rust fixtures passed |
-| Bundled runtime | **SQLite 3.53.2**; the ≥3.51.3 assertion and rejected-3.51.2 sensitivity test passed |
-| 1M storage | **549,076,992 bytes** (549.077 decimal MB), below 550,000,000; only 923,008 bytes headroom |
-| Reverse/stale delete | **5000 entries**, **16.879 s total**, **6 write batches**; slow-trigger timer regression passed |
-| Stress | Two writer processes and eight readers; readers each ran 60 s during a physical **1,000,001-entry** rebuild; **740,100 probes**, **0 reader errors**, highest per-reader p99 **78 µs**, highest observed query **87.120 ms**; `integrity_check=ok` |
-| Stress writer roles | Lease holder completed one scan; non-holder committed **1,781 inbox writes**. Whole run **168.102 s**, including completion after the readers' 60 s windows |
-| 30% / 70% kills | Killed just after batch commits at **62,435 / 140,593** entries (each <5,000 past its threshold); both resumed to **200,001**, no stale generation rows, equal to a fresh crawl, `quick_check=ok` |
-| State / migration / quarantine kills | `building_committed`, `before_ready`, `ready_committed`, `migration_ddl`, `quarantine_renamed`, and `identity_synced` all recovered; migration kill left minor 0 and reran atomically; quarantine recovery produced an empty reusable v3 file |
-| Concurrent first opens | **100 separate-process pairs**, both opening fresh SQLite stores; same 128-bit identity within every pair |
-| Takeover / exec | **5,172 ms** after holder kill; a second process reacquired the writer lease while the executed child was still alive; FD_CLOEXEC sensitivity passed |
-| CLI import | Actual `kfs store import`: **1 root, 200,001 entries, 0 errors**; full turso v2 source main/WAL/SHM hashes unchanged |
-| Scope | Rust, Node, daemon and actual CLI strict/empty/foreign-scope regressions passed; client flags did not grant union-only rows |
-| Minor skew | **11 cells**: actual opens/writers for minors 0/1, current-reader/current-writer after migration, old-reader success, old-writer step-down, both newer-reader-floor refusals with unchanged main bytes, future epoch sentinel preserved |
-| Previous tag | Actual `v0.4.1` / `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` built from `git archive`; v2 old/new private reads preserved source bytes; old binary refused v3 without changing main bytes; GC preserved unregistered v2 |
-| Protected files | No tracked or untracked changes in `kuntu-crawler`, `kuntu-watcher`, `kuntu-scan`, or `.github` |
-
-The 1M gate uses one untimed warm-up followed by three measured runs, judged by the best. Times are printed to 0.1 ms; `0.0` is rounded, not a zero-duration claim. The fixture generator retains the realistic Zipf/directory/extension distribution and uses the logical root `/Users/kuntu/fixture`; fixture bytes and logs live under the allowed scratch directory. Its v3 cache is separate from M1/v2 caches. The 50,000-row option is covered by budget/recall tests; the table below times the default budget.
-
-| Class | Best measured warm ms | Candidates | M1 ceiling ms |
-|---|---:|---:|---:|
-| miss | 0.0 | 0 | 25 |
-| miss_non_ascii | 0.0 | 0 | 25 |
-| rare | 0.1 | 9 | 50 |
-| mid | 5.3 | 1477 | 100 |
-| broad | 23.7 | 5000 | 400 |
-| prefix3 | 23.1 | 5000 | 400 |
-| mixed | 5.4 | 271 | 300 |
-| all_rows | 16.6 | 5000 | 600 |
-| prefix1 | 21.1 | 5000 | 800 |
-
-
-All nine M1 ceilings passed. In this snapshot the measured miss, rare/mid, 5k broad and one-character prefix classes also met their tighter M2 ceilings. This is not a claim that every run did: the initial cold-fixture replay measured mid **10.2 ms**, broad **37.8 ms** and one-character prefix **43.8 ms**, missing those M2 ceilings while passing M1. Its fixture build took **289.405 s**; later complete replays reused that cache. The cold log remains `/Volumes/Portable2TB/tmp/kuntu-m2/m1-cold-replay-4.log`.
-
-### Deviations and evidence limits
-
-- Stale-ID selection remains a large-root index scan outside the write transaction. The delete measurement's longest complete helper call was **8.603 s**, including selection. The write loop checks the 100 ms deadline between individual deletes; one SQL statement, commit, busy wait or scheduler pause can exceed that deadline. Neither the total cleanup call nor all future reader latencies have a hard 100 ms bound. The measured stress maximum above is the observed bound on this run.
-- The ≤120 s **internal-SSD** rebuild target was not tested. The physical external-volume stress scan completed after **168.102 s** wall time for the whole controller run. Cold fixture generation is a different operation and is reported separately.
-- There is no released v3 minor-0 binary or v0.5.0 tag in this repository. Same-epoch minor skew uses two actual process roles with parameterized build minors; it is not evidence from a separately released N−1 v3 binary. The actual previous release, v0.4.1, is epoch 2 and has its own real-binary isolation test. A future release CI matrix must build its preceding v3 tag.
-- Linux policy is implemented but untested here. Windows shared-store support is not implemented by the Unix fd VFS; Windows, Android/NDK and installed Xross/Kunkun/helper-signing/TCC acceptance are not run. D12 remains macOS first; no consumer pin or release action was performed.
-- Import requires an **absolute, quiescent v2 source**. Copying a changing live v2 writer is not an atomic backup. Private import snapshots are retained in the destination; automatic snapshot cleanup is not implemented. Unregistered old epochs are preserved fail-closed until their binaries participate in lifetime coordination.
-
-Failed/interrupted attempts are not counted as acceptance: the early reverse-index/fixture pilot was interrupted; replay 1 exposed the reused generation/point probe, replay 2 a missing test import, replay 3 the Unix open ABI/mode bug, replay 4 the separate-process lock-create race, replay 6 an insensitive exec RED, and replay 7 its missing assertion. Each was corrected in the document and recommitted before the next clean replay. Replay 5 completed the earlier payload; replay 8 is the complete strengthened snapshot above. Raw top-level logs `replay-1.log` through `replay-8.log` are retained, including failures. No independent round-2 review was performed by this plan writer.
+Pending the committed-blob replay. Pilot compilation/tests are not acceptance evidence. The final revision must replace this paragraph with measured results and retain all failed or not-run targets as explicit deviations.
