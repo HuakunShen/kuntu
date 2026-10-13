@@ -1,18 +1,20 @@
 //! Foundation regression tests, executable before the index port.
 use super::*;
 fn home() -> Home {
+  home_at(
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_nanos(),
+  )
+}
+fn home_at(nonce: u128) -> Home {
+  static NEXT_HOME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let sequence = NEXT_HOME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
   let base =
     PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").expect("scratch KUNTU_TEST_DIR required"));
   std::fs::create_dir_all(&base).unwrap();
-  Home::open(&base.join(format!(
-      "store-{}-{}",
-      std::process::id(),
-      std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-    )))
-  .unwrap()
+  Home::open(&base.join(format!("store-{}-{}-{sequence}", std::process::id(), nonce))).unwrap()
 }
 #[test]
 fn descriptor_open_rejects_symlink_and_private_modes_are_exact() {
@@ -193,4 +195,14 @@ fn pending_gc_is_completed_before_an_old_epoch_can_be_reused() {
   assert!(!h.exists("gc-2.json").unwrap());
   assert!(!h.gc_epoch(3, u64::MAX).unwrap());
   assert!(!h.gc_epoch(4, u64::MAX).unwrap());
+}
+
+#[test]
+fn equal_resolution_timestamps_do_not_share_store_fixtures() {
+  let first = home_at(0);
+  let second = home_at(0);
+  assert_ne!(
+    first.path, second.path,
+    "parallel timestamp collision shared a store and its locks"
+  );
 }
