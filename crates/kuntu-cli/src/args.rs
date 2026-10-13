@@ -7,11 +7,13 @@
 use std::path::PathBuf;
 
 use kuntu_core::{SearchQuery, SearchRoot};
+use kuntu_store::StoreMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedArgs {
   pub roots: Vec<SearchRoot>,
   pub db_path: Option<PathBuf>,
+  pub store_mode: StoreMode,
   pub provider: SearchProvider,
   pub command: CommandSpec,
 }
@@ -81,6 +83,7 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
       Ok(ParsedArgs {
         roots: Vec::new(),
         db_path: None,
+        store_mode: StoreMode::Shared,
         provider: SearchProvider::Sqlite,
         command: CommandSpec::Store { operation, source },
       })
@@ -102,6 +105,7 @@ fn parse_search(args: &[String]) -> Result<ParsedArgs, String> {
   let json = parsed.json;
   Ok(ParsedArgs {
     roots: parsed.take_roots()?,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Search { query, json },
@@ -114,6 +118,7 @@ fn parse_explain(args: &[String]) -> Result<ParsedArgs, String> {
   let query = parsed.query_text.take().map(SearchQuery::new);
   Ok(ParsedArgs {
     roots: parsed.take_roots()?,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Explain {
@@ -129,6 +134,7 @@ fn parse_bench(args: &[String]) -> Result<ParsedArgs, String> {
   let query = parsed.query(query_text);
   Ok(ParsedArgs {
     roots: parsed.take_roots()?,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Bench { query },
@@ -161,6 +167,7 @@ fn parse_index(args: &[String]) -> Result<ParsedArgs, String> {
   };
   Ok(ParsedArgs {
     roots,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Index(command),
@@ -173,6 +180,7 @@ fn parse_watch(args: &[String]) -> Result<ParsedArgs, String> {
   let duration_ms = parsed.require_duration_ms()?;
   Ok(ParsedArgs {
     roots: parsed.take_roots()?,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Watch { duration_ms },
@@ -188,6 +196,7 @@ fn parse_daemon(args: &[String]) -> Result<ParsedArgs, String> {
     .ok_or_else(|| "--addr is required for daemon".to_string())?;
   Ok(ParsedArgs {
     roots: parsed.take_roots()?,
+    store_mode: parsed.store_mode(),
     db_path: parsed.db_path,
     provider: parsed.provider,
     command: CommandSpec::Daemon {
@@ -247,6 +256,13 @@ impl Default for CommonArgs {
 }
 
 impl CommonArgs {
+  fn store_mode(&self) -> StoreMode {
+    if self.db_path.is_some() {
+      StoreMode::Private
+    } else {
+      StoreMode::Shared
+    }
+  }
   fn take_roots(&mut self) -> Result<Vec<SearchRoot>, String> {
     if self.roots.is_empty() {
       return Err("at least one --root is required".to_string());
@@ -628,5 +644,23 @@ mod tests {
       }
     ));
     assert!(parse_args(&["store".into(), "import".into()]).is_err());
+  }
+}
+
+#[cfg(test)]
+mod mode_tests {
+  use super::*;
+  #[test]
+  fn explicit_db_selects_private_and_default_selects_shared() {
+    let shared = parse_args(&["index".into(), "status".into()]).unwrap();
+    assert_eq!(shared.store_mode, StoreMode::Shared);
+    let private = parse_args(&[
+      "index".into(),
+      "status".into(),
+      "--db".into(),
+      "/Users/owner/index.v3.db".into(),
+    ])
+    .unwrap();
+    assert_eq!(private.store_mode, StoreMode::Private);
   }
 }

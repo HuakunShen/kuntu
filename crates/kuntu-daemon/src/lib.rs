@@ -13,13 +13,14 @@ use std::time::{Duration, Instant};
 
 use kuntu_core::{BackendError, MetadataIndex, SearchConfig, SearchQuery, SearchRoot};
 use kuntu_index::{match_names, KuntuIndex, WriterService};
-use kuntu_store::Home;
+use kuntu_store::{Home, StoreMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
   pub db_path: PathBuf,
+  pub store_mode: StoreMode,
   pub addr: String,
   pub duration: Option<Duration>,
   pub max_requests: Option<usize>,
@@ -100,10 +101,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
   let started = Instant::now();
   let server_deadline = config.duration.map(|d| started + d);
   let cancelled = std::sync::atomic::AtomicBool::new(false);
-  let shared = config
-    .db_path
-    .file_name()
-    .is_some_and(|n| n == "index.v3.db");
+  let shared = config.store_mode == StoreMode::Shared;
   let home = if shared {
     Some(
       Home::open(
@@ -706,6 +704,7 @@ mod tests {
   #[test]
   fn daemon_rejects_non_loopback_bind_without_opt_in() {
     let config = DaemonConfig {
+      store_mode: StoreMode::Private,
       db_path: PathBuf::from("/tmp/kfs-review-daemon.sqlite"),
       addr: "0.0.0.0:0".to_string(),
       duration: Some(Duration::from_millis(1)),
@@ -799,13 +798,14 @@ mod tests {
 #[cfg(test)]
 mod connection_tests {
   use super::*;
-  fn health_run(db_path: PathBuf, requests: usize) -> (DaemonRunStats, Vec<f64>) {
+  fn health_run(db_path: PathBuf, requests: usize, mode: StoreMode) -> (DaemonRunStats, Vec<f64>) {
     let addr = TcpListener::bind("127.0.0.1:0")
       .unwrap()
       .local_addr()
       .unwrap()
       .to_string();
     let config = DaemonConfig {
+      store_mode: mode,
       db_path,
       addr: addr.clone(),
       duration: None,
@@ -839,7 +839,7 @@ mod connection_tests {
   #[test]
   fn health_requests_reuse_worker_reader_connections() {
     let path = std::env::temp_dir().join(format!("daemon-pool-{}.sqlite", std::process::id()));
-    let (stats, _) = health_run(path, 16);
+    let (stats, _) = health_run(path, 16, StoreMode::Private);
     assert!(
       stats.reader_connections <= 4,
       "opened {} readers for 16 requests",
@@ -850,7 +850,7 @@ mod connection_tests {
   #[ignore = "owner-supplied 1M shared-store copy; release latency evidence"]
   fn million_store_daemon_health_latency() {
     let path = PathBuf::from(std::env::var_os("KUNTU_HEALTH_DB").unwrap());
-    let (stats, samples) = health_run(path, 20);
+    let (stats, samples) = health_run(path, 20, StoreMode::Shared);
     eprintln!(
       "M2_HEALTH reader_connections={} first_ms={:.3} warm_ms={:?}",
       stats.reader_connections,
@@ -923,6 +923,7 @@ mod deadline_tests {
       .unwrap()
       .to_string();
     let config = DaemonConfig {
+      store_mode: StoreMode::Private,
       db_path: std::env::temp_dir().join(format!("daemon-shutdown-{}.sqlite", std::process::id())),
       addr: addr.clone(),
       duration: Some(Duration::from_millis(250)),

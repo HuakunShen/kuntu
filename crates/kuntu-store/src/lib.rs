@@ -10,6 +10,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 type DirectoryRegistry =
   std::sync::Mutex<std::collections::HashMap<(u64, u64), std::sync::Weak<File>>>;
+/// Selected by the host, independently of the database filename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreMode {
+  Private,
+  Shared,
+}
 pub const EPOCH: u32 = 3;
 pub type Result<T> = std::io::Result<T>;
 fn err(s: impl std::fmt::Display) -> std::io::Error {

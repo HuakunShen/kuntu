@@ -17,7 +17,7 @@ use kuntu_core::{
 use kuntu_daemon::{serve, DaemonConfig};
 use kuntu_index::KuntuIndex;
 use kuntu_provider_spotlight::SpotlightProvider;
-use kuntu_store::Home;
+use kuntu_store::{Home, StoreMode};
 use kuntu_watcher::{run_polling_watch, WatchOptions};
 use output::{
   format_bench_stats, format_daemon_stats, format_explain_text, format_rebuild_stats,
@@ -46,6 +46,7 @@ fn main() -> ExitCode {
 
 fn run(raw_args: Vec<String>) -> Result<String, String> {
   let spec = parse_args(&raw_args)?;
+  let store_mode = spec.store_mode;
   let default_db = if spec.db_path.is_none() {
     Some(
       kuntu_store::resolve()
@@ -103,7 +104,8 @@ fn run(raw_args: Vec<String>) -> Result<String, String> {
       }
     }
     CommandSpec::Search { query, json } => {
-      let search = search_with_provider(&config, &core, &query, spec.provider, db_path)?;
+      let search =
+        search_with_provider(&config, &core, &query, spec.provider, db_path, store_mode)?;
       if json {
         Ok(format_results_json(&search.results))
       } else {
@@ -116,20 +118,30 @@ fn run(raw_args: Vec<String>) -> Result<String, String> {
     }
     CommandSpec::Bench { query } => {
       let started = Instant::now();
-      let search = search_with_provider(&config, &core, &query, spec.provider, db_path)?;
+      let search =
+        search_with_provider(&config, &core, &query, spec.provider, db_path, store_mode)?;
       Ok(format_bench_stats(
         search.candidate_count,
         search.results.len(),
         started.elapsed().as_millis(),
       ))
     }
-    CommandSpec::Index(command) => run_index_command(&config, db_path, command),
-    CommandSpec::Watch { duration_ms } => run_watch_command(&config, db_path, duration_ms),
+    CommandSpec::Index(command) => run_index_command(&config, db_path, command, store_mode),
+    CommandSpec::Watch { duration_ms } => {
+      run_watch_command(&config, db_path, duration_ms, store_mode)
+    }
     CommandSpec::Daemon {
       addr,
       duration_ms,
       allow_non_loopback,
-    } => run_daemon_command(&config, db_path, addr, duration_ms, allow_non_loopback),
+    } => run_daemon_command(
+      &config,
+      db_path,
+      addr,
+      duration_ms,
+      allow_non_loopback,
+      store_mode,
+    ),
   }
 }
 
@@ -139,16 +151,17 @@ fn search_with_provider(
   query: &SearchQuery,
   provider: SearchProvider,
   db_path: Option<&Path>,
+  store_mode: StoreMode,
 ) -> Result<SearchRun, String> {
   match provider {
     SearchProvider::Spotlight => search_spotlight(config, core, query),
     SearchProvider::Sqlite => {
       let path = db_path.ok_or_else(|| "--db is required for sqlite provider".to_string())?;
-      search_sqlite(config, query, path)
+      search_sqlite(config, query, path, store_mode)
     }
     SearchProvider::Auto => {
       if let Some(path) = db_path {
-        let search = search_sqlite(config, query, path)?;
+        let search = search_sqlite(config, query, path, store_mode)?;
         if !search.results.is_empty() {
           return Ok(search);
         }
@@ -174,8 +187,12 @@ fn search_spotlight(
   })
 }
 
-fn open_cli_index(path: &Path, read_only: bool) -> kuntu_index::Result<KuntuIndex> {
-  if path.file_name().is_some_and(|n| n == "index.v3.db") {
+fn open_cli_index(
+  path: &Path,
+  read_only: bool,
+  mode: StoreMode,
+) -> kuntu_index::Result<KuntuIndex> {
+  if mode == StoreMode::Shared {
     KuntuIndex::open_shared(
       Home::open(
         path
@@ -195,8 +212,9 @@ fn search_sqlite(
   config: &SearchConfig,
   query: &SearchQuery,
   db_path: &Path,
+  store_mode: StoreMode,
 ) -> Result<SearchRun, String> {
-  let index = open_cli_index(db_path, true).map_err(|err| err.to_string())?;
+  let index = open_cli_index(db_path, true, store_mode).map_err(|err| err.to_string())?;
   let outcome = index
     .search_with_metrics(config, query)
     .map_err(|err| err.to_string())?;
@@ -210,9 +228,10 @@ fn run_index_command(
   config: &SearchConfig,
   db_path: Option<&Path>,
   command: IndexCommand,
+  store_mode: StoreMode,
 ) -> Result<String, String> {
   let path = db_path.ok_or_else(|| "--db is required for index commands".to_string())?;
-  let mut index = open_cli_index(path, false).map_err(|err| err.to_string())?;
+  let mut index = open_cli_index(path, false, store_mode).map_err(|err| err.to_string())?;
   if index.is_shared() {
     for root in &config.roots {
       index.register_root(root).map_err(|e| e.to_string())?;
@@ -263,9 +282,10 @@ fn run_watch_command(
   config: &SearchConfig,
   db_path: Option<&Path>,
   duration_ms: u64,
+  store_mode: StoreMode,
 ) -> Result<String, String> {
   let path = db_path.ok_or_else(|| "--db is required for watch".to_string())?;
-  let mut index = open_cli_index(path, false).map_err(|err| err.to_string())?;
+  let mut index = open_cli_index(path, false, store_mode).map_err(|err| err.to_string())?;
   if index.is_shared() {
     for root in &config.roots {
       index.register_root(root).map_err(|e| e.to_string())?;
@@ -293,10 +313,12 @@ fn run_daemon_command(
   addr: String,
   duration_ms: Option<u64>,
   allow_non_loopback: bool,
+  store_mode: StoreMode,
 ) -> Result<String, String> {
   let path = db_path.ok_or_else(|| "--db is required for daemon".to_string())?;
   let stats = serve(DaemonConfig {
     db_path: path.to_path_buf(),
+    store_mode,
     addr,
     duration: duration_ms.map(Duration::from_millis),
     max_requests: None,
@@ -314,6 +336,57 @@ mod tests {
   use std::time::{SystemTime, UNIX_EPOCH};
 
   use super::*;
+
+  fn explicit_private_fixture(label: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = temp_dir(label);
+    fs::create_dir_all(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.join("files");
+    fs::create_dir(&root).unwrap();
+    let path = parent.join("index.v3.db");
+    let index = KuntuIndex::open(&path).unwrap();
+    index
+      .register_root(&kuntu_core::SearchRoot::new(&root))
+      .unwrap();
+    drop(index);
+    (path, root)
+  }
+  #[test]
+  fn explicit_index_v3_basename_stays_private_in_cli() {
+    let (path, _) = explicit_private_fixture("explicit-private-cli");
+    let result = run(vec![
+      "index".into(),
+      "status".into(),
+      "--db".into(),
+      path.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+      result.is_ok(),
+      "explicit private path was treated as shared: {result:?}"
+    );
+    assert!(!path.parent().unwrap().join("store.json").exists());
+  }
+  #[test]
+  fn explicit_index_v3_basename_stays_private_in_daemon() {
+    let (path, root) = explicit_private_fixture("explicit-private-daemon");
+    let result = run(vec![
+      "daemon".into(),
+      "--db".into(),
+      path.to_string_lossy().into_owned(),
+      "--root".into(),
+      root.to_string_lossy().into_owned(),
+      "--addr".into(),
+      "127.0.0.1:0".into(),
+      "--duration-ms".into(),
+      "1".into(),
+    ]);
+    assert!(
+      result.is_ok(),
+      "daemon inferred shared mode from basename: {result:?}"
+    );
+    assert!(!path.parent().unwrap().join("store.json").exists());
+  }
 
   #[test]
   fn bench_reports_candidate_and_result_counts_for_sqlite() {
