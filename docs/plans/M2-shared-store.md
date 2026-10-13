@@ -332,7 +332,14 @@ fn ensure_store_json(home: &Path) -> Result<(), StoreError> {
 mod tests {
   use super::*;
 
+  // Process-global env is shared by parallel test threads: every test
+  // that mutates KUNTU_HOME/HOME holds this lock, otherwise tests clobber
+  // each other (replay proved `ensure_refuses_symlinked_home` fails
+  // intermittently without it).
+  static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
   fn with_env_home(home: &Path, f: impl FnOnce()) {
+    let _guard = ENV_LOCK.lock().unwrap();
     let prev_kuntu = std::env::var_os("KUNTU_HOME");
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("KUNTU_HOME", home);
@@ -369,6 +376,7 @@ mod tests {
 
   #[test]
   fn store_home_defaults_to_home_dot_kuntu() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let prev = std::env::var_os("KUNTU_HOME");
     std::env::remove_var("KUNTU_HOME");
     let home = std::env::var_os("HOME").unwrap();
@@ -586,7 +594,17 @@ mod tests {
       let held = try_acquire(&home, 0).unwrap();
       assert!(held.is_some());
     }
-    let again = try_acquire(&home, 0).unwrap();
+    // Bounded retry: a forked-but-not-yet-exec'd child (e.g. another test
+    // spawning a subprocess) transiently shares our flock references, so an
+    // immediate reacquire can observe a stale lock under parallel load.
+    // The OS guarantee under test is release-on-close; a persistent holder
+    // still fails this test after the deadline.
+    let mut again = try_acquire(&home, 0).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while again.is_none() && std::time::Instant::now() < deadline {
+      std::thread::sleep(std::time::Duration::from_millis(10));
+      again = try_acquire(&home, 0).unwrap();
+    }
     assert!(again.is_some(), "lease must be reacquirable after drop");
     let _ = std::fs::remove_dir_all(&home);
   }
