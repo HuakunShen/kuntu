@@ -105,7 +105,7 @@ Import opens all source members first, creates a unique private snapshot with ex
 
 M2.1–M2.10 each have a named regression (plus deterministic lock-creation and slow-delete boundary regressions) and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
 
-The final replay installs every complete file from the committed plan in task order, runs all ten tasks with twenty-eight RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests with filesystem mutation, member-by-member quarantine/GC interruption, 60 s stress, the skew matrix and the four-host macOS consumer smoke. A separate M2 latency gate records assertion failures as OPEN RED; internal-SSD acceptance is explicitly pending without an authorized internal-volume fixture. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
+The final replay installs every complete file from the committed plan in task order, runs all ten tasks with twenty-nine RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests with filesystem mutation, member-by-member quarantine/GC interruption, 60 s stress, the skew matrix and the four-host macOS consumer smoke. Separate M2 search and stress-latency gates retain strict assertions and record recognized performance failures as OPEN RED; internal-SSD acceptance is explicitly pending without an authorized internal-volume fixture. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
 
 
 ## Task M2.1: descriptor-safe foundation and bootstrap
@@ -15584,9 +15584,26 @@ async function killed(op:string,home:string,point:string,rows?:number) {
  await marker(m,p);p.child.kill('SIGKILL');const r=await p.done;assert.equal(r.code,null);return readFileSync(m,'utf8');
 }
 function db(home:string,sql:string){const r=spawnSync('python3',['-c','import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(sys.argv[2]).fetchall()); c.commit()',join(home,'index.v3.db'),sql],{encoding:'utf8',maxBuffer:256*1024*1024});assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
+type ReaderMetric={queries:number,errors:number,p99_us:number,max_us:number};
+function readerAcceptanceMisses(metrics:ReaderMetric[]):string[] {
+ const misses:string[]=[];
+ for(const m of metrics){
+  assert.equal(m.errors,0,'reader errors are a correctness failure');
+  if(m.p99_us>5000)misses.push(`p99 ${m.p99_us}>5000 us`);
+  if(m.max_us>100000)misses.push(`maximum ${m.max_us}>100000 us`);
+ }
+ return misses;
+}
 const mode=process.argv[2]??'crash';
 try {
- if(mode==='crash') {
+ if(mode==='ceilings') {
+  const name='m2_reader_ceilings_reject_a_100ms_overrun';console.log(`RUN ${name}`);
+  assert.equal(readerAcceptanceMisses([{queries:1,errors:0,p99_us:5000,max_us:100000}]).length,0);
+  assert.equal(readerAcceptanceMisses([{queries:1,errors:0,p99_us:100,max_us:100001}]).length,1,'100 ms ceiling was loosened');
+  assert.equal(readerAcceptanceMisses([{queries:1,errors:0,p99_us:5001,max_us:100}]).length,1);
+  assert.throws(()=>readerAcceptanceMisses([{queries:1,errors:1,p99_us:1,max_us:1}]),/correctness/);
+  console.log(`PASS ${name}`);
+ } else if(mode==='crash') {
   for(let n=0;n<200_000;n++){const p=join(root,`file-${String(n).padStart(6,'0')}.md`);if(!existsSync(p))writeFileSync(p,'x');}
   const home=join(base,'crash-home');rmSync(home,{recursive:true,force:true});
   await ok('init',home);const outcomes:Record<string,string>={};
@@ -15636,10 +15653,10 @@ try {
   const home=join(base,'stress-home');rmSync(home,{recursive:true,force:true});await ok('init',home,extra);
   const started=Date.now();const writers=[start('writer',home,extra),start('writer',home,extra)];const readers=Array.from({length:8},()=>start('reader',home,extra));
   const results=await Promise.all([...writers,...readers].map(p=>p.done));for(const r of results)assert.equal(r.code,0,r.text);
-  const metrics=results.slice(2).map(r=>JSON.parse(r.text) as {queries:number,errors:number,p99_us:number,max_us:number});
+  const metrics=results.slice(2).map(r=>JSON.parse(r.text) as ReaderMetric);
   const report={root_entries:1_000_001,probe:'alternating entry-rowid point and 100-row id range',seconds:(Date.now()-started)/1000,writers:results.slice(0,2).map(r=>r.text.trim()),readers:metrics,integrity:db(home,'PRAGMA integrity_check')};assert.equal(report.integrity,"[('ok',)]");writeFileSync(join(base,'stress.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
   assert.equal(db(home,'SELECT count(*) FROM entries'),'[(1000001,)]');
-  for(const m of metrics){assert.equal(m.errors,0);assert.ok(m.p99_us<=5000,JSON.stringify(m));assert.ok(m.max_us<=100000,JSON.stringify(m));}
+  const misses=readerAcceptanceMisses(metrics);assert.equal(misses.length,0,`M2_STRESS_ACCEPTANCE_MISS: ${misses.join('; ')}`);
  } else if(mode==='skew') {
   const cells:Record<string,string>={};
   const h=join(base,'skew');rmSync(h,{recursive:true,force:true});await ok('init',h,{},'0');
@@ -15665,6 +15682,7 @@ import {spawnSync} from 'node:child_process';
 import {strict as assert} from 'node:assert';
 type Case={task:string,file:string,old:string,bad:string,crate:string,test:string};
 const cases:Case[]=[
+ {"task": "M2.10-reader-ceilings", "file": "scripts/m2-evidence.ts", "old": "if(m.max_us>100000)", "bad": "if(m.max_us>200000)", "crate": "reader-ceilings", "test": "m2_reader_ceilings_reject_a_100ms_overrun"},
  {"task": "M2.6-restart", "file": "crates/kuntu-index/src/shared.rs", "old": "active_scan_gen=active_scan_gen+1", "bad": "active_scan_gen=CASE WHEN status='building' AND scan_policy_revision=policy_revision THEN active_scan_gen ELSE active_scan_gen+1 END", "crate": "kuntu-index", "test": "m2_tests::restarted_walk_removes_deleted_and_renamed_committed_files"},
  {"task": "M2.4-preopened", "file": "crates/kuntu-index/src/shared.rs", "old": "      if floor > self.conn.minor {\n        self.conn.readonly.set(true);\n        return Err(IndexError::ReadOnly);\n      }\n", "bad": "      if false && floor > self.conn.minor {\n        self.conn.readonly.set(true);\n        return Err(IndexError::ReadOnly);\n      }\n", "crate": "kuntu-index", "test": "m2_tests::preopened_old_writer_rechecks_after_migration_and_releases_capability"},
  {"task": "M2.7-downgrade", "file": "crates/kuntu-index/src/shared.rs", "old": "    if self.legacy.is_none() {\n      let floor:", "bad": "    if false && self.legacy.is_none() {\n      let floor:", "crate": "kuntu-index", "test": "m2_tests::holder_service_drops_unusable_capability_after_writer_floor_changes"},
@@ -15698,6 +15716,7 @@ const cases:Case[]=[
 const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/replay';mkdirSync(base,{recursive:true});
 function command(args:string[],cwd?:string){const r=spawnSync(args[0]!,args.slice(1),{cwd,env:process.env,encoding:'utf8',maxBuffer:16*1024*1024});return {status:r.status,text:r.stdout+r.stderr};}
 function test(c:Case){
+ if(c.crate==='reader-ceilings')return command(['bun','scripts/m2-evidence.ts','ceilings']);
  if(c.crate==='internal')return command(['bun','scripts/m2-internal-rebuild.ts','--contracts']);
  if(c.crate==='smoke'){const b=command(['pnpm','run','build:debug'],'crates/kuntu-napi');assert.equal(b.status,0,b.text);return command(['bun','scripts/m2-consumer-smoke.ts']);}
  if(c.crate==='node'){
@@ -15715,7 +15734,7 @@ for(const c of cases.filter(c=>!chosen||c.task===chosen)){
   assert.notEqual(red.status,0,`${c.task} RED unexpectedly passed`);assert.ok(red.text.includes(c.test),red.text);assert.match(red.text,/FAILED|not ok|✖|AssertionError/);assert.doesNotMatch(red.text,/could not compile|error\[E\d+\]/);
  } finally {writeFileSync(c.file,original);}
  const green=test(c);writeFileSync(`${base}/${c.task}-GREEN.log`,green.text);assert.equal(green.status,0,green.text);
- if(!['node','smoke','internal'].includes(c.crate))assert.match(green.text,/1 passed; 0 failed/);
+ if(!['node','smoke','internal','reader-ceilings'].includes(c.crate))assert.match(green.text,/1 passed; 0 failed/);
  else if(c.crate!=='node')assert.ok(green.text.includes('PASS '+c.test),green.text);
  console.log(`${c.task}: RED named failure, GREEN passed (${c.test})`);
 }
@@ -15777,7 +15796,11 @@ run('m1-recall' ,['cargo','test','--release','-p','kuntu-index','rarest_token_dr
 run('m1-budget',['cargo','test','--release','-p','kuntu-index','default_budget_bounds_a_broad_single_token','--','--ignored','--nocapture']);
 run('sqlite-version',['cargo','test','--release','-p','kuntu-index','bundled_runtime_includes_wal_reset_fix','--','--nocapture']);
 run('size-delete',['cargo','test','--release','-p','kuntu-index','realistic_fixture_reverse_delete_cost_and_size_gate','--','--ignored','--nocapture']);
-run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
+run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('crash',['bun','scripts/m2-evidence.ts','crash']);
+const stress=spawnSync('bun',['scripts/m2-evidence.ts','stress'],{env:process.env,encoding:'utf8',maxBuffer:64*1024*1024});writeFileSync(`${base}/stress.log`,stress.stdout+stress.stderr);
+if(stress.status!==0){assert.match(stress.stdout+stress.stderr,/M2_STRESS_ACCEPTANCE_MISS/);console.log('OPEN RED: M2 stress reader latency; unchanged 5 ms p99 / 100 ms maximum ceilings');}
+writeFileSync(`${base}/acceptance-status.json`,JSON.stringify({m2_latency:m2.status===0?'PASS':'OPEN RED',internal_ssd:internal.status===2?'NOT RUN':'PASS',stress_reader_latency:stress.status===0?'PASS':'OPEN RED'},null,2));
+run('skew',['bun','scripts/m2-evidence.ts','skew']);
 run('consumer-smoke',['bun','scripts/m2-consumer-smoke.ts']);
 run('previous-tag',['bun','scripts/m2-previous-tag.ts']);
 run('fmt-final',['cargo','fmt','--all','--','--check']);
@@ -15978,7 +16001,7 @@ Product lanes must reproduce these boundary conditions through their own hosts. 
 | 6 P1 Consumer scope | M2.8–10, D16 | `macos_four_host_shared_store_consumer_contract`; complete consumer contract and independent NAPI host payloads; M2-X/M2-K follow-ups explicitly outside this repo |
 | 7 P2 Long-lived Rust reader | M2.4 | `long_lived_rust_readers_recheck_floor_for_search_status_and_probes` |
 | 8 P2 Cleanup hand-off | M2.5–7 | `cleanup_seek_limits_inspection_even_across_large_current_generation_gaps`; `shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover`; `slow_delete_triggers_force_the_100_ms_cleanup_boundary`; 1M reverse-delete measurement |
-| 9 P2 M2 ceilings | M2.10 | `m2_ceilings_reject_the_m1_only_latency_range`; `realistic_fixture_m2_latency_acceptance`; `internal_ssd_one_million_rebuild_within_120_seconds_ceiling_contract` and real internal-volume runner. Any measured miss remains OPEN RED; an unrun hardware check remains NOT RUN. |
+| 9 P2 M2 ceilings | M2.10 | `m2_ceilings_reject_the_m1_only_latency_range`; `m2_reader_ceilings_reject_a_100ms_overrun`; `realistic_fixture_m2_latency_acceptance`; `internal_ssd_one_million_rebuild_within_120_seconds_ceiling_contract` and real internal-volume runner. Any measured miss remains OPEN RED; an unrun hardware check remains NOT RUN. |
 
 Every finding's code path has a named defect-sensitivity RED and GREEN in the runner. Acceptance measurements are separate from those correctness regressions. Any P1 that remains after this final round must remain a test-first RED item; this writer supplies executable evidence, not an independent review verdict.
 
