@@ -1139,18 +1139,22 @@ pub const WRITE_BATCH_ROWS: usize = 5_000;
 /// waits on `busy_timeout` instead of failing with `SQLITE_BUSY`, and
 /// re-reads `meta.min_writer_minor` inside the transaction: a writer that
 /// finds itself too old aborts and steps down to read-only (PLAN §5.5).
-pub fn begin_writer_txn(conn: &Connection, own_minor: u32) -> Result<rusqlite::Transaction<'_>, IndexError> {
-  conn.execute_batch("BEGIN IMMEDIATE")
+pub fn begin_writer_txn(conn: &mut Connection, own_minor: u32) -> Result<rusqlite::Transaction<'_>, IndexError> {
+  // One call opens the transaction: `transaction_with_behavior(Immediate)`
+  // issues `BEGIN IMMEDIATE` itself. A separate `execute_batch("BEGIN
+  // IMMEDIATE")` followed by `conn.transaction()` would nest BEGINs and fail
+  // with "cannot start a transaction within a transaction".
+  let txn = conn
+    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     .map_err(|e| IndexError::Engine(e.to_string()))?;
-  let min_writer: String = conn
+  let min_writer: String = txn
     .query_row("SELECT value FROM meta WHERE key='min_writer_minor'", [], |r| r.get(0))
     .map_err(|e| IndexError::Engine(e.to_string()))?;
   let min_writer: u32 = min_writer.parse().map_err(|_| IndexError::SchemaTooNew { found: -1, supported: own_minor as i64 })?;
   if min_writer > own_minor {
-    let _ = conn.execute_batch("ROLLBACK");
     return Err(IndexError::SchemaTooNew { found: min_writer as i64, supported: own_minor as i64 });
   }
-  Ok(conn.transaction().map_err(|e| IndexError::Engine(e.to_string()))?)
+  Ok(txn)
 }
 
 /// Small write any process may perform without the lease: file a request for
@@ -1264,9 +1268,9 @@ fn writer_steps_down_when_min_writer_bumped_inside_txn() {
   let dir = temp_dir("stepdown");
   std::fs::create_dir_all(&dir).unwrap();
   let db = dir.join("index.v3.db");
-  let conn = open_shared_connection(&db, false).unwrap();
+  let mut conn = open_shared_connection(&db, false).unwrap();
   conn.execute("UPDATE meta SET value='99' WHERE key='min_writer_minor'", []).unwrap();
-  let err = begin_writer_txn(&conn, 0).unwrap_err().to_string();
+  let err = begin_writer_txn(&mut conn, 0).unwrap_err().to_string();
   assert!(err.contains("newer than supported"), "{err}");
   conn.execute("UPDATE meta SET value='0' WHERE key='min_writer_minor'", []).unwrap();
   let _ = remove_dir_all_if_exists(&dir);
@@ -2216,4 +2220,40 @@ Not run by this plan (state in the report): `kuntu-napi` Node smoke beyond `carg
 
 ## Replay results
 
-PENDING — filled by the replay pass below (do not edit this section by hand; the replay loop updates it and re-commits until every RED/GREEN reproduces).
+Replay worktree `/Volumes/Portable2TB/ExtDev/kuntu-m2replay`, branch
+`replay/m2` at the plan HEAD. Edit blocks were applied mechanically with a
+script (create / insert-before / replace-range / append-to-`mod tests`);
+every RED/GREEN command below was run as written, in the foreground.
+Environment: Apple M4 Pro, macOS, rustc/cargo 1.98.1, machine under load
+from other agents (load average routinely above 10), `python3` with sqlite3
+available, node v26 available.
+
+| Step | Observed |
+|---|---|
+| M2.1 RED | `cargo test -p kuntu-store --locked` → `package ID specification 'kuntu-store' did not match any packages`, as specified |
+| M2.1 GREEN | **6 passed**, clippy clean — after two doc fixes (below) |
+| M2.2 RED | `E0583 file not found for module 'lease'` after the mod declaration without the file, as specified (restructured from the draft's orphan-file form, which compiled fine and proved the original RED wrong) |
+| M2.2 GREEN | **10 passed** (incl. the `kill -9` cross-process test, ~0.5 s), clippy clean — after two doc fixes |
+| M2.7 GREEN | **12 passed** (10 store + 2 takeover), clippy clean, no doc change needed |
+| M2.4a GREEN | `cargo test -p kuntu-core` **21 passed**, clippy clean, no doc change needed |
+| Anchor audit | script checked all 44 `apply` blocks: every `insert-before`/`replace-range` anchor occurs exactly once in its target file at the task's commit point (3 apparent misses are files created by earlier tasks in the same chain, verified against the created content instead) |
+| Snippet probe | standalone crate under `/Volumes/Portable2TB/tmp/kuntu-m2/probe` (since discarded) compiled the exact M2.3e/M2.5 shapes against rusqlite 0.32 bundled + fs4 0.13: WAL mode set, `busy_timeout=5000`, `WITHOUT ROWID` covering-PK plan with no `SCAN`, cross-fd flock contention + release, second-writer busy-wait-then-commit — all pass |
+
+Doc bugs found and fixed by replay (each re-committed on `docs/m2-plan`, doc-only commits, no attribution lines):
+
+1. M2.1c `ensure_store_home` chmodded (`set_dir_private`) **before** `check_dir_permissions`, so a pre-existing group-writable home was silently repaired and the refusal test failed. Fixed order: refuse first, then harden.
+2. M2.1 GREEN omitted lockfile generation: new deps (`nix`, `fs4`) make the first `--locked` run fail. Added `cargo generate-lockfile` to GREEN and `Cargo.lock` to the M2.1 commit.
+3. M2.2 RED was unobservable (an orphan `lease.rs` compiles fine). Restructured: M2.2a declares `pub mod lease;` (RED = E0583), M2.2b creates the file (GREEN).
+4. M2.2a used `SeekFrom::Start` (takes a `u64`); does not compile. Fixed to `SeekFrom::Start(0)`.
+5. M2.2b reacquire test flaked ~30–50% under default thread counts. Root-caused with a standalone reproducer (5/2000 fails with a concurrent spawner, 0/2000 and 0/12000 without): a forked-but-not-yet-exec'd child transiently shares the parent's flock references, so an immediate post-close reacquire can see `EWOULDBLOCK`. Fixed with a bounded 2 s retry (a stuck holder still fails loudly); cross-process release stays proven by the `kill -9` test. Production note: lease fds are CLOEXEC (Rust default), so the window closes at exec; no product-code change needed.
+6. `with_env_home`-based tests raced on process-global env under parallel threads (`ensure_refuses_symlinked_home` failed intermittently). Fixed with a shared `ENV_LOCK` mutex in the test module.
+7. Clippy `suspicious_open_options` on the lease open: stated `.truncate(false)` explicitly (truncation happens only post-lock via `set_len(0)`).
+8. M2.5a `begin_writer_txn` issued `BEGIN IMMEDIATE` and then called `conn.transaction()`, which nests `BEGIN` and fails. Fixed to a single `transaction_with_behavior(Immediate)` with the `min_writer_minor` re-read inside it (rollback on step-down is automatic by drop).
+9. M2.6b test inserts omitted the `NOT NULL kind` column. Fixed to include `kind`.
+10. M2.9b replacement dropped `pub` from `parse_args`. Fixed the replacement tail.
+11. M2.9d's runner calls `store_gc`/`doctor_check`, which were defined in M2.10a (later task). Moved both helpers to a new M2.9d2 step; M2.10a keeps only `import_v2_roots`.
+12. Removed duplicated M2.3/M2.5/M2.7/M2.8/M2.9/M2.10 sections produced by overlapping appends, and a duplicated `scope_is_enforced_non_empty_and_sorted` test; checklist rows now name only tests defined exactly once in the file.
+
+Not run in replay (stated openly): the full `kuntu-index` turso→rusqlite port (M2.3 call-site port, M2.4b/c, M2.5/2.6/2.9d2/2.10a/b application), the NAPI/CLI/daemon edits, and the 100k M1 latency gate on the new engine. These were verified at anchor level (every block resolves to a unique site) and snippet level (the engine-critical shapes compile and behave in the probe), but a full port is the milestone implementation itself (8–10 days per PLAN §1) and is out of scope for a planning replay. The worker runs it task by task; the first full `cargo test -p kuntu-index` GREEN that fails anywhere stops the line per the Rules above.
+
+Scratch state after replay: `/Volumes/Portable2TB/tmp/kuntu-m2/` removed; `/tmp/flockprobe`, `/tmp/flock-stress`, `/tmp/m2plan-doc.md`, `/tmp/m*.txt` removed; leftover `kuntu-lease-*` temp dirs from failed test runs removed; replay worktree and `replay/m2` branch removed after this commit. No push was ever run; no other worktree was touched.
