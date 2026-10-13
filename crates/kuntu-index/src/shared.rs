@@ -31,6 +31,44 @@ pub fn fault(point: &str) {
     }
   }
 }
+#[cfg(test)]
+thread_local! {
+  pub(crate) static OPEN_CHECK_ERRORS: std::cell::RefCell<std::collections::VecDeque<i32>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+  pub(crate) static OPEN_CHECK_TIMEOUT: Cell<i64> = const { Cell::new(0) };
+}
+fn opening_check(raw: &rusqlite::Connection) -> rusqlite::Result<String> {
+  #[cfg(test)]
+  {
+    OPEN_CHECK_TIMEOUT.with(|t| {
+      t.set(
+        raw
+          .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+          .unwrap(),
+      )
+    });
+    if let Some(code) = OPEN_CHECK_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
+      return Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(code),
+        None,
+      ));
+    }
+  }
+  raw.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+}
+fn confirmed_corruption(checked: rusqlite::Result<String>) -> Result<bool> {
+  match checked {
+    Ok(s) => Ok(s != "ok"),
+    Err(e)
+      if matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+      ) =>
+    {
+      Ok(true)
+    }
+    Err(e) => Err(e.into()),
+  }
+}
 impl KuntuIndex {
   pub fn open_shared(home: Home, readonly: bool, consumer: &str) -> Result<Self> {
     Self::open_shared_minor(home, readonly, consumer, BUILD_MINOR)
@@ -69,8 +107,8 @@ impl KuntuIndex {
       rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
     };
     let raw = rusqlite::Connection::open_with_flags_and_vfs(name, flags, "kuntu-fd")?;
-    let checked = raw.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0));
-    if matches!(&checked,Ok(s)if s!="ok") || checked.is_err() {
+    raw.busy_timeout(Duration::from_millis(5000))?;
+    if confirmed_corruption(opening_check(&raw))? {
       drop(raw);
       drop(reader);
       if readonly {
@@ -82,7 +120,19 @@ impl KuntuIndex {
       let _epoch = home
         .lock("epoch-3.lock", false)?
         .ok_or(IndexError::LeaseRequired)?;
-      home.resume_quarantine(3, &_writer, &_epoch)?;
+      // The failed connection and its lifetime lock are gone. Reopen and
+      // confirm under both recovery capabilities before moving any member.
+      let recheck = rusqlite::Connection::open_with_flags_and_vfs(
+        home.sqlite_name("index.v3.db")?,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        "kuntu-fd",
+      )?;
+      recheck.busy_timeout(Duration::from_millis(5000))?;
+      let corrupt = confirmed_corruption(opening_check(&recheck))?;
+      drop(recheck);
+      if corrupt {
+        home.resume_quarantine(3, &_writer, &_epoch)?;
+      }
       drop(_epoch);
       drop(_writer);
       drop(_boot);
@@ -115,6 +165,7 @@ impl KuntuIndex {
     if path.exists() {
       let inspect =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+      inspect.busy_timeout(Duration::from_millis(5000))?;
       let version: i64 = inspect.query_row("PRAGMA user_version", [], |r| r.get(0))?;
       drop(inspect);
       if version == 2 {
@@ -154,6 +205,7 @@ impl KuntuIndex {
     consumer: &str,
     minor: i64,
   ) -> Result<Self> {
+    raw.busy_timeout(Duration::from_millis(5000))?;
     assert!(
       sqlite_runtime_supported(rusqlite::version_number()),
       "SQLite WAL-reset fix is required"
@@ -180,7 +232,6 @@ impl KuntuIndex {
           .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
       },
     )?;
-    raw.busy_timeout(Duration::from_millis(5000))?;
     let version: i64 = raw.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let tables: i64 = raw.query_row(
       "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -358,6 +409,7 @@ impl KuntuIndex {
       rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
       "kuntu-fd",
     )?;
+    copy.busy_timeout(Duration::from_millis(5000))?;
     let version: i64 = copy.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != 2 {
       return Err(IndexError::RecreateRequired);

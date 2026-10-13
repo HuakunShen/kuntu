@@ -1025,3 +1025,105 @@ fn holder_service_drops_unusable_capability_after_writer_floor_changes() {
   next.rebuild(&c).unwrap();
   drop(service);
 }
+
+fn member_snapshot(h: &Home) -> Vec<(String, u64, Vec<u8>)> {
+  use std::os::unix::fs::MetadataExt;
+  let mut snapshot = Vec::new();
+  for entry in std::fs::read_dir(&h.path).unwrap() {
+    let entry = entry.unwrap();
+    let name = entry.file_name().to_string_lossy().into_owned();
+    if name.starts_with("index.v3.db") || name.starts_with("quarantine-") {
+      snapshot.push((
+        name,
+        entry.metadata().unwrap().ino(),
+        std::fs::read(entry.path()).unwrap(),
+      ));
+    }
+  }
+  snapshot.sort();
+  snapshot
+}
+fn transient_open_regression(code: i32) {
+  for readonly in [false, true] {
+    let (h, config, seed) = fixture();
+    seed.enqueue("rebuild", &config).unwrap();
+    seed
+      .conn
+      .raw
+      .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+      .unwrap();
+    drop(seed);
+    let before = member_snapshot(&h);
+    shared::OPEN_CHECK_ERRORS.with(|e| e.borrow_mut().push_back(code));
+    let result = KuntuIndex::open_shared(h.clone(), readonly, "strict");
+    assert!(
+      matches!(result, Err(IndexError::Engine(ref e)) if e.sqlite_error().is_some_and(|e| e.extended_code == code)),
+      "operational {code} was treated as corruption"
+    );
+    assert_eq!(
+      member_snapshot(&h),
+      before,
+      "operational failure changed database members"
+    );
+    shared::OPEN_CHECK_TIMEOUT.with(|t| assert_eq!(t.get(), 5000, "timeout installed too late"));
+  }
+}
+#[test]
+fn busy_open_preserves_database_members() {
+  transient_open_regression(rusqlite::ffi::SQLITE_BUSY);
+}
+#[test]
+fn io_open_preserves_database_members() {
+  transient_open_regression(rusqlite::ffi::SQLITE_IOERR_READ);
+}
+#[test]
+fn nomem_open_preserves_database_members() {
+  transient_open_regression(rusqlite::ffi::SQLITE_NOMEM);
+}
+#[test]
+fn recovery_rechecks_corruption_after_capabilities() {
+  let (h, config, seed) = fixture();
+  seed.enqueue("rebuild", &config).unwrap();
+  drop(seed);
+  shared::OPEN_CHECK_ERRORS.with(|e| e.borrow_mut().push_back(rusqlite::ffi::SQLITE_CORRUPT));
+  let reopened = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  assert_eq!(
+    reopened.status().unwrap().len(),
+    1,
+    "healthy registrations quarantined"
+  );
+  let pending: i64 = reopened
+    .conn
+    .raw
+    .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+    .unwrap();
+  assert_eq!(pending, 1, "healthy inbox quarantined");
+  assert!(!h.exists("quarantine-3.json").unwrap());
+  assert!(!std::fs::read_dir(&h.path).unwrap().any(|e| e
+    .unwrap()
+    .file_name()
+    .to_string_lossy()
+    .contains("quarantine")));
+}
+#[test]
+fn recovery_operational_error_preserves_database_members() {
+  let (h, _config, seed) = fixture();
+  seed
+    .conn
+    .raw
+    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+    .unwrap();
+  drop(seed);
+  let before = member_snapshot(&h);
+  shared::OPEN_CHECK_ERRORS.with(|e| {
+    e.borrow_mut().extend([
+      rusqlite::ffi::SQLITE_CORRUPT,
+      rusqlite::ffi::SQLITE_IOERR_READ,
+    ])
+  });
+  let result = KuntuIndex::open_shared(h.clone(), false, "strict");
+  assert!(
+    matches!(result, Err(IndexError::Engine(ref e)) if e.sqlite_error().is_some_and(|e| e.extended_code == rusqlite::ffi::SQLITE_IOERR_READ))
+  );
+  assert_eq!(member_snapshot(&h), before);
+}
