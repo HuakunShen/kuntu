@@ -1,12 +1,12 @@
-# Kuntu M2: shared store, revision 2
+# Kuntu M2: shared store, revision 3
 
-Implementation hand-off from `e164d67` (M1 merged). Sources: `/Volumes/Portable2TB/tmp/kuntu/PLAN.md` §5, §§8–9; `RESEARCH.md` §§4, 6, 10; round-1 review `kuntum2-plan-review.md` (2026-10-10). This revision replaces the incomplete round-1 snippets with complete files and executable fault tests. Replay evidence below distinguishes completed checks from acceptance targets.
+Implementation hand-off from `e164d67` (M1 merged). Sources: `/Volumes/Portable2TB/tmp/kuntu/PLAN.md` §5, §§8–9; `RESEARCH.md` §§4, 6, 10; round-1 review `kuntum2-plan-review.md` and round-2 recheck `kuntum2-rev2-recheck.md`. Revision 3 addresses the recheck with complete payloads, named sensitivity tests and the D16 consumer scope. Replay evidence below distinguishes completed checks from acceptance targets.
 
 ## Frozen owner decisions
 
 D1–D14 stay frozen. D1 SQLite WAL with bundled rusqlite; D2 M1 ships separately; D3 signed `kuntud` with embedded fallback; D4 epoch in filename and additive minors; D5 Xross keeps export mappings in its own DB; D6 5,000 candidate budget, 50,000 cap; D7 native macOS watcher in M3; D8 opt-in local text/code content in M5; D9 locale-dependent pinyin in M4; D10 submodule for development, npm for release; D11 shared file with explicit non-empty scope; D12 macOS first; D13 GC after 30 days of recorded non-use; D14 lease-held additive migrations with older writers stepping down.
 
-| Decision | Recommended default adopted in rev 2 |
+| Decision | Recommended default adopted in rev 3 |
 |---|---|
 | O1 | Pin rusqlite `=0.40.2`, bundled SQLite 3.53.2; assert runtime ≥3.51.3. The [rusqlite release history](https://github.com/rusqlite/rusqlite/releases) records the WAL fix in 0.39.0 and SQLite 3.53.2 in 0.40.1. |
 | O2 | fs4 0.13.1, permanent lock inodes, CLOEXEC. |
@@ -20,7 +20,8 @@ D1–D14 stay frozen. D1 SQLite WAL with bundled rusqlite; D2 M1 ships separatel
 | O10 | 128 random bits, stable bootstrap lock, synced private temporary document, atomic publication. |
 | O11 | Fail-closed platform allow-list from `fstatfs` on the opened directory: macOS APFS/HFS; Linux ext-family/XFS/Btrfs/tmpfs. Unknown, FUSE and remote filesystems fail. |
 | O12 | Compatibility before WAL/DDL, guarded write transactions, additive migrations under `migrate.lock`. |
-| D15 (new, finding 7) | Hidden/ignored admission and ranking priority belong to each consumer. The indexing union never grants query admission. Default allowances are false; a stricter consumer cannot override its registration with query flags. |
+| D15 | Hidden/ignored admission and ranking priority belong to each consumer. The indexing union never grants query admission. Default allowances are false; a stricter consumer cannot override its registration with query flags. |
+| D16 (round-2 finding 6, owner default) | M2 delivers the shared store and documented consumer contract: CLI, daemon, NAPI read-only/writer, plus a macOS smoke with CLI, daemon and two independent NAPI hosts standing in for Xross/Kunkun. Xross mapping move (M2-X) and Kunkun signed-helper integration (M2-K) are separate follow-up lanes planned in their own repos after M2 lands. No product plans are written here. |
 
 ## Execution contract
 
@@ -68,6 +69,20 @@ The complete write set is the following list, including regenerated dependencies
 - `scripts/m2-red.ts`
 - `scripts/m2-replay.ts`
 
+- `crates/kuntu-core/src/policy.rs`
+
+- `crates/kuntu-index/src/walk.rs`
+
+- `crates/kuntu-index/src/m2_acceptance.rs`
+
+- `scripts/m2-napi-host.cjs`
+
+- `scripts/m2-consumer-smoke.ts`
+
+- `scripts/m2-internal-rebuild.ts`
+
+- `docs/consumer-contract.md`
+
 ## State and lifetime rules
 
 Shared homes are absolute paths resolved with no-follow `openat` directory traversal. Ancestors must belong to root or the user; a user-owned mounted volume may have group-write permissions because each traversed object is opened and pinned. World-write without sticky protection is refused. The final home and `locks/run/logs` require user ownership and exact 0700. Files are 0600 at creation; existing symlinks and hard links are refused. No process-global umask changes or temporary fallback occur. One directory descriptor is reused per inode in a process, so SQLite's shared Unix shm nodes cannot outlive the descriptor encoded in their filenames.
@@ -76,19 +91,21 @@ Transient ENOENT during permanent-lock creation is retried at most 100 times thr
 
 The compiled `BUILD_MINOR` bounds every shared opener; the skew helper may lower it to 0 but cannot accept a caller claim above the compiled version. Compatibility is validated before WAL configuration or DDL, including read-only opens, `schema_epoch`, store identity and reader/writer floors. Initial schema creation, migrations, inbox/consumer updates, batches, cleanup and completion use `begin_writer_txn`; RAII rollback applies on error. The empty-store bootstrap exception is available only to an exclusive transaction with no existing user tables. A minor-1 holder migrates under `migrate.lock` plus an exclusive transaction; minor-0 readers keep working and minor-0 writers step down. The private v2 compatibility backend retains the old engine and its original file format. It cannot open a shared store; its guarded transactions re-check v2 user_version instead of v3 metadata.
 
-Each scan registers `building` before crawling without holding a SQL transaction. Restart of an interrupted scan with unchanged consumer policy re-walks using the same generation and idempotent upserts; a changed policy starts a new generation. After the walk, every batch, every cleanup transaction and final completion checks the persisted generation and policy revision again. Removed/disabled consumers cannot be revived by an inbox payload. Entries, postings, progress and `meta.generation` commit together, so there is no crash interval between a batch commit and a separate generation bump. Ready is a checked final transaction after bounded stale cleanup. Readers hold no SQL transaction across calls; shared NAPI instances pool one locked reader and re-check reader floors after acquiring that lock. They use `data_version` to detect other connections' commits. Empty queries and misses on a building root report `Building`.
+Each scan registers `building` before crawling without holding a SQL transaction. Every restarted walk takes a fresh visitation generation. Previously committed rows are idempotently refreshed only if visited again, so deleted/renamed files cannot survive completion. Cancellation leaves building state recoverable; the unmodified protected crawler is complemented by an index-owned cancellable walk. Cleanup seeks over rowids, limits inspected rows to 5,000 and checks the 100 ms deadline and stop signal between rows. After the walk, every batch, every cleanup transaction and final completion checks the persisted generation and policy revision again. Removed/disabled consumers cannot be revived by an inbox payload. Entries, postings, progress and `meta.generation` commit together, so there is no crash interval between a batch commit and a separate generation bump. Ready is a checked final transaction after bounded stale cleanup. Readers hold no SQL transaction across calls. Every public Rust read re-checks the reader floor centrally; shared NAPI instances also re-check after acquiring their pooled-reader lock. They use `data_version` to detect other connections' commits. Empty queries and misses on a building root report `Building`.
 
 Name/path postings keep the M1 term-first, covering range scan; fetches keep the bare rowid `IN` projection with `id`. The reverse path is a compressed `reverse_postings` record keyed by entry ID. The lossy-path verifier reads that rowid record. Replacement and delete triggers decode its terms and delete by the term-first primary keys, avoiding an `entry_id` scan of postings. Tests explain the production builders, including the trigger's builder before `OLD.id` substitution. This replaces the space-heavy reverse indexes considered in the pilot.
 
-Every open holds the epoch lifetime lock. Quarantine requires both the indexer lease and exclusive epoch access, publishes a synced recovery marker, moves the DB/WAL/SHM group under that marker, and resumes that sequence before reuse. GC only considers epochs strictly below 3; a live epoch holder blocks it and resets the non-use clock. Future epochs are never deleted. Unregistered old epochs are preserved fail-closed. Old binaries that do not participate in epoch lifetime coordination require a product rollout before automatic retention can be enabled; the minor matrix below simulates cooperating versions within v3. The actual previous-tag controller builds v0.4.1 from archive commit `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` and checks epoch2/epoch3 isolation and unchanged bytes on refusal. No released v3 minor-0 binary exists yet.
+Compiled sensitive-policy identity is derived from the rule tables and matching-version identifier. A lease holder atomically updates that identity, increments policy revisions and invalidates ready roots for reconciliation. Admission evaluates current sensitive denial even when an older producer stored nonsensitive flags.
 
-Import snapshots the source main file and sidecars through read-only opened directory handles into the private destination, verifies v2 on that copy, registers its enabled roots, then rebuilds from the filesystem under the destination lease. Source main/WAL/SHM bytes remain unchanged. A source must be quiescent while its three files are copied; importing a live, changing v2 writer is not an atomic snapshot protocol.
+Every open holds the epoch lifetime lock. Quarantine requires both the indexer lease and exclusive epoch access, atomically publishes and directory-syncs a recovery marker before moving the DB/WAL/SHM group. GC uses the same durable marker discipline before unlinking an old group; lifetime acquisition finishes interrupted GC before epoch reuse. Only ENOENT counts as absence. Each member operation and marker removal is directory-synced. GC only considers epochs strictly below 3; a live epoch holder blocks it and resets the non-use clock. Future epochs are never deleted. Unregistered old epochs are preserved fail-closed. Old binaries that do not participate in epoch lifetime coordination require a product rollout before automatic retention can be enabled; the minor matrix below simulates cooperating versions within v3. The actual previous-tag controller builds v0.4.1 from archive commit `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` and checks epoch2/epoch3 isolation and unchanged bytes on refusal. No released v3 minor-0 binary exists yet.
+
+Import opens all source members first, creates a unique private snapshot with exclusive inode creation, checks every source/destination inode pair before copying, and snapshots through read-only opened directory handles into the destination, verifies v2 on that copy, registers its enabled roots, then rebuilds from the filesystem under the destination lease. Source main/WAL/SHM bytes remain unchanged, including a retained snapshot inside the same home. Successful and error returns remove only files created by that attempt; a process kill may retain harmless uniquely named copies. A source must be quiescent while its three files are copied; importing a live, changing v2 writer is not an atomic snapshot protocol.
 
 ## RED/GREEN method and foreground runner
 
 M2.1–M2.10 each have a named regression (plus deterministic lock-creation and slow-delete boundary regressions) and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
 
-The final replay installs every complete file from the committed plan in task order, runs all ten tasks with fourteen RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
+The final replay installs every complete file from the committed plan in task order, runs all ten tasks with twenty-eight RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests with filesystem mutation, member-by-member quarantine/GC interruption, 60 s stress, the skew matrix and the four-host macOS consumer smoke. A separate M2 latency gate records assertion failures as OPEN RED; internal-SSD acceptance is explicitly pending without an authorized internal-volume fixture. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
 
 
 ## Task M2.1: descriptor-safe foundation and bootstrap
@@ -178,7 +195,7 @@ use nix::fcntl::{open, openat, OFlag};
 use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
 use nix::unistd::{getuid, unlinkat, UnlinkatFlags};
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -407,6 +424,28 @@ impl Home {
     fchmod(&f, Mode::from_bits_truncate(0o600)).map_err(err)?;
     Ok(f)
   }
+  /// Create a new private inode. Existing files are never truncated.
+  pub fn create_new_file(&self, name: &str) -> Result<File> {
+    if name.contains('/') || name.contains("..") {
+      return Err(err("Invalid leaf."));
+    }
+    let f: File = openat(
+      &*self.dir,
+      name,
+      OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+      Mode::from_bits_truncate(0o600),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    Ok(f)
+  }
+  pub fn exists(&self, name: &str) -> Result<bool> {
+    match self.read_file(name) {
+      Ok(_) => Ok(true),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+      Err(e) => Err(e),
+    }
+  }
   pub fn sqlite_name(&self, name: &str) -> Result<String> {
     if name.contains('/') || name.contains("..") {
       return Err(err("Invalid leaf."));
@@ -463,6 +502,18 @@ impl Home {
       return Err(err("Invalid epoch lock inode."));
     }
     f.lock_shared()?;
+    if epoch < EPOCH && self.exists(&format!("gc-{epoch}.json"))? {
+      FileExt::unlock(&f)?;
+      let guard = self
+        .lock(&format!("epoch-{epoch}.lock"), true)?
+        .ok_or_else(|| err("Missing epoch capability."))?;
+      if self.exists(&format!("gc-{epoch}.json"))? {
+        self.resume_gc(epoch, &guard)?;
+      }
+      drop(guard);
+      // Re-enter to acquire shared access and re-check after the lock wait.
+      return self.lifetime(epoch);
+    }
     let mut registration = self.file(&format!("lifetime-{epoch}"), true)?;
     registration.write_all(b"1")?;
     registration.sync_data()?;
@@ -510,31 +561,87 @@ impl Home {
       ));
     }
     let marker = format!("quarantine-{epoch}.json");
-    let mut f = self.file(&marker, true)?;
-    if f.metadata()?.len() == 0 {
-      let mut b = [0; 16];
-      getrandom::fill(&mut b).map_err(err)?;
-      write!(
-        f,
-        "{}",
-        b.iter().map(|v| format!("{v:02x}")).collect::<String>()
-      )?;
-      f.sync_all()?;
-    }
-    f.rewind()?;
-    let mut suffix = String::new();
-    f.read_to_string(&mut suffix)?;
-    for ext in ["", "-wal", "-shm"] {
+    let suffix = self.operation_marker(&marker)?;
+    for (ext, point) in [
+      ("", "quarantine_main_moved"),
+      ("-wal", "quarantine_wal_moved"),
+      ("-shm", "quarantine_shm_moved"),
+    ] {
       let src = format!("index.v{epoch}.db{ext}");
-      if self.file(&src, false).is_ok() {
-        self.rename(&src, &format!("quarantine-{suffix}{ext}"))?;
-        fault("quarantine_renamed");
+      match self.file(&src, false) {
+        Ok(_) => self.rename(&src, &format!("quarantine-{suffix}{ext}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
       }
+      self.dir.sync_all()?;
+      namespace_event(point);
+      fault(point);
+      fault("quarantine_renamed");
     }
-    self.dir.sync_all()?;
-    self.remove(&marker)?;
-    self.dir.sync_all()?;
+    self.finish_operation(&marker)?;
     Ok(())
+  }
+  /// Atomic marker publication is durable before the first member operation.
+  fn operation_marker(&self, marker: &str) -> Result<String> {
+    if !self.exists(marker)? {
+      let temporary = format!("{marker}.tmp");
+      let mut random = [0; 16];
+      getrandom::fill(&mut random).map_err(err)?;
+      let suffix = random
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+      let mut f = self.file(&temporary, true)?;
+      f.set_len(0)?;
+      f.write_all(suffix.as_bytes())?;
+      f.sync_all()?;
+      namespace_event("marker_file_synced");
+      self.rename(&temporary, marker)?;
+      self.dir.sync_all()?;
+      namespace_event("marker_directory_synced");
+      fault("namespace_marker_published");
+    }
+    let mut suffix = String::new();
+    self.read_file(marker)?.read_to_string(&mut suffix)?;
+    if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+      return Err(err("Invalid durable operation marker."));
+    }
+    Ok(suffix)
+  }
+  fn finish_operation(&self, marker: &str) -> Result<()> {
+    self.dir.sync_all()?;
+    namespace_event("members_directory_synced");
+    self.remove(marker)?;
+    self.dir.sync_all()?;
+    namespace_event("marker_removal_synced");
+    Ok(())
+  }
+  fn resume_gc(&self, epoch: u32, guard: &Lease) -> Result<()> {
+    if epoch >= EPOCH || guard.name != format!("epoch-{epoch}.lock") || !guard.belongs_to(self) {
+      return Err(err("GC requires an older epoch capability."));
+    }
+    let marker = format!("gc-{epoch}.json");
+    self.operation_marker(&marker)?;
+    for (ext, point) in [
+      ("", "gc_main_removed"),
+      ("-wal", "gc_wal_removed"),
+      ("-shm", "gc_shm_removed"),
+    ] {
+      match self.remove(&format!("index.v{epoch}.db{ext}")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+      }
+      self.dir.sync_all()?;
+      namespace_event(point);
+      fault(point);
+    }
+    match self.remove(&format!("unused-{epoch}")) {
+      Ok(()) => {}
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+      Err(e) => return Err(e),
+    }
+    self.finish_operation(&marker)
   }
   pub fn gc_epoch(&self, epoch: u32, now: u64) -> Result<bool> {
     if epoch >= EPOCH {
@@ -556,6 +663,10 @@ impl Home {
     let Some(_g) = self.lock(&format!("epoch-{epoch}.lock"), false)? else {
       return Ok(false);
     };
+    if self.exists(&format!("gc-{epoch}.json"))? {
+      self.resume_gc(epoch, &_g)?;
+      return Ok(true);
+    }
     let stamp = format!("unused-{epoch}");
     let mut f = self.file(&stamp, true)?;
     let mut s = String::new();
@@ -569,16 +680,7 @@ impl Home {
     if now.saturating_sub(t.unwrap()) < 30 * 86400 {
       return Ok(false);
     }
-    for ext in ["", "-wal", "-shm"] {
-      let n = format!("index.v{epoch}.db{ext}");
-      match self.remove(&n) {
-        Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(2) => {}
-        Err(e) => return Err(e),
-      }
-    }
-    self.remove(&stamp)?;
-    self.dir.sync_all()?;
+    self.resume_gc(epoch, &_g)?;
     Ok(true)
   }
 }
@@ -676,6 +778,13 @@ impl SourceDir {
     }
     Ok(f)
   }
+}
+
+fn namespace_event(event: &str) {
+  #[cfg(test)]
+  tests::record_namespace_event(event);
+  #[cfg(not(test))]
+  let _ = event;
 }
 ````
 
@@ -796,6 +905,86 @@ fn executed_child_does_not_inherit_the_permanent_writer_lease() {
     reacquired,
     "an executed child inherited the live writer capability"
   );
+}
+
+thread_local! {static NAMESPACE_EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };}
+pub(super) fn record_namespace_event(event: &str) {
+  NAMESPACE_EVENTS.with(|events| events.borrow_mut().push(event.into()));
+}
+#[test]
+fn durable_markers_precede_every_namespace_member_and_only_enoent_is_absent() {
+  let h = home();
+  for ext in ["", "-wal", "-shm"] {
+    h.file(&format!("index.v3.db{ext}"), true)
+      .unwrap()
+      .write_all(b"member")
+      .unwrap();
+  }
+  NAMESPACE_EVENTS.with(|events| events.borrow_mut().clear());
+  h.quarantine(3).unwrap();
+  NAMESPACE_EVENTS.with(|events| {
+    let events = events.borrow();
+    assert_eq!(
+      &events[..2],
+      ["marker_file_synced", "marker_directory_synced"]
+    );
+    assert_eq!(
+      &events[2..5],
+      [
+        "quarantine_main_moved",
+        "quarantine_wal_moved",
+        "quarantine_shm_moved"
+      ]
+    );
+    assert_eq!(events.last().unwrap(), "marker_removal_synced");
+  });
+  // ELOOP is a refusal, never a missing member; leave the marker for recovery.
+  std::os::unix::fs::symlink("store.json", h.path.join("index.v3.db")).unwrap();
+  assert!(h.quarantine(3).is_err());
+  assert!(h.exists("quarantine-3.json").unwrap());
+  h.remove("index.v3.db").unwrap();
+  h.quarantine(3).unwrap();
+  assert!(!h.exists("quarantine-3.json").unwrap());
+  let reader = h.lifetime(2).unwrap();
+  drop(reader);
+  for ext in ["", "-wal", "-shm"] {
+    h.file(&format!("index.v2.db{ext}"), true).unwrap();
+  }
+  assert!(!h.gc_epoch(2, 1).unwrap());
+  NAMESPACE_EVENTS.with(|events| events.borrow_mut().clear());
+  assert!(h.gc_epoch(2, 31 * 86400).unwrap());
+  NAMESPACE_EVENTS.with(|events| {
+    let events = events.borrow();
+    assert_eq!(
+      &events[..2],
+      ["marker_file_synced", "marker_directory_synced"]
+    );
+    assert_eq!(
+      &events[2..5],
+      ["gc_main_removed", "gc_wal_removed", "gc_shm_removed"]
+    );
+  });
+}
+#[test]
+fn pending_gc_is_completed_before_an_old_epoch_can_be_reused() {
+  let h = home();
+  let reader = h.lifetime(2).unwrap();
+  drop(reader);
+  for ext in ["", "-wal", "-shm"] {
+    h.file(&format!("index.v2.db{ext}"), true)
+      .unwrap()
+      .write_all(b"old")
+      .unwrap();
+  }
+  let _ = h.operation_marker("gc-2.json").unwrap();
+  h.remove("index.v2.db").unwrap();
+  let _reuser = h.lifetime(2).unwrap();
+  for ext in ["", "-wal", "-shm"] {
+    assert!(!h.exists(&format!("index.v2.db{ext}")).unwrap());
+  }
+  assert!(!h.exists("gc-2.json").unwrap());
+  assert!(!h.gc_epoch(3, u64::MAX).unwrap());
+  assert!(!h.gc_epoch(4, u64::MAX).unwrap());
 }
 ````
 
@@ -2718,7 +2907,7 @@ pub use model::{
   normalize_root_path, EntryKind, ExplainResult, MatchKind, PolicyDecision, SearchCandidate,
   SearchConfig, SearchQuery, SearchResult, SearchRoot,
 };
-pub use policy::PathPolicy;
+pub use policy::{denies_sensitive_path, sensitive_policy_identity, PathPolicy};
 
 pub use model::SearchScope;
 ````
@@ -2744,6 +2933,7 @@ futures.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
 nix.workspace = true
+getrandom.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -2769,6 +2959,7 @@ pub struct Connection {
   pub raw: rusqlite::Connection,
   pub readonly: Cell<bool>,
   pub minor: i64,
+  pub lease: std::cell::RefCell<Option<kuntu_store::Lease>>,
 }
 pub struct Rows {
   rows: std::vec::IntoIter<Row>,
@@ -2832,6 +3023,7 @@ impl Connection {
     match min {
       Ok(m) if m > self.minor => {
         self.readonly.set(true);
+        self.lease.borrow_mut().take();
         Err(IndexError::ReadOnly)
       }
       Ok(_) => Ok(tx),
@@ -2885,6 +3077,14 @@ impl Drop for Transaction<'_> {
 //! Shared access, lease capabilities, scan state, additive migration and hosts.
 use super::*;
 type EntrySnapshot = HashMap<String, (i64, Option<i64>, Option<i64>)>;
+pub(crate) struct CleanupBatch {
+  pub inspected: usize,
+  pub deleted: usize,
+  pub done: bool,
+}
+pub(crate) fn cleanup_seek_sql() -> &'static str {
+  "SELECT id,root_id,scan_gen FROM entries WHERE id>?1 ORDER BY id LIMIT 5000"
+}
 use std::cell::Cell;
 use std::sync::{
   atomic::{AtomicBool, Ordering},
@@ -2924,7 +3124,7 @@ impl KuntuIndex {
     let _boot = home
       .lock("bootstrap.lock", true)?
       .ok_or(IndexError::LeaseRequired)?;
-    if home.file("quarantine-3.json", false).is_ok() {
+    if home.exists("quarantine-3.json")? {
       if readonly {
         return Err(IndexError::RecreateRequired);
       }
@@ -3038,6 +3238,7 @@ impl KuntuIndex {
       raw,
       readonly: Cell::new(readonly),
       minor,
+      lease: std::cell::RefCell::new(None),
     };
     let raw = &conn.raw;
     raw.create_scalar_function(
@@ -3162,7 +3363,7 @@ impl KuntuIndex {
       legacy: None,
       conn,
       home,
-      lease: None,
+      cancel: Arc::new(AtomicBool::new(false)),
       _reader: None,
       shared,
       consumer: consumer.into(),
@@ -3184,22 +3385,52 @@ impl KuntuIndex {
       .file_name()
       .and_then(|s| s.to_str())
       .ok_or_else(|| std::io::Error::other("Invalid source path."))?;
+    use std::os::unix::fs::MetadataExt;
+    // Open every source member first and preserve their identities.
+    let mut inputs = Vec::new();
     for ext in ["", "-wal", "-shm"] {
       match src.read_file(&format!("{leaf}{ext}")) {
-        Ok(mut f) => {
-          let mut out = home.file(&format!("import-v2.db{ext}"), true)?;
-          out.set_len(0)?;
-          std::io::copy(&mut f, &mut out)?;
-          out.sync_all()?;
-        }
-        Err(e) if e.raw_os_error() == Some(2) => {
-          let _ = home.remove(&format!("import-v2.db{ext}"));
-        }
+        Ok(f) => inputs.push((ext, f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !ext.is_empty() => {}
         Err(e) => return Err(e.into()),
       }
     }
+    let mut random = [0; 16];
+    getrandom::fill(&mut random).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let leaf = format!(
+      "import-{}.db",
+      random
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>()
+    );
+    let mut cleanup = ImportSnapshot {
+      home: home.clone(),
+      created: Vec::new(),
+    };
+    let mut outputs = Vec::new();
+    for (ext, _) in &inputs {
+      let name = format!("{leaf}{ext}");
+      outputs.push((*ext, home.create_new_file(&name)?));
+      cleanup.created.push(name);
+    }
+    // Check the complete cross-product before copying even one byte.
+    for (_, output) in &outputs {
+      let destination = output.metadata()?;
+      for (_, input) in &inputs {
+        let source = input.metadata()?;
+        if source.dev() == destination.dev() && source.ino() == destination.ino() {
+          return Err(std::io::Error::other("Import source overlaps its snapshot.").into());
+        }
+      }
+    }
+    for ((_, input), (_, output)) in inputs.iter_mut().zip(outputs.iter_mut()) {
+      std::io::copy(input, output)?;
+      output.sync_all()?;
+    }
+    drop(outputs);
     let copy = rusqlite::Connection::open_with_flags_and_vfs(
-      home.sqlite_name("import-v2.db")?,
+      home.sqlite_name(&leaf)?,
       rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
       "kuntu-fd",
     )?;
@@ -3215,6 +3446,7 @@ impl KuntuIndex {
       r
     };
     drop(copy);
+    drop(cleanup);
     let config = SearchConfig {
       roots: paths.into_iter().map(SearchRoot::new).collect(),
     };
@@ -3235,16 +3467,32 @@ impl KuntuIndex {
   }
   pub fn acquire_writer(&mut self) -> Result<bool> {
     if self.conn.readonly.get() {
+      self.conn.lease.borrow_mut().take();
       return Err(IndexError::ReadOnly);
     }
-    if self.lease.is_some() {
-      return Ok(true);
+    if self.conn.lease.borrow().is_none() {
+      if let Some(home) = &self.home {
+        *self.conn.lease.borrow_mut() = home.lock("indexer.lock", false)?;
+        if self.conn.lease.borrow().is_none() {
+          return Ok(false);
+        }
+      }
     }
-    let Some(home) = &self.home else {
-      return Ok(true);
-    };
-    self.lease = home.lock("indexer.lock", false)?;
-    if self.lease.is_some() && self.conn.minor >= 1 {
+    // Acquiring a blocking capability never makes cached compatibility true.
+    let result = (|| {
+      self.recheck_read_access()?;
+      if self.legacy.is_some() {
+        return Ok(());
+      }
+      let floor: i64 = self.conn.raw.query_row(
+        "SELECT value FROM meta WHERE key='min_writer_minor'",
+        [],
+        |r| r.get(0),
+      )?;
+      if floor > self.conn.minor {
+        self.conn.readonly.set(true);
+        return Err(IndexError::ReadOnly);
+      }
       let current: i64 =
         self
           .conn
@@ -3252,21 +3500,84 @@ impl KuntuIndex {
           .query_row("SELECT value FROM meta WHERE key='schema_minor'", [], |r| {
             r.get(0)
           })?;
-      if current < 1 {
+      if current < 1 && self.conn.minor >= 1 && self.home.is_some() {
         self.migrate(1)?;
       }
+      self.reconcile_sensitive_policy()?;
+      Ok(())
+    })();
+    if let Err(error) = result {
+      self.conn.lease.borrow_mut().take();
+      return Err(error);
     }
-    Ok(self.lease.is_some())
+    Ok(true)
+  }
+  pub(crate) fn check_cancelled(&self) -> Result<()> {
+    if self.cancel.load(Ordering::Acquire) {
+      Err(IndexError::Cancelled)
+    } else {
+      Ok(())
+    }
+  }
+  pub(crate) fn reconcile_sensitive_policy(&self) -> Result<()> {
+    if self.home.is_some() && self.conn.lease.borrow().is_none() {
+      return Err(IndexError::LeaseRequired);
+    }
+    let identity = kuntu_core::sensitive_policy_identity();
+    let stored: String =
+      self
+        .conn
+        .raw
+        .query_row("SELECT value FROM meta WHERE key='policy_hash'", [], |r| {
+          r.get(0)
+        })?;
+    if stored == identity {
+      return Ok(());
+    }
+    let tx = self.conn.begin_writer_txn(false)?;
+    // Re-read inside the transaction after its lock wait.
+    let stored: String =
+      tx.conn
+        .raw
+        .query_row("SELECT value FROM meta WHERE key='policy_hash'", [], |r| {
+          r.get(0)
+        })?;
+    if stored != identity {
+      tx.conn.raw.execute(
+        "UPDATE root_state SET status='dirty',dirty=1,policy_revision=policy_revision+1",
+        [],
+      )?;
+      tx.conn.raw.execute(
+        "UPDATE meta SET value=?1 WHERE key='policy_hash'",
+        params![identity],
+      )?;
+    }
+    block_on(tx.commit())?;
+    fault("policy_invalidated");
+    Ok(())
   }
   pub(crate) fn ensure_lease(&mut self) -> Result<()> {
     if self.conn.readonly.get() {
       return Err(IndexError::ReadOnly);
     }
-    if !self.shared {
+    if !self.shared && self.conn.lease.borrow().is_none() {
       self.acquire_writer()?;
     }
-    if self.home.is_some() && self.lease.is_none() {
+    if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
+    }
+    self.recheck_read_access()?;
+    if self.legacy.is_none() {
+      let floor: i64 = self.conn.raw.query_row(
+        "SELECT value FROM meta WHERE key='min_writer_minor'",
+        [],
+        |r| r.get(0),
+      )?;
+      if floor > self.conn.minor {
+        self.conn.readonly.set(true);
+        self.conn.lease.borrow_mut().take();
+        return Err(IndexError::ReadOnly);
+      }
     }
     Ok(())
   }
@@ -3304,11 +3615,11 @@ impl KuntuIndex {
     block_on(tx.commit())
   }
   pub fn begin_scan(&self, root_id: i64) -> Result<i64> {
-    if self.home.is_some() && self.lease.is_none() {
+    if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
     }
     let tx = self.conn.begin_writer_txn(false)?;
-    tx.conn.raw.execute("UPDATE root_state SET active_scan_gen=CASE WHEN status='building' AND scan_policy_revision=policy_revision THEN active_scan_gen ELSE active_scan_gen+1 END,status='building',dirty=1,scan_policy_revision=policy_revision WHERE root_id=?1",params![root_id])?;
+    tx.conn.raw.execute("UPDATE root_state SET active_scan_gen=active_scan_gen+1,status='building',dirty=1,scan_policy_revision=policy_revision WHERE root_id=?1",params![root_id])?;
     let gen = tx.conn.raw.query_row(
       "SELECT active_scan_gen FROM root_state WHERE root_id=?1",
       params![root_id],
@@ -3327,11 +3638,20 @@ impl KuntuIndex {
     }
   }
   pub fn complete_scan(&self, root_id: i64, gen: i64) -> Result<()> {
-    if self.home.is_some() && self.lease.is_none() {
+    if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
     }
-    while self.cleanup_stale_batch(root_id, gen)? != 0 {}
+    let mut cursor = 0;
+    loop {
+      self.check_cancelled()?;
+      let batch = self.cleanup_stale_batch(root_id, gen, &mut cursor)?;
+      debug_assert!(batch.deleted <= batch.inspected && batch.inspected <= 5000);
+      if batch.done {
+        break;
+      }
+    }
     fault("before_ready");
+    self.check_cancelled()?;
     let tx = self.conn.begin_writer_txn(false)?;
     self.check_scan(root_id, gen)?;
     tx.conn.raw.execute("UPDATE root_state SET status='ready',dirty=0,generation=generation+1,last_full_scan_at=?3,entry_count=(SELECT count(*) FROM entries WHERE root_id=?1) WHERE root_id=?1 AND active_scan_gen=?2",params![root_id,gen,unix_now()])?;
@@ -3339,39 +3659,62 @@ impl KuntuIndex {
     fault("ready_committed");
     Ok(())
   }
-  pub(crate) fn cleanup_stale_batch(&self, root_id: i64, gen: i64) -> Result<usize> {
-    if self.home.is_some() && self.lease.is_none() {
+  pub(crate) fn cleanup_stale_batch(
+    &self,
+    root_id: i64,
+    gen: i64,
+    cursor: &mut i64,
+  ) -> Result<CleanupBatch> {
+    if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
     }
-    let ids: Vec<i64> = {
-      let mut query = self
-        .conn
-        .raw
-        .prepare("SELECT id FROM entries WHERE root_id=?1 AND scan_gen<>?2 LIMIT 5000")?;
-      let ids = query
-        .query_map(params![root_id, gen], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-      ids
+    self.check_cancelled()?;
+    let started = std::time::Instant::now();
+    // Limit inspected rows, including other roots and current generations.
+    // No root predicate can force SQLite to walk an unbounded gap first.
+    let candidates = {
+      let mut q = self.conn.raw.prepare(cleanup_seek_sql())?;
+      let rows = q
+        .query_map(params![*cursor], |r| {
+          Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+          ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+      rows
     };
-    if ids.is_empty() {
-      self.check_scan(root_id, gen)?;
-      return Ok(0);
-    }
+    self.check_cancelled()?;
     let tx = self.conn.begin_writer_txn(false)?;
     self.check_scan(root_id, gen)?;
-    let started = std::time::Instant::now();
-    let mut rows = 0;
-    for id in ids {
-      rows += tx
-        .conn
-        .raw
-        .execute("DELETE FROM entries WHERE id=?1", params![id])?;
-      if rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100) {
+    let mut inspected = 0;
+    let mut deleted = 0;
+    let mut next = *cursor;
+    for (id, root, stamp) in &candidates {
+      self.check_cancelled()?;
+      if *root == root_id && *stamp != gen {
+        #[cfg(test)]
+        m2_tests::cleanup_delay(self.home.as_ref());
+        deleted += tx
+          .conn
+          .raw
+          .execute("DELETE FROM entries WHERE id=?1", params![id])?;
+      }
+      next = *id;
+      inspected += 1;
+      if inspected >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100) {
         break;
       }
     }
     block_on(tx.commit())?;
-    Ok(rows)
+    *cursor = next;
+    fault("cleanup_committed");
+    Ok(CleanupBatch {
+      inspected,
+      deleted,
+      done: candidates.is_empty(),
+    })
   }
   pub(crate) fn index_config(&self, id: i64) -> Result<SearchConfig> {
     let r = self.conn.raw.query_row(
@@ -3401,6 +3744,7 @@ impl KuntuIndex {
     Ok(rows)
   }
   pub fn generation_probe(&self) -> Result<i64> {
+    self.recheck_read_access()?;
     Ok(
       self
         .conn
@@ -3411,6 +3755,7 @@ impl KuntuIndex {
     )
   }
   pub fn point_probe(&self) -> Result<i64> {
+    self.recheck_read_access()?;
     use rusqlite::OptionalExtension;
     Ok(
       self
@@ -3422,6 +3767,7 @@ impl KuntuIndex {
     )
   }
   pub fn range_probe(&self) -> Result<i64> {
+    self.recheck_read_access()?;
     Ok(self.conn.raw.query_row(
       "SELECT count(*) FROM entries WHERE id>=1 AND id<101",
       [],
@@ -3429,6 +3775,7 @@ impl KuntuIndex {
     )?)
   }
   pub fn count_entries(&self) -> Result<i64> {
+    self.recheck_read_access()?;
     Ok(
       self
         .conn
@@ -3446,6 +3793,8 @@ impl KuntuIndex {
       |r| r.get(0),
     )?;
     if min > self.conn.minor {
+      self.conn.readonly.set(true);
+      self.conn.lease.borrow_mut().take();
       return Err(IndexError::SchemaTooNew {
         found: min,
         supported: self.conn.minor,
@@ -3454,6 +3803,7 @@ impl KuntuIndex {
     Ok(())
   }
   pub fn root_state_name(&self, path: &Path) -> Result<String> {
+    self.recheck_read_access()?;
     if let Some(legacy) = &self.legacy {
       let s = legacy
         .status()
@@ -3470,6 +3820,7 @@ impl KuntuIndex {
     )?)
   }
   pub fn doctor(&self) -> Result<String> {
+    self.recheck_read_access()?;
     Ok(
       self
         .conn
@@ -3478,6 +3829,7 @@ impl KuntuIndex {
     )
   }
   pub fn poll_changes(&self) -> Result<bool> {
+    self.recheck_read_access()?;
     let version = self
       .conn
       .raw
@@ -3530,6 +3882,7 @@ impl KuntuIndex {
     };
     let mut seen = HashSet::new();
     for (path, consumer) in roots {
+      self.check_cancelled()?;
       if !seen.insert(path.clone()) {
         continue;
       }
@@ -3559,6 +3912,7 @@ impl KuntuIndex {
       rows
     };
     for (id, kind, payload, consumer) in items {
+      self.check_cancelled()?;
       let paths: Vec<PathBuf> =
         serde_json::from_str(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
       self.consumer = consumer;
@@ -3575,6 +3929,12 @@ impl KuntuIndex {
         "repair" => self.repair(&config).map(|_| ()),
         _ => Err(IndexError::StaleScan),
       };
+      if matches!(
+        result,
+        Err(IndexError::ReadOnly | IndexError::SchemaTooNew { .. } | IndexError::Cancelled)
+      ) {
+        return result;
+      }
       let tx = self.conn.begin_writer_txn(false)?;
       tx.conn.raw.execute(
         "UPDATE requests SET state=?2 WHERE id=?1",
@@ -3649,12 +4009,21 @@ impl WriterService {
     let worker = thread::spawn(move || {
       while !signal.load(Ordering::Acquire) {
         if let Ok(mut index) = KuntuIndex::open_shared(home.clone(), false, "service") {
+          index.cancel = signal.clone();
           attempted.store(true, Ordering::Release);
           if index.acquire_writer().unwrap_or(false) {
             acquired.store(true, Ordering::Release);
             while !signal.load(Ordering::Acquire) {
-              let _ = index.drain_requests();
-              let _ = index.recover_pending_roots();
+              let result = index
+                .drain_requests()
+                .and_then(|()| index.recover_pending_roots());
+              if matches!(
+                result,
+                Err(IndexError::ReadOnly | IndexError::SchemaTooNew { .. } | IndexError::Cancelled)
+              ) {
+                index.conn.lease.borrow_mut().take();
+                break;
+              }
               for _ in 0..10 {
                 if signal.load(Ordering::Acquire) {
                   break;
@@ -3664,6 +4033,7 @@ impl WriterService {
             }
           }
         }
+        acquired.store(false, Ordering::Release);
         // Five seconds is the poll interval; shutdown checks do not clamp it.
         for _ in 0..50 {
           if signal.load(Ordering::Acquire) {
@@ -3693,6 +4063,18 @@ impl Drop for WriterService {
 pub(crate) fn sqlite_runtime_supported(number: i32) -> bool {
   number >= 3_051_003
 }
+
+struct ImportSnapshot {
+  home: Home,
+  created: Vec<String>,
+}
+impl Drop for ImportSnapshot {
+  fn drop(&mut self) {
+    for name in &self.created {
+      let _ = self.home.remove(name);
+    }
+  }
+}
 ````
 
 <!-- apply {"task": "M2.3", "file": "crates/kuntu-index/src/lib.rs", "mode": "file"} -->
@@ -3707,12 +4089,13 @@ use kuntu_core::{
   BackendError, EntryKind, IndexRebuildStats, IndexRefreshStats, IndexRepairStats, IndexRootStatus,
   MatchKind, MetadataIndex, SearchCandidate, SearchConfig, SearchQuery, SearchResult, SearchRoot,
 };
-use kuntu_crawler::{crawl, CrawlOptions};
+use kuntu_crawler::CrawlOptions;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter};
 mod engine;
 mod shared;
-use kuntu_store::{Home, Lease, ReaderGuard};
+use kuntu_store::{Home, ReaderGuard};
+mod walk;
 pub use shared::{Access, WriterService};
 
 pub type RebuildStats = IndexRebuildStats;
@@ -3751,6 +4134,7 @@ pub enum IndexError {
   LeaseRequired,
   EmptyScope,
   StaleScan,
+  Cancelled,
   RecreateFailed(Box<IndexError>),
   UnrecognizedDatabase { path: PathBuf },
 }
@@ -3761,6 +4145,7 @@ impl std::fmt::Display for IndexError {
       IndexError::ReadOnly => write!(formatter,"Store is read-only."),
       IndexError::LeaseRequired => write!(formatter,"An owned writer lease is required."),
       IndexError::EmptyScope => write!(formatter,"Search scope must be non-empty."),
+      IndexError::Cancelled => write!(formatter,"The scan was cancelled; its root remains recoverable."),
       IndexError::StaleScan => write!(formatter,"Scan generation or consumer policy changed."),
       IndexError::Engine(error) => write!(formatter, "index engine error: {error}"),
       IndexError::Io(error) => write!(formatter, "index io error: {error}"),
@@ -3833,7 +4218,7 @@ pub struct KuntuIndex {
   conn: engine::Connection,
   legacy: Option<kuntu_legacy_index::KuntuIndex>,
   home: Option<Home>,
-  lease: Option<Lease>,
+  cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
   _reader: Option<ReaderGuard>,
   shared: bool,
   consumer: String,
@@ -3945,7 +4330,9 @@ impl KuntuIndex {
       // The unmodified M1 crawler returns a snapshot; SQL batches never span
       // this blocking walk. Re-read policy after the walk and each commit.
       let crawl_config = self.index_config(root_id)?;
-      let (entries, stats) = crawl(&CrawlOptions::new(crawl_config));
+      let (entries, stats) =
+        walk::crawl_cancellable(&CrawlOptions::new(crawl_config), &self.cancel)?;
+      self.check_cancelled()?;
       skipped += stats.skipped;
       if !stats.errors.is_empty() {
         errors.extend(stats.errors);
@@ -3955,6 +4342,7 @@ impl KuntuIndex {
       self.check_scan(root_id, gen)?;
       let mut offset = 0;
       while offset < entries.len() {
+        self.check_cancelled()?;
         let started = std::time::Instant::now();
         let tx = self.conn.begin_writer_txn(false)?;
         self.check_scan(root_id, gen)?;
@@ -3963,6 +4351,7 @@ impl KuntuIndex {
           && rows < 5_000
           && (rows == 0 || started.elapsed() < std::time::Duration::from_millis(100))
         {
+          self.check_cancelled()?;
           let entry = &entries[offset];
           if !entry.decision.sensitive {
             let (id, needs_postings) = block_on(insert_entry_tx(&tx, root_id, entry, gen))?;
@@ -4122,6 +4511,7 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
+    self.recheck_read_access()?;
     if !config.roots.iter().any(|r| r.enabled) {
       return Err(IndexError::EmptyScope);
     }
@@ -4158,6 +4548,7 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
+    self.recheck_read_access()?;
     if self.legacy.is_some() {
       return Err(IndexError::RecreateRequired);
     }
@@ -4355,6 +4746,7 @@ impl KuntuIndex {
   }
 
   pub fn status(&self) -> Result<Vec<RootStatus>> {
+    self.recheck_read_access()?;
     if let Some(legacy) = &self.legacy {
       return legacy.status().map_err(legacy_error);
     }
@@ -4486,7 +4878,11 @@ impl CandidateScope {
   /// requested extension, and is either clean or allowed by the query flag or
   /// by its own root's allowance.
   fn admit(&self, query: &SearchQuery, entry: FetchedEntry) -> Option<CandidateRow> {
-    if entry.deleted || entry.sensitive || !self.allowed_roots.contains(&entry.root_id) {
+    if entry.deleted
+      || entry.sensitive
+      || kuntu_core::denies_sensitive_path(&entry.path)
+      || !self.allowed_roots.contains(&entry.root_id)
+    {
       return None;
     }
     let kind_allowed = match entry.kind {
@@ -6493,6 +6889,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod m2_acceptance;
+#[cfg(test)]
 mod m2_tests;
 
 fn legacy_error(e: kuntu_legacy_index::IndexError) -> IndexError {
@@ -7045,7 +7443,7 @@ fn consumer_removal_and_disable_invalidate_inflight_generation() {
   assert!(matches!(i.check_scan(id, gen), Err(IndexError::StaleScan)));
 }
 #[test]
-fn resume_keeps_generation_stale_completion_is_rejected_and_building_is_reported() {
+fn restart_uses_fresh_generation_stale_completion_is_rejected_and_building_is_reported() {
   let (_h, c, i) = fixture();
   let id = i
     .conn
@@ -7053,7 +7451,7 @@ fn resume_keeps_generation_stale_completion_is_rejected_and_building_is_reported
     .query_row("SELECT id FROM roots", [], |r| r.get(0))
     .unwrap();
   let gen = i.begin_scan(id).unwrap();
-  assert_eq!(gen, i.begin_scan(id).unwrap());
+  assert_eq!(gen + 1, i.begin_scan(id).unwrap());
   assert!(matches!(
     i.complete_scan(id, gen - 1),
     Err(IndexError::StaleScan)
@@ -7336,7 +7734,7 @@ fn restart_recovery_waits_for_live_holder_then_resumes_persisted_generation() {
       .query_row("SELECT active_scan_gen FROM root_state", [], |r| r
         .get::<_, i64>(0))
       .unwrap(),
-    gen
+    gen + 1
   );
   drop(service);
 }
@@ -7393,13 +7791,16 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
   let mut deleted = 0;
   let mut batches = 0;
   let mut max_ms = 0.0_f64;
+  let mut cursor = 0;
+  let mut inspected = 0;
   loop {
     let t = std::time::Instant::now();
-    let n = i.cleanup_stale_batch(root, 0).unwrap();
-    if n == 0 {
+    let batch = i.cleanup_stale_batch(root, 0, &mut cursor).unwrap();
+    inspected += batch.inspected;
+    if batch.done {
       break;
     }
-    deleted += n;
+    deleted += batch.deleted;
     batches += 1;
     max_ms = max_ms.max(t.elapsed().as_secs_f64() * 1000.0);
   }
@@ -7419,7 +7820,7 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
   }
   assert_eq!(i.doctor().unwrap(), "ok");
   eprintln!(
-    "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3} batches={batches} max_call_ms={max_ms:.3}"
+    "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3} batches={batches} inspected={inspected} max_call_ms={max_ms:.3}"
   );
   assert!(bytes <= 550_000_000, "550 MB size gate: {bytes} bytes");
 }
@@ -7476,7 +7877,7 @@ fn slow_delete_triggers_force_the_100_ms_cleanup_boundary() {
   let tx = i.conn.begin_writer_txn(false).unwrap();
   tx.conn.raw.execute_batch("CREATE TEMP TRIGGER slow_delete_trigger BEFORE DELETE ON entries BEGIN SELECT slow_delete(); END;").unwrap();
   block_on(tx.commit()).unwrap();
-  let n = i.cleanup_stale_batch(id, gen).unwrap();
+  let n = i.cleanup_stale_batch(id, gen, &mut 0).unwrap().deleted;
   assert!((1..=6).contains(&n), "one call deleted {n} slow rows");
   assert_eq!(i.root_state_name(&c.roots[0].path).unwrap(), "building");
   i.complete_scan(id, gen).unwrap();
@@ -7506,6 +7907,392 @@ fn caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor() {
     ),
     "caller-supplied build version bypassed the compiled minor floor"
   );
+}
+
+#[test]
+fn restarted_walk_removes_deleted_and_renamed_committed_files() {
+  let (h, c, mut index) = fixture();
+  let root: i64 = index
+    .conn
+    .raw
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
+    .unwrap();
+  let old = index.begin_scan(root).unwrap();
+  let tx = index.conn.begin_writer_txn(false).unwrap();
+  tx.conn
+    .raw
+    .execute("UPDATE entries SET scan_gen=?1", params![old])
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  std::fs::remove_file(c.roots[0].path.join("visible-file.md")).unwrap();
+  std::fs::rename(
+    c.roots[0].path.join(".hidden-file.md"),
+    c.roots[0].path.join("renamed-file.md"),
+  )
+  .unwrap();
+  drop(index);
+  index = KuntuIndex::open_shared(h, false, "strict").unwrap();
+  assert!(index.acquire_writer().unwrap());
+  index.rebuild(&c).unwrap();
+  assert!(index
+    .search(&c, &SearchQuery::new("visible file"))
+    .unwrap()
+    .is_empty());
+  assert_eq!(
+    index
+      .search(&c, &SearchQuery::new("renamed file"))
+      .unwrap()
+      .len(),
+    1
+  );
+  let mut fresh = KuntuIndex::open_memory().unwrap();
+  fresh.rebuild(&c).unwrap();
+  assert_eq!(index.snapshot().unwrap(), fresh.snapshot().unwrap());
+}
+#[test]
+fn preopened_old_writer_rechecks_after_migration_and_releases_capability() {
+  let h = home("preopened-skew");
+  let old = KuntuIndex::open_shared_minor(h.clone(), false, "old", 0).unwrap();
+  let preopened = Arc::new(Barrier::new(2));
+  let migrated = Arc::new(Barrier::new(2));
+  let a = preopened.clone();
+  let b = migrated.clone();
+  let thread = std::thread::spawn(move || {
+    let mut old = old;
+    a.wait();
+    b.wait();
+    assert!(matches!(old.acquire_writer(), Err(IndexError::ReadOnly)));
+    assert!(
+      old.conn.lease.borrow().is_none(),
+      "stale opener retained capability"
+    );
+    old
+  });
+  preopened.wait();
+  let mut current = KuntuIndex::open_shared(h.clone(), false, "new").unwrap();
+  assert!(current.acquire_writer().unwrap());
+  drop(current);
+  migrated.wait();
+  let old = thread.join().unwrap();
+  let mut supported = KuntuIndex::open_shared(h, false, "supported").unwrap();
+  assert!(supported.acquire_writer().unwrap());
+  drop(old);
+  // A floor raised while already holding also drops the capability at BEGIN.
+  supported
+    .conn
+    .raw
+    .execute("UPDATE meta SET value=2 WHERE key='min_writer_minor'", [])
+    .unwrap();
+  assert!(matches!(
+    supported.conn.begin_writer_txn(false),
+    Err(IndexError::ReadOnly)
+  ));
+  assert!(supported.conn.lease.borrow().is_none());
+}
+#[test]
+fn self_snapshot_import_uses_unique_inodes_and_preserves_all_source_hashes() {
+  let h = home("self-snapshot");
+  let root = h.path.join("files");
+  std::fs::create_dir(&root).unwrap();
+  std::fs::write(root.join("retained.md"), "x").unwrap();
+  let source = h.path.join("import-v2.db");
+  let raw = rusqlite::Connection::open(&source).unwrap();
+  raw
+    .execute_batch("CREATE TABLE roots(path TEXT,enabled INTEGER);PRAGMA user_version=2;")
+    .unwrap();
+  raw
+    .execute(
+      "INSERT INTO roots VALUES(?1,1)",
+      params![root.to_string_lossy()],
+    )
+    .unwrap();
+  drop(raw);
+  for ext in ["-wal", "-shm"] {
+    std::fs::write(h.path.join(format!("import-v2.db{ext}")), []).unwrap();
+  }
+  let before: Vec<_> = ["", "-wal", "-shm"]
+    .iter()
+    .map(|e| std::fs::read(h.path.join(format!("import-v2.db{e}"))).unwrap())
+    .collect();
+  let mut index = KuntuIndex::open_shared(h.clone(), false, "importer").unwrap();
+  assert!(index.acquire_writer().unwrap());
+  assert_eq!(index.import_v2(&source).unwrap().entries, 2);
+  let after: Vec<_> = ["", "-wal", "-shm"]
+    .iter()
+    .map(|e| std::fs::read(h.path.join(format!("import-v2.db{e}"))).unwrap())
+    .collect();
+  assert_eq!(before, after, "import modified its own retained source");
+  assert_eq!(
+    std::fs::read_dir(&h.path)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .filter(|e| e.file_name().to_string_lossy().starts_with("import-"))
+      .count(),
+    3
+  );
+}
+#[test]
+fn current_sensitive_policy_denies_historical_rows_during_interrupted_reconciliation() {
+  let (h, c, index) = fixture();
+  let root: i64 = index
+    .conn
+    .raw
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
+    .unwrap();
+  let tx = index.conn.begin_writer_txn(false).unwrap();
+  let path = c.roots[0].path.join("credentials-public.md");
+  tx.conn.raw.execute("INSERT INTO entries(root_id,path,name,kind,flags,scan_gen) VALUES(?1,?2,'credentials-public.md',1,0,0)",params![root,path.to_string_lossy()]).unwrap();
+  block_on(insert_terms_tx(&tx, tx.conn.raw.last_insert_rowid(), &path)).unwrap();
+  tx.conn
+    .raw
+    .execute(
+      "UPDATE meta SET value='historical' WHERE key='policy_hash'",
+      [],
+    )
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  let reader = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+  assert!(
+    reader
+      .search(&c, &SearchQuery::new("credentials public"))
+      .unwrap()
+      .is_empty(),
+    "trusted historical flags"
+  );
+  drop(index);
+  let mut holder = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  assert!(holder.acquire_writer().unwrap());
+  assert_eq!(holder.root_state_name(&c.roots[0].path).unwrap(), "dirty");
+  assert_eq!(
+    holder
+      .conn
+      .raw
+      .query_row("SELECT value FROM meta WHERE key='policy_hash'", [], |r| {
+        r.get::<_, String>(0)
+      })
+      .unwrap(),
+    kuntu_core::sensitive_policy_identity()
+  );
+  let interrupted = holder.begin_scan(root).unwrap();
+  drop(holder);
+  assert!(reader
+    .search(&c, &SearchQuery::new("credentials public"))
+    .unwrap()
+    .is_empty());
+  let mut holder = KuntuIndex::open_shared(h, false, "strict").unwrap();
+  assert!(holder.acquire_writer().unwrap());
+  holder.recover_pending_roots().unwrap();
+  assert!(matches!(
+    holder.complete_scan(root, interrupted),
+    Err(IndexError::StaleScan)
+  ));
+  assert!(!holder
+    .snapshot()
+    .unwrap()
+    .contains_key(path.to_str().unwrap()));
+  assert_eq!(holder.root_state_name(&c.roots[0].path).unwrap(), "ready");
+}
+#[test]
+fn long_lived_rust_readers_recheck_floor_for_search_status_and_probes() {
+  let (h, c, index) = fixture();
+  let reader = KuntuIndex::open_shared(h, true, "strict").unwrap();
+  let tx = index.conn.begin_writer_txn(false).unwrap();
+  tx.conn
+    .raw
+    .execute("UPDATE meta SET value=2 WHERE key='min_reader_minor'", [])
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  assert!(matches!(
+    reader.search(&c, &SearchQuery::new("file")),
+    Err(IndexError::SchemaTooNew { .. })
+  ));
+  assert!(matches!(
+    reader.status(),
+    Err(IndexError::SchemaTooNew { .. })
+  ));
+  assert!(matches!(
+    reader.root_state_name(&c.roots[0].path),
+    Err(IndexError::SchemaTooNew { .. })
+  ));
+  assert!(matches!(
+    reader.poll_changes(),
+    Err(IndexError::SchemaTooNew { .. })
+  ));
+  assert!(matches!(
+    reader.point_probe(),
+    Err(IndexError::SchemaTooNew { .. })
+  ));
+}
+#[test]
+fn cleanup_seek_limits_inspection_even_across_large_current_generation_gaps() {
+  let (_, _, index) = fixture();
+  let root: i64 = index
+    .conn
+    .raw
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
+    .unwrap();
+  let gen = index.begin_scan(root).unwrap();
+  let tx = index.conn.begin_writer_txn(false).unwrap();
+  for n in 0..15000 {
+    tx.conn
+      .raw
+      .execute(
+        "INSERT INTO entries(root_id,path,name,kind,scan_gen) VALUES(?1,?2,'current',1,?3)",
+        params![root, format!("/current/{n}"), gen],
+      )
+      .unwrap();
+  }
+  tx.conn
+    .raw
+    .execute(
+      "INSERT INTO entries(root_id,path,name,kind,scan_gen) VALUES(?1,'/stale','stale',1,0)",
+      params![root],
+    )
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  let mut cursor = 0;
+  let first = index.cleanup_stale_batch(root, gen, &mut cursor).unwrap();
+  assert!(first.inspected <= 5000);
+  assert!(cursor <= 5000, "seek scanned past inspection budget");
+  let mut q = index
+    .conn
+    .raw
+    .prepare(&format!(
+      "EXPLAIN QUERY PLAN {}",
+      shared::cleanup_seek_sql()
+    ))
+    .unwrap();
+  let plan = q
+    .query_map(params![0], |r| r.get::<_, String>(3))
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+    .join("|");
+  assert!(plan.contains("rowid>?") && !plan.contains("SCAN"), "{plan}");
+  index.complete_scan(root, gen).unwrap();
+  assert!(!index.snapshot().unwrap().contains_key("/stale"));
+}
+
+static CLEANUP_DELAY: std::sync::Mutex<Option<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>> =
+  std::sync::Mutex::new(None);
+pub(super) fn cleanup_delay(home: Option<&Home>) {
+  let hook = CLEANUP_DELAY.lock().unwrap().clone();
+  if let Some((path, seen)) = hook {
+    if home.is_some_and(|h| h.path == path) {
+      seen.store(true, std::sync::atomic::Ordering::Release);
+      std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+  }
+}
+#[test]
+fn shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover() {
+  let (h, c, index) = fixture();
+  let root: i64 = index
+    .conn
+    .raw
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
+    .unwrap();
+  let tx = index.conn.begin_writer_txn(false).unwrap();
+  for n in 0..100 {
+    tx.conn
+      .raw
+      .execute(
+        "INSERT INTO entries(root_id,path,name,kind,scan_gen) VALUES(?1,?2,'stale',1,0)",
+        params![root, format!("/stale/{n}")],
+      )
+      .unwrap();
+  }
+  tx.conn
+    .raw
+    .execute("UPDATE root_state SET status='dirty',dirty=1", [])
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  drop(index);
+  let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  *CLEANUP_DELAY.lock().unwrap() = Some((h.path.clone(), seen.clone()));
+  struct Hook;
+  impl Drop for Hook {
+    fn drop(&mut self) {
+      *CLEANUP_DELAY.lock().unwrap() = None;
+    }
+  }
+  let _hook = Hook;
+  let reader = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+  let service = WriterService::start(h.clone());
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+  let mut probes = 0;
+  let mut max = std::time::Duration::ZERO;
+  while !seen.load(std::sync::atomic::Ordering::Acquire) {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "worker did not enter cleanup"
+    );
+    let t = std::time::Instant::now();
+    reader.point_probe().unwrap();
+    max = max.max(t.elapsed());
+    probes += 1;
+  }
+  let start = std::time::Instant::now();
+  drop(service);
+  let shutdown = start.elapsed();
+  assert!(
+    shutdown < std::time::Duration::from_millis(500),
+    "cleanup shutdown took {shutdown:?}"
+  );
+  assert!(
+    probes > 0 && max < std::time::Duration::from_millis(100),
+    "readers: {probes} max={max:?}"
+  );
+  assert_eq!(
+    reader.root_state_name(&c.roots[0].path).unwrap(),
+    "building"
+  );
+  let mut next = KuntuIndex::open_shared(h, false, "strict").unwrap();
+  assert!(next.acquire_writer().unwrap());
+  eprintln!(
+    "CLEANUP_HANDOFF shutdown_ms={:.3} reader_probes={probes} reader_max_ms={:.3}",
+    shutdown.as_secs_f64() * 1000.0,
+    max.as_secs_f64() * 1000.0
+  );
+  drop(_hook);
+  next.recover_pending_roots().unwrap();
+  assert_eq!(next.root_state_name(&c.roots[0].path).unwrap(), "ready");
+}
+#[test]
+fn holder_service_drops_unusable_capability_after_writer_floor_changes() {
+  let (h, c, index) = fixture();
+  drop(index);
+  let control = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  let service = WriterService::start(h.clone());
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+  while !service.is_holder() {
+    assert!(std::time::Instant::now() < deadline);
+    std::thread::yield_now();
+  }
+  let tx = control.conn.begin_writer_txn(false).unwrap();
+  tx.conn
+    .raw
+    .execute("UPDATE meta SET value=2 WHERE key='min_writer_minor'", [])
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+  while service.is_holder() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "service retained stale lease"
+    );
+    std::thread::yield_now();
+  }
+  assert!(h.lock("indexer.lock", false).unwrap().is_some());
+  control
+    .conn
+    .raw
+    .execute("UPDATE meta SET value=1 WHERE key='min_writer_minor'", [])
+    .unwrap();
+  let mut next = KuntuIndex::open_shared(h, false, "strict").unwrap();
+  assert!(next.acquire_writer().unwrap());
+  next.rebuild(&c).unwrap();
+  drop(service);
 }
 ````
 
@@ -7544,6 +8331,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = KuntuIndex::open_shared(home.clone(), false, "probe")?;
     drop(index);
     println!("{}", home.id()?);
+    return Ok(());
+  }
+  if a[1] == "gc-init" {
+    let guard = home.lifetime(2)?;
+    drop(guard);
+    for ext in ["", "-wal", "-shm"] {
+      use std::io::Write;
+      home
+        .file(&format!("index.v2.db{ext}"), true)?
+        .write_all(b"old epoch member")?;
+    }
+    assert!(!home.gc_epoch(2, 1)?);
+    return Ok(());
+  }
+  if a[1] == "gc" {
+    assert!(home.gc_epoch(2, 31 * 86400)?);
+    return Ok(());
+  }
+  if a[1] == "reuse-old" {
+    let _guard = home.lifetime(2)?;
+    for ext in ["", "-wal", "-shm"] {
+      assert!(!home.exists(&format!("index.v2.db{ext}"))?);
+    }
+    assert!(!home.exists("gc-2.json")?);
+    println!("gc resumed before epoch reuse");
     return Ok(());
   }
   if a[1] == "quarantine" {
@@ -7684,9 +8496,560 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ````
 
+
+<!-- apply {"task": "M2.3", "file": "crates/kuntu-core/src/policy.rs", "mode": "file"} -->
+````rust
+//! Root scoping, default ignore rules, and sensitive-path denial.
+//!
+//! Providers are allowed to be broad candidate generators. This policy is the
+//! core gate that prevents hidden, generated, ignored, or sensitive paths from
+//! leaking into ranked search results by default.
+
+use std::path::{Component, Path};
+
+use crate::model::{expand_tilde, lowercase_extension, PolicyDecision, SearchConfig, SearchQuery};
+
+#[derive(Debug, Clone)]
+pub struct PathPolicy {
+  config: SearchConfig,
+}
+
+impl PathPolicy {
+  pub fn new(config: SearchConfig) -> Self {
+    Self { config }
+  }
+
+  pub fn evaluate(&self, path: &Path, query: Option<&SearchQuery>) -> PolicyDecision {
+    let path = expand_tilde(path.to_path_buf());
+    let root = self.matching_root(&path);
+    let full_components = normal_components(&path);
+    let relative_components = root
+      .and_then(|root| path.strip_prefix(&root.path).ok())
+      .map(normal_components)
+      .unwrap_or_else(|| full_components.clone());
+    let hidden = is_hidden(&relative_components);
+    let ignored = is_ignored(&path, &relative_components);
+    let sensitive = is_sensitive(&path, &full_components);
+    let mut reasons = Vec::new();
+
+    let mut allowed = true;
+    let Some(root) = root else {
+      allowed = false;
+      reasons.push("outside-configured-roots".to_string());
+      return PolicyDecision {
+        path,
+        allowed,
+        root: None,
+        root_priority: 0,
+        hidden,
+        ignored,
+        sensitive,
+        reasons,
+      };
+    };
+
+    reasons.push("inside-root".to_string());
+    if sensitive {
+      allowed = false;
+      reasons.push("sensitive-deny".to_string());
+    }
+
+    let include_hidden = query.is_some_and(|query| query.include_hidden) || root.include_hidden;
+    if hidden && !include_hidden {
+      allowed = false;
+      reasons.push("hidden-deny".to_string());
+    }
+
+    let include_ignored = query.is_some_and(|query| query.include_ignored) || root.include_ignored;
+    if ignored && !include_ignored {
+      allowed = false;
+      reasons.push("ignored-deny".to_string());
+    }
+
+    PolicyDecision {
+      path,
+      allowed,
+      root: Some(root.path.clone()),
+      root_priority: root.priority,
+      hidden,
+      ignored,
+      sensitive,
+      reasons,
+    }
+  }
+
+  fn matching_root(&self, path: &Path) -> Option<&crate::model::SearchRoot> {
+    self
+      .config
+      .roots
+      .iter()
+      .filter(|root| root.enabled && path.starts_with(&root.path))
+      .max_by_key(|root| root.path.components().count())
+  }
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+  path
+    .components()
+    .filter_map(|component| match component {
+      Component::Normal(value) => value.to_str().map(ToOwned::to_owned),
+      _ => None,
+    })
+    .collect()
+}
+
+fn is_hidden(components: &[String]) -> bool {
+  components
+    .iter()
+    .any(|component| component.starts_with('.') && component != "." && component != "..")
+}
+
+fn is_ignored(path: &Path, components: &[String]) -> bool {
+  let ignored_components = [
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    "dist",
+    "build",
+    ".turbo",
+    ".cache",
+    "vendor",
+    "Pods",
+    "DerivedData",
+    ".gradle",
+    "coverage",
+  ];
+  if components
+    .iter()
+    .any(|component| ignored_components.contains(&component.as_str()))
+  {
+    return true;
+  }
+  path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .is_some_and(|name| name == ".DS_Store")
+}
+
+const SENSITIVE_COMPONENTS: &[&str] = &[
+  ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
+];
+const SENSITIVE_SUBSTRINGS: &[&str] = &["credentials", "secret"];
+const SENSITIVE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
+/// Compiled rule identity, derived from the same tables used for admission.
+/// The algorithm version covers matching semantics, including .env names.
+pub fn sensitive_policy_identity() -> String {
+  format!(
+    "sensitive-v2|components:{}|substrings:{}|extensions:{}|env:.env,.env.*",
+    SENSITIVE_COMPONENTS.join(","),
+    SENSITIVE_SUBSTRINGS.join(","),
+    SENSITIVE_EXTENSIONS.join(",")
+  )
+}
+/// Current sensitive denial never trusts a producer's persisted flags.
+pub fn denies_sensitive_path(path: &Path) -> bool {
+  is_sensitive(path, &normal_components(path))
+}
+fn is_sensitive(path: &Path, components: &[String]) -> bool {
+  if components.iter().any(|component| {
+    let lower = component.to_ascii_lowercase();
+    SENSITIVE_COMPONENTS.contains(&component.as_str())
+      || SENSITIVE_SUBSTRINGS
+        .iter()
+        .any(|needle| lower.contains(needle))
+  }) {
+    return true;
+  }
+  if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+      return true;
+    }
+  }
+  lowercase_extension(path)
+    .is_some_and(|extension| SENSITIVE_EXTENSIONS.contains(&extension.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::path::PathBuf;
+
+  use crate::{SearchConfig, SearchQuery, SearchRoot};
+
+  use super::*;
+
+  /// Fixture roots live under the platform's own temporary directory so the
+  /// drive/prefix shape matches what a real caller passes on every platform.
+  /// Fixture roots start at the platform's volume root and use only
+  /// controlled components: a real temporary directory can carry ambient
+  /// names (`.ssh`, `credentials`, `target`, ...) that `is_sensitive` and
+  /// `is_ignored` would legitimately classify, making the tests
+  /// environment-dependent. The paths are never created; evaluation is
+  /// pure logic.
+  fn fixture_root(name: &str) -> PathBuf {
+    let mut base = PathBuf::new();
+    for component in std::env::temp_dir().components() {
+      match component {
+        Component::Prefix(_) | Component::RootDir => base.push(component.as_os_str()),
+        _ => break,
+      }
+    }
+    base.join(format!("kuntu-core-{name}-{}", std::process::id()))
+  }
+
+  fn policy() -> (PathPolicy, PathBuf) {
+    let root = SearchRoot::new(fixture_root("policy")).with_priority(10);
+    let configured = root.path.clone();
+    (
+      PathPolicy::new(SearchConfig { roots: vec![root] }),
+      configured,
+    )
+  }
+
+  #[test]
+  fn allows_paths_inside_enabled_roots() {
+    let (policy, root) = policy();
+    let decision = policy.evaluate(&root.join("project").join("main.rs"), None);
+
+    assert!(decision.allowed);
+    assert_eq!(decision.root, Some(root.clone()));
+    assert_eq!(decision.root_priority, 10);
+    assert_eq!(decision.reasons, vec!["inside-root"]);
+  }
+
+  #[test]
+  fn denies_paths_outside_configured_roots() {
+    let (policy, _root) = policy();
+    let outside = fixture_root("elsewhere");
+    let decision = policy.evaluate(&outside.join("documents").join("report.pdf"), None);
+
+    assert!(!decision.allowed);
+    assert_eq!(decision.root, None);
+    assert!(decision
+      .reasons
+      .contains(&"outside-configured-roots".to_string()));
+  }
+
+  #[test]
+  fn denies_generated_directories_by_default() {
+    let (policy, root) = policy();
+    let decision = policy.evaluate(
+      &root
+        .join("app")
+        .join("node_modules")
+        .join("pkg")
+        .join("index.js"),
+      None,
+    );
+
+    assert!(!decision.allowed);
+    assert!(decision.ignored);
+    assert!(decision.reasons.contains(&"ignored-deny".to_string()));
+  }
+
+  #[test]
+  fn denies_sensitive_paths_even_when_ignored_paths_are_allowed() {
+    let (policy, root) = policy();
+    let query = SearchQuery {
+      include_ignored: true,
+      include_hidden: true,
+      ..SearchQuery::new("id_rsa")
+    };
+    let decision = policy.evaluate(&root.join(".ssh").join("id_rsa"), Some(&query));
+
+    assert!(!decision.allowed);
+    assert!(decision.sensitive);
+    assert!(decision.reasons.contains(&"sensitive-deny".to_string()));
+  }
+
+  #[test]
+  fn query_can_include_hidden_non_sensitive_paths() {
+    let (policy, root) = policy();
+    let query = SearchQuery {
+      include_hidden: true,
+      ..SearchQuery::new("config")
+    };
+    let decision = policy.evaluate(&root.join(".config").join("readme.md"), Some(&query));
+
+    assert!(decision.allowed);
+    assert!(decision.hidden);
+  }
+
+  #[test]
+  fn root_can_include_ignored_paths() {
+    let root = SearchRoot::new(fixture_root("policy")).include_ignored(true);
+    let configured = root.path.clone();
+    let policy = PathPolicy::new(SearchConfig { roots: vec![root] });
+    let decision = policy.evaluate(
+      &configured
+        .join("project")
+        .join("target")
+        .join("debug")
+        .join("app"),
+      None,
+    );
+
+    assert!(decision.allowed);
+    assert!(decision.ignored);
+  }
+
+  #[test]
+  fn explicit_root_under_hidden_parent_does_not_hide_every_child() {
+    let root = SearchRoot::new(
+      fixture_root("hidden-parent")
+        .join(".codex")
+        .join("worktree")
+        .join("project"),
+    );
+    let configured = root.path.clone();
+    let policy = PathPolicy::new(SearchConfig { roots: vec![root] });
+
+    let decision = policy.evaluate(&configured.join("src").join("main.rs"), None);
+
+    assert!(decision.allowed);
+    assert!(!decision.hidden);
+  }
+
+  #[test]
+  fn hidden_directories_inside_explicit_root_are_still_hidden() {
+    let root = SearchRoot::new(
+      fixture_root("hidden-parent")
+        .join(".codex")
+        .join("worktree")
+        .join("project"),
+    );
+    let configured = root.path.clone();
+    let policy = PathPolicy::new(SearchConfig { roots: vec![root] });
+
+    let decision = policy.evaluate(&configured.join(".cache").join("file"), None);
+
+    assert!(!decision.allowed);
+    assert!(decision.hidden);
+  }
+}
+````
+
+
+<!-- apply {"task": "M2.3", "file": "crates/kuntu-index/src/walk.rs", "mode": "file"} -->
+````rust
+//! Cancellable snapshot walk for M2 hosts; the protected crawler stays unchanged.
+use crate::{IndexError, Result};
+use kuntu_core::{EntryKind, PathPolicy};
+use kuntu_crawler::{CrawlOptions, CrawlStats, CrawledEntry};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::UNIX_EPOCH;
+
+pub(crate) fn crawl_cancellable(
+  options: &CrawlOptions,
+  stop: &AtomicBool,
+) -> Result<(Vec<CrawledEntry>, CrawlStats)> {
+  let policy = PathPolicy::new(options.config.clone());
+  let mut entries = Vec::new();
+  let mut stats = CrawlStats {
+    visited: 0,
+    yielded: 0,
+    skipped: 0,
+    errors: Vec::new(),
+  };
+  for root in options.config.roots.iter().filter(|r| r.enabled) {
+    visit(
+      &root.path,
+      0,
+      options,
+      &policy,
+      stop,
+      &mut entries,
+      &mut stats,
+    )?;
+  }
+  Ok((entries, stats))
+}
+fn check(stop: &AtomicBool) -> Result<()> {
+  if stop.load(Ordering::Acquire) {
+    Err(IndexError::Cancelled)
+  } else {
+    Ok(())
+  }
+}
+fn visit(
+  path: &Path,
+  depth: usize,
+  options: &CrawlOptions,
+  policy: &PathPolicy,
+  stop: &AtomicBool,
+  entries: &mut Vec<CrawledEntry>,
+  stats: &mut CrawlStats,
+) -> Result<()> {
+  check(stop)?;
+  stats.visited += 1;
+  let decision = policy.evaluate(path, Some(&options.query));
+  if !decision.allowed {
+    stats.skipped += 1;
+    return Ok(());
+  }
+  let metadata = match std::fs::symlink_metadata(path) {
+    Ok(m) => m,
+    Err(e) => {
+      stats.errors.push(format!("{}: {e}", path.display()));
+      return Ok(());
+    }
+  };
+  check(stop)?;
+  let kind = if metadata.is_dir() {
+    EntryKind::Directory
+  } else if metadata.is_file() {
+    EntryKind::File
+  } else {
+    EntryKind::Other
+  };
+  let mtime = metadata
+    .modified()
+    .ok()
+    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+    .and_then(|d| i64::try_from(d.as_secs()).ok());
+  entries.push(CrawledEntry {
+    path: decision.path.clone(),
+    kind,
+    size: metadata.is_file().then_some(metadata.len()),
+    mtime,
+    decision,
+  });
+  stats.yielded += 1;
+  if metadata.is_dir() && options.max_depth.is_none_or(|max| depth < max) {
+    let children = match std::fs::read_dir(path) {
+      Ok(r) => r,
+      Err(e) => {
+        stats.errors.push(format!("{}: {e}", path.display()));
+        return Ok(());
+      }
+    };
+    check(stop)?;
+    for child in children {
+      check(stop)?;
+      match child {
+        Ok(child) => visit(
+          &child.path(),
+          depth + 1,
+          options,
+          policy,
+          stop,
+          entries,
+          stats,
+        )?,
+        Err(e) => stats.errors.push(format!("{}: {e}", path.display())),
+      }
+    }
+  }
+  Ok(())
+}
+````
+
+
+<!-- apply {"task": "M2.3", "file": "crates/kuntu-index/src/m2_acceptance.rs", "mode": "file"} -->
+````rust
+//! Strict M2 acceptance; performance misses are reported as open RED items.
+use super::*;
+fn ceiling_ms(class: &str, budget: usize) -> f64 {
+  if budget == 50_000 {
+    return 150.0;
+  }
+  match class {
+    "miss" | "miss_non_ascii" => 2.0,
+    "rare" | "mid" => 10.0,
+    "prefix1" => 40.0,
+    _ => 25.0,
+  }
+}
+#[test]
+fn m2_ceilings_reject_the_m1_only_latency_range() {
+  assert_eq!(ceiling_ms("miss", 5000), 2.0);
+  assert_eq!(ceiling_ms("rare", 5000), 10.0);
+  assert_eq!(ceiling_ms("mid", 5000), 10.0);
+  assert!(
+    26.0 > ceiling_ms("broad", 5000),
+    "M1-only 26 ms was accepted"
+  );
+  assert_eq!(ceiling_ms("prefix1", 5000), 40.0);
+  assert!(151.0 > ceiling_ms("broad", 50000));
+}
+#[test]
+#[ignore = "strict 1M M2 latency acceptance; retain every miss"]
+fn realistic_fixture_m2_latency_acceptance() {
+  let rows = std::env::var("KUNTU_BENCH_ROWS")
+    .unwrap()
+    .parse::<usize>()
+    .unwrap();
+  assert_eq!(rows, 1_000_000);
+  let f = fixture::open_or_build(rows);
+  let q = &f.queries;
+  let classes = vec![
+    ("miss", "zzqqx".to_string()),
+    ("miss_non_ascii", "zzqqé".to_string()),
+    ("rare", q.rare.clone()),
+    ("mid", q.mid.clone()),
+    ("broad", q.broad.clone()),
+    ("prefix3", q.prefix3.clone()),
+    ("mixed", q.mixed.clone()),
+    ("all_rows", q.all_rows.clone()),
+    ("prefix1", q.prefix1.clone()),
+  ];
+  let mut measurements = Vec::new();
+  let mut misses = Vec::new();
+  for budget in [5000, 50000] {
+    for (class, text) in &classes {
+      let query = SearchQuery::new(text).with_limit(20);
+      let options = SearchOptions {
+        fetch_budget: budget,
+      };
+      let mut count = 0;
+      let best = fixture::measure_warm_best(|| {
+        let start = std::time::Instant::now();
+        let outcome = f
+          .index
+          .search_with_options(&f.config, &query, options)
+          .unwrap();
+        count = outcome.candidate_count;
+        start.elapsed()
+      });
+      let ms = best.as_secs_f64() * 1000.0;
+      let ceiling = ceiling_ms(class, budget);
+      let pass = ms <= ceiling;
+      eprintln!("M2_GATE class={class} budget={budget} best_ms={ms:.3} ceiling_ms={ceiling:.1} candidates={count} pass={pass}");
+      measurements.push(serde_json::json!({"class":class,"budget":budget,"best_ms":ms,"ceiling_ms":ceiling,"candidates":count,"pass":pass}));
+      if !pass {
+        misses.push(format!("{class}/{budget} {ms:.3}>{ceiling} ms"));
+      }
+    }
+  }
+  let output = PathBuf::from(
+    std::env::var_os("KUNTU_ACCEPTANCE_DIR").expect("acceptance artifacts under scratch"),
+  );
+  std::fs::create_dir_all(&output).unwrap();
+  std::fs::write(
+    output.join("m2-latency.json"),
+    serde_json::to_vec_pretty(&measurements).unwrap(),
+  )
+  .unwrap();
+  assert!(
+    misses.is_empty(),
+    "M2_ACCEPTANCE_MISS: {}",
+    misses.join("; ")
+  );
+}
+````
+
 ## Task M2.4: access, atomic migrations and quarantine
 
-RED/GREEN: `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`. Also run `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `every_write_transaction_rechecks_minor_and_rolls_back`, `private_open_cannot_bypass_a_shared_store_lease`, and the process `migration_ddl` / `quarantine_renamed` fault cases. The engine file above contains the complete runner, compatibility path and marker recovery, not unused helpers.
+RED/GREEN: `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`. Also run `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `every_write_transaction_rechecks_minor_and_rolls_back`, `private_open_cannot_bypass_a_shared_store_lease`, `preopened_old_writer_rechecks_after_migration_and_releases_capability`, `long_lived_rust_readers_recheck_floor_for_search_status_and_probes`, durable-marker/GC-reuse tests and migration plus every namespace-member fault case. The engine file above contains the complete runner, compatibility path and marker recovery, not unused helpers.
 
 ## Task M2.5: guarded batches and reader notification
 
@@ -7694,15 +9057,15 @@ RED/GREEN: `batch_generation_is_atomic_and_readers_observe_data_version`. `slow_
 
 ## Task M2.6: restart/resume state machine
 
-RED/GREEN: `resume_keeps_generation_stale_completion_is_rejected_and_building_is_reported`. Also run `consumer_removal_and_disable_invalidate_inflight_generation` and `restart_recovery_waits_for_live_holder_then_resumes_persisted_generation`. Resume re-walks with the same generation and retains unchanged postings; changed policy uses a new generation. The service reconstructs recovery work from persisted memberships, never client state, and only after obtaining its capability.
+RED/GREEN: `restart_uses_fresh_generation_stale_completion_is_rejected_and_building_is_reported`. Also run `consumer_removal_and_disable_invalidate_inflight_generation` and `restart_recovery_waits_for_live_holder_then_resumes_persisted_generation`. Every restarted walk takes a fresh visitation generation while retaining unchanged postings for rows actually visited again. Deleted/renamed committed rows are removed before ready. The 30%/70% kill tests mutate the committed files and compare against fresh crawls. The service reconstructs recovery work from persisted memberships, never client state, and only after obtaining its capability.
 
 ## Task M2.7: persistent takeover and joined shutdown
 
-RED/GREEN: `joined_takeover_service_releases_lease_only_after_worker_stops`. `WriterService::start` is public and wired into the hosts below. The process probe covers a real holder death, five-second polling, child exec and capability transfer. The worker joins before its service can release the lease. Read-only hosts are configured to use a separate signed helper; `openReadOnly` never starts an indexer in the read-only application.
+RED/GREEN: `joined_takeover_service_releases_lease_only_after_worker_stops`. `WriterService::start` is public and wired into the hosts below. The process probe covers a real holder death, five-second polling, child exec and capability transfer. The worker joins before its service can release the lease. `shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover` interrupts an active cleanup and requires a sub-500 ms joined shutdown with successful concurrent readers; `holder_service_drops_unusable_capability_after_writer_floor_changes` proves a downgrade exits the holder loop. Signed-helper integration belongs to M2-K; `openReadOnly` never starts an indexer.
 
 ## Task M2.8: NAPI access propagation and exact old constructor
 
-Install complete adapter, generated JS/declarations and Node tests. The string constructor remains private and opens exactly its path; a real v2 fixture exercises that backend. The object constructor, `openShared`, `withHome`, `openReadOnly`, `openClient`, `requestRebuild`, `mode`, `registerRoots` and `close` are additive. Every task carries access, kind and consumer. Shared instances pool a read connection and re-check its floor after the mutex wait. `openClient` registers and submits requests without an indexer; `openShared` reports effective compatibility access and starts a service only when writable. Read-only rebuild/refresh/repair/registration fail; shared bulk requests enter the inbox. Scope and phase are exposed in the DTOs. RED/GREEN is the Node test `openReadOnly enforces access on rebuild refresh repair and registration`; also run `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` and `strict consumer ignores permissive indexing union and supplied query flags`.
+Install complete adapter, generated JS/declarations and Node tests. The string constructor remains private and opens exactly its path; a real v2 fixture exercises that backend. The object constructor, `openShared`, `withHome`, `openReadOnly`, `openClient`, `requestRebuild`, `mode`, `writerLeaseHeld`, `registerRoots` and `close` are additive. Every task carries access, kind and consumer. Shared instances pool a read connection and re-check its floor after the mutex wait. `openClient` registers and submits requests without an indexer; `openShared` reports effective compatibility access and starts a service only when writable. Read-only rebuild/refresh/repair/registration fail; shared bulk requests enter the inbox. Scope and phase are exposed in the DTOs. RED/GREEN is the Node test `openReadOnly enforces access on rebuild refresh repair and registration`; also run `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` and `strict consumer ignores permissive indexing union and supplied query flags`.
 
 <!-- apply {"task": "M2.8", "file": "crates/kuntu-napi/Cargo.toml", "mode": "file"} -->
 ````toml
@@ -7930,6 +9293,14 @@ impl FileSearchIndex {
   pub fn close(&mut self) {
     self._reader.take();
     self._service.take();
+  }
+  /// Informational capability state; bulk methods still validate the owned lease.
+  #[napi]
+  pub fn writer_lease_held(&self) -> bool {
+    self
+      ._service
+      .as_ref()
+      .is_some_and(|service| service.is_holder())
   }
   #[napi]
   pub fn mode(&self) -> String {
@@ -9134,6 +10505,8 @@ export declare class FileSearchIndex {
   requestRebuild(roots: Array<SearchRootInput>): string
   static openReadOnly(home?: string | undefined | null, consumer?: string | undefined | null): FileSearchIndex
   close(): void
+  /** Informational capability state; bulk methods still validate the owned lease. */
+  writerLeaseHeld(): boolean
   mode(): string
   registerRoots(roots: Array<SearchRootInput>): void
   constructor(input: string | SharedStoreOptions)
@@ -9344,7 +10717,7 @@ test("openClient registers and queues without starting an indexer", async () => 
 
 ## Task M2.9: CLI, bounded daemon and import dispatch
 
-Install complete host files and the final generated lockfile. RED/GREEN: `non_holder_bulk_endpoint_queues_and_empty_search_is_rejected`. CLI default home is shared; `--db` retains the private compatibility path. Watch requires a capability; daemon read endpoints open read-only and bulk endpoints queue. Four scoped workers, eight pending connections, no detached connection threads. `kfs store info|gc|doctor|import SOURCE` has parsing and dispatch. Import acquires a destination capability, copies source sidecars without modifying them and rebuilds enabled roots. Also run `strict_daemon_admission_ignores_another_consumers_union`.
+Install complete host files and the final generated lockfile. RED/GREEN: `non_holder_bulk_endpoint_queues_and_empty_search_is_rejected`. CLI default home is shared; `--db` retains the private compatibility path. Watch requires a capability; daemon read endpoints open read-only and bulk endpoints queue. Four scoped workers, eight pending connections, no detached connection threads. `kfs store info|gc|doctor|import SOURCE` has parsing and dispatch. Import acquires a destination capability, uses a unique snapshot, rejects all source/destination inode overlaps before copying and preserves source sidecars and rebuilds enabled roots. Also run `strict_daemon_admission_ignores_another_consumers_union`.
 
 <!-- apply {"task": "M2.9", "file": "crates/kuntu-cli/Cargo.toml", "mode": "file"} -->
 ````toml
@@ -12200,6 +13573,7 @@ name = "kuntu-index"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "getrandom 0.3.4",
  "kuntu-core",
  "kuntu-crawler",
  "kuntu-legacy-index",
@@ -14135,7 +15509,14 @@ dependencies = [
 
 RED/GREEN: `store_import_parser_accepts_source_and_rejects_missing_source`. Install the foreground controllers below. `real_turso_v2_import_rebuilds_and_preserves_source_sidecars` tests the library; the process `import` case invokes the actual `kfs store import` command against a full turso-generated v2 schema, compares source hashes and verifies 200,001 rebuilt entries. `cli_scope` exercises strict admission through CLI flags.
 
-Xross moves `xross_search_exports` into its own DB, replaces its direct turso reader with the shared v3 reader, and builds `SearchScope` from host-authorized export root IDs. Its host chooses a stable consumer ID; peers never supply that ID or use index policy as authorization. Kunkun builds/signs the `kfs daemon` helper as `kuntud`, gives that helper TCC grants, and loads `openReadOnly` in app-server. Root registration and rescan requests use a separate writer/inbox client; the app-server does not crawl. Both products pin the owner-approved v0.6.0 engine commit after implementation and installed-product acceptance. Their worktrees are outside this write set; no consumer pin, signature, push, merge or tag is performed by this replay.
+D16 defines this task's acceptance: install `docs/consumer-contract.md`, run `macos_four_host_shared_store_consumer_contract` with CLI, daemon and independent read-only/writer NAPI hosts, and prove one store identity, scoped searches, read-only enforcement, queued rebuild and lease takeover. The stand-ins exercise the actual NAPI package through independent Node host processes; they do not establish installed Xross/Kunkun integration.
+
+## Consumer follow-ups
+
+- **M2-X (Xross repo, after M2 lands):** move `xross_search_exports` into Xross's own DB, replace direct turso index readers, derive non-empty scope only from host-authorized export roots, use a stable consumer ID and pin the accepted engine. Pass this contract's `macos_four_host_shared_store_consumer_contract`, `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, and `long_lived_rust_readers_recheck_floor_for_search_status_and_probes` through its host; add its product test `xross_remote_peer_scope_never_returns_unexported_root`.
+- **M2-K (Kunkun repo, after M2 lands):** build/sign the preferred `kuntud` helper with stable TCC grants, connect app-server via read-only NAPI, route registration/rescan through an inbox client, surface compatibility/permission failures and pin the accepted engine. Pass this contract's four-host smoke, Node read-only operation test, `preopened_old_writer_rechecks_after_migration_and_releases_capability` and `shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover` through its host; add its product tests `kunkun_signed_helper_tcc_identity_is_stable` and `kunkun_app_server_remains_read_only_during_helper_restart`.
+
+These are follow-up obligations, not plans or acceptance executed in other repositories. No mapping move, helper signing, product pin or product plan is part of this write set.
 
 <!-- apply {"task": "M2.10", "file": "scripts/m2-previous-tag.ts", "mode": "file"} -->
 ````typescript
@@ -14180,11 +15561,12 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, readdirSync
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { strict as assert } from 'node:assert';
-const base='/Volumes/Portable2TB/tmp/kuntu-m2/evidence';
+const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/evidence';
+const fixtureBase='/Volumes/Portable2TB/tmp/kuntu-m2/evidence';
 const target=process.env.CARGO_TARGET_DIR??'target';
 const bin=resolve(target,'release/examples/m2_probe');
 mkdirSync(base,{recursive:true});
-const root=join(base,'root-200k');mkdirSync(root,{recursive:true});
+const root=join(fixtureBase,'root-200k');mkdirSync(root,{recursive:true});
 const live=new Set<ChildProcess>();const orphaned=new Set<number>();
 function start(op:string,home:string,extra:Record<string,string>={},minor='1') {
  const child=spawn(bin,[op,home,extra.KUNTU_EVIDENCE_ROOT??root,minor],{env:{...process.env,...extra},stdio:['ignore','pipe','pipe']});live.add(child);
@@ -14212,13 +15594,28 @@ try {
    rmSync(home,{recursive:true,force:true});await ok('init',home);await killed('scan',home,'batch_committed',200_000*percent/100);
    const partialCount=Number(/\d+/.exec(db(home,"SELECT count(*) FROM entries"))?.[0]);assert.ok(partialCount>=200_000*percent/100&&partialCount<200_000*percent/100+5000);
    const partial=db(home,"SELECT status,active_scan_gen,(SELECT value FROM meta WHERE key='generation'),(SELECT count(*) FROM entries) FROM root_state");
-   const resumed=await ok('scan',home);assert.equal(db(home,'SELECT count(*) FROM entries'),'[(200001,)]');assert.equal(db(home,"SELECT count(*) FROM entries WHERE scan_gen<>(SELECT active_scan_gen FROM root_state)"),'[(0,)]');outcomes[`kill_${percent}`]=`${partial}; ${resumed}`;
+   const selected=spawnSync('python3',['-c','import sqlite3,json,sys; c=sqlite3.connect(sys.argv[1]); print(json.dumps([r[0] for r in c.execute("SELECT path FROM entries WHERE kind=1 ORDER BY id LIMIT 2")]))',join(home,'index.v3.db')],{encoding:'utf8'});assert.equal(selected.status,0,selected.stderr);
+   const committed:unknown=JSON.parse(selected.stdout);assert.ok(Array.isArray(committed)&&committed.length===2&&committed.every(p=>typeof p==='string'));
+   const deleted=String(committed[0]),renamed=String(committed[1]),replacement=renamed.replace('.md','-renamed.md');rmSync(deleted);const moved=readFileSync(renamed);rmSync(renamed);writeFileSync(replacement,moved);
+   const resumed=await ok('scan',home);assert.equal(db(home,'SELECT count(*) FROM entries'),'[(200000,)]');assert.equal(db(home,"SELECT count(*) FROM entries WHERE scan_gen<>(SELECT active_scan_gen FROM root_state)"),'[(0,)]');
+   const freshMutated=join(base,`fresh-mutated-${percent}`);rmSync(freshMutated,{recursive:true,force:true});await ok('init',freshMutated);await ok('scan',freshMutated);assert.equal(db(home,"SELECT path,kind,size,mtime,flags FROM entries ORDER BY path"),db(freshMutated,"SELECT path,kind,size,mtime,flags FROM entries ORDER BY path"));
+   outcomes[`kill_${percent}`]=`${partial}; delete+rename committed files; ${resumed}; equal fresh crawl`;
+   rmSync(replacement);writeFileSync(deleted,'x');writeFileSync(renamed,'x');
   }
   for(const point of ['building_committed','before_ready','ready_committed']){await killed('scan',home,point);outcomes[point]=await ok('scan',home);}
   const expected=db(home,"SELECT path,kind,size,mtime,flags FROM entries ORDER BY path");
   const fresh=join(base,'fresh-home');rmSync(fresh,{recursive:true,force:true});await ok('init',fresh);await ok('scan',fresh);assert.equal(db(fresh,"SELECT path,kind,size,mtime,flags FROM entries ORDER BY path"),expected);
   const mig=join(base,'migration-home');rmSync(mig,{recursive:true,force:true});await ok('init',mig);await killed('scan',mig,'migration_ddl');assert.equal(db(mig,"SELECT value FROM meta WHERE key='schema_minor'"),'[(0,)]');outcomes.migration=await ok('scan',mig);
-  await killed('quarantine',home,'quarantine_renamed');outcomes.quarantine=await ok('init',home);assert.equal(db(home,'SELECT count(*) FROM entries'),'[(0,)]');
+  for(const point of ['namespace_marker_published','quarantine_main_moved','quarantine_wal_moved','quarantine_shm_moved']) {
+   const namespace=join(base,`quarantine-${point}`);rmSync(namespace,{recursive:true,force:true});await ok('init',namespace);
+   writeFileSync(join(namespace,'index.v3.db-wal'),'old wal');writeFileSync(join(namespace,'index.v3.db-shm'),'old shm');
+   await killed('quarantine',namespace,point);outcomes[point+'_quarantine']=await ok('init',namespace);assert.equal(db(namespace,'SELECT count(*) FROM entries'),'[(0,)]');assert.equal(existsSync(join(namespace,'quarantine-3.json')),false);
+  }
+  for(const point of ['namespace_marker_published','gc_main_removed','gc_wal_removed','gc_shm_removed']) {
+   const namespace=join(base,`gc-${point}`);rmSync(namespace,{recursive:true,force:true});await ok('gc-init',namespace);await killed('gc',namespace,point);outcomes[point+'_gc']=await ok('reuse-old',namespace);
+  }
+  const policy=join(base,'policy-home');rmSync(policy,{recursive:true,force:true});await ok('init',policy);db(policy,"UPDATE meta SET value='historical' WHERE key='policy_hash'");await killed('scan',policy,'policy_invalidated');assert.equal(db(policy,"SELECT status FROM root_state"),"[('dirty',)]");outcomes.policy_reconciliation=await ok('scan',policy);
+
   const first=join(base,'first-home');rmSync(first,{recursive:true,force:true});await killed('identity',first,'identity_synced');const x=await ok('identity',first);assert.equal(x.length,32);
   const simultaneous=join(base,'simultaneous');rmSync(simultaneous,{recursive:true,force:true});mkdirSync(simultaneous);for(let n=0;n<100;n++){const pair=join(simultaneous,`pair-${n}`);const a=start('identity',pair),b=start('identity',pair);const ar=await a.done,br=await b.done;assert.equal(ar.code,0,ar.text);assert.equal(br.code,0,br.text);assert.equal(ar.text,br.text);}outcomes.concurrent_identity='100 concurrent fresh-home pairs: one identity per pair';
   const heldMarker=join(base,'held');rmSync(heldMarker,{force:true});const held=start('hold',fresh,{KUNTU_FAULT_MARKER:heldMarker});await marker(heldMarker,held);
@@ -14233,7 +15630,7 @@ try {
   const scopedEnv={...process.env,KUNTU_HOME:scopedHome};const rebuild=spawnSync(resolve(target,'release/kfs'),['index','rebuild','--root',scopedRoot],{env:scopedEnv,encoding:'utf8'});assert.equal(rebuild.status,0,rebuild.stderr);const searched=spawnSync(resolve(target,'release/kfs'),['search','file','--root',scopedRoot,'--provider','sqlite','--include-hidden','--include-ignored','--json'],{env:scopedEnv,encoding:'utf8'});assert.equal(searched.status,0,searched.stderr);assert.ok(searched.stdout.includes('visible-file'));assert.ok(!searched.stdout.includes('.hidden-file')&&!searched.stdout.includes('node_modules'));outcomes.cli_scope='strict CLI excludes union rows and supplied query flags';
   writeFileSync(join(base,'crash.json'),JSON.stringify(outcomes,null,2));console.log(JSON.stringify(outcomes,null,2));
  } else if(mode==='stress') {
-  const stressRoot=join(base,'root-1m');mkdirSync(stressRoot,{recursive:true});
+  const stressRoot=join(fixtureBase,'root-1m');mkdirSync(stressRoot,{recursive:true});
   for(let n=0;n<1_000_000;n++){const p=join(stressRoot,`file-${String(n).padStart(6,'0')}.md`);if(!existsSync(p))writeFileSync(p,'x');}
   const extra={KUNTU_EVIDENCE_ROOT:stressRoot};
   const home=join(base,'stress-home');rmSync(home,{recursive:true,force:true});await ok('init',home,extra);
@@ -14268,24 +15665,41 @@ import {spawnSync} from 'node:child_process';
 import {strict as assert} from 'node:assert';
 type Case={task:string,file:string,old:string,bad:string,crate:string,test:string};
 const cases:Case[]=[
+ {"task": "M2.6-restart", "file": "crates/kuntu-index/src/shared.rs", "old": "active_scan_gen=active_scan_gen+1", "bad": "active_scan_gen=CASE WHEN status='building' AND scan_policy_revision=policy_revision THEN active_scan_gen ELSE active_scan_gen+1 END", "crate": "kuntu-index", "test": "m2_tests::restarted_walk_removes_deleted_and_renamed_committed_files"},
+ {"task": "M2.4-preopened", "file": "crates/kuntu-index/src/shared.rs", "old": "      if floor > self.conn.minor {\n        self.conn.readonly.set(true);\n        return Err(IndexError::ReadOnly);\n      }\n", "bad": "      if false && floor > self.conn.minor {\n        self.conn.readonly.set(true);\n        return Err(IndexError::ReadOnly);\n      }\n", "crate": "kuntu-index", "test": "m2_tests::preopened_old_writer_rechecks_after_migration_and_releases_capability"},
+ {"task": "M2.7-downgrade", "file": "crates/kuntu-index/src/shared.rs", "old": "    if self.legacy.is_none() {\n      let floor:", "bad": "    if false && self.legacy.is_none() {\n      let floor:", "crate": "kuntu-index", "test": "m2_tests::holder_service_drops_unusable_capability_after_writer_floor_changes"},
+ {"task": "M2.9-self-import", "file": "crates/kuntu-index/src/shared.rs", "old": "    let leaf = format!(\n      \"import-{}.db\",\n      random\n        .iter()\n        .map(|v| format!(\"{v:02x}\"))\n        .collect::<String>()\n    );\n", "bad": "    let leaf = String::from(\"import-v2.db\");\n", "crate": "kuntu-index", "test": "m2_tests::self_snapshot_import_uses_unique_inodes_and_preserves_all_source_hashes"},
+ {"task": "M2.4-durable-marker", "file": "crates/kuntu-store/src/lib.rs", "old": "      self.dir.sync_all()?;\n      namespace_event(\"marker_directory_synced\");", "bad": "      namespace_event(\"marker_sync_skipped\");", "crate": "kuntu-store", "test": "tests::durable_markers_precede_every_namespace_member_and_only_enoent_is_absent"},
+ {"task": "M2.4-gc-reuse", "file": "crates/kuntu-store/src/lib.rs", "old": "    if epoch < EPOCH && self.exists(&format!(\"gc-{epoch}.json\"))? {", "bad": "    if false && epoch < EPOCH && self.exists(&format!(\"gc-{epoch}.json\"))? {", "crate": "kuntu-store", "test": "tests::pending_gc_is_completed_before_an_old_epoch_can_be_reused"},
+ {"task": "M2.3-sensitive-admission", "file": "crates/kuntu-index/src/lib.rs", "old": "      || kuntu_core::denies_sensitive_path(&entry.path)", "bad": "", "crate": "kuntu-index", "test": "m2_tests::current_sensitive_policy_denies_historical_rows_during_interrupted_reconciliation"},
+ {"task": "M2.3-policy-invalidation", "file": "crates/kuntu-index/src/shared.rs", "old": "    if stored == identity {", "bad": "    if true || stored == identity {", "crate": "kuntu-index", "test": "m2_tests::current_sensitive_policy_denies_historical_rows_during_interrupted_reconciliation"},
+ {"task": "M2.4-rust-reader", "file": "crates/kuntu-index/src/shared.rs", "old": "    if min > self.conn.minor {", "bad": "    if false && min > self.conn.minor {", "crate": "kuntu-index", "test": "m2_tests::long_lived_rust_readers_recheck_floor_for_search_status_and_probes"},
+ {"task": "M2.5-cleanup-seek", "file": "crates/kuntu-index/src/shared.rs", "old": "SELECT id,root_id,scan_gen FROM entries WHERE id>?1 ORDER BY id LIMIT 5000", "bad": "SELECT id,root_id,scan_gen FROM entries WHERE scan_gen=0 AND id>?1 ORDER BY id LIMIT 5000", "crate": "kuntu-index", "test": "m2_tests::cleanup_seek_limits_inspection_even_across_large_current_generation_gaps"},
+ {"task": "M2.7-cleanup-cancel", "file": "crates/kuntu-index/src/shared.rs", "old": "    if self.cancel.load(Ordering::Acquire) {", "bad": "    if false && self.cancel.load(Ordering::Acquire) {", "crate": "kuntu-index", "test": "m2_tests::shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover"},
+ {"task": "M2.10-four-host", "file": "crates/kuntu-napi/src/lib.rs", "old": "      _service: (!readonly).then(|| Arc::new(WriterService::start(h))),", "bad": "      _service: None,", "crate": "smoke", "test": "macos_four_host_shared_store_consumer_contract"},
+ {"task": "M2.10-ceilings", "file": "crates/kuntu-index/src/m2_acceptance.rs", "old": "    _ => 25.0,", "bad": "    _ => 400.0,", "crate": "kuntu-index", "test": "m2_acceptance::m2_ceilings_reject_the_m1_only_latency_range"},
+ {"task": "M2.10-internal-ceiling", "file": "scripts/m2-internal-rebuild.ts", "old": "const secondsCeiling=120;", "bad": "const secondsCeiling=999;", "crate": "internal", "test": "internal_ssd_one_million_rebuild_within_120_seconds_ceiling_contract"},
+
  {task:'M2.4-client-version',file:'crates/kuntu-index/src/shared.rs',old:'if !(0..=BUILD_MINOR).contains(&minor) {',bad:'if minor < 0 {',crate:'kuntu-index',test:'m2_tests::caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor'},
  {"task": "M2.2-exec", "file": "crates/kuntu-store/src/lib.rs", "old": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "bad": "    let mut fd = create_lock_file(&locks, || {\n      openat(\n        &locks,\n        name,\n        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW,\n        Mode::from_bits_truncate(0o600),\n      )\n    })?;\n", "crate": "kuntu-store", "test": "tests::executed_child_does_not_inherit_the_permanent_writer_lease"},
  {task:'M2.1-lock-create',file:'crates/kuntu-store/src/lib.rs',old:'attempts < 100',bad:'attempts < 0',crate:'kuntu-store',test:'tests::transient_lock_creation_retries_only_not_found_under_the_same_directory_fd'},
- {task:'M2.5-cleanup',file:'crates/kuntu-index/src/shared.rs',old:'rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100)',bad:'rows >= 5000',crate:'kuntu-index',test:'m2_tests::slow_delete_triggers_force_the_100_ms_cleanup_boundary'},
+ {task:'M2.5-cleanup',file:'crates/kuntu-index/src/shared.rs',old:'inspected >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100)',bad:'inspected >= 5000',crate:'kuntu-index',test:'m2_tests::slow_delete_triggers_force_the_100_ms_cleanup_boundary'},
  {task:'M2.1',file:'crates/kuntu-store/src/lib.rs',old:'let flags = OFlag::O_RDWR\n      | OFlag::O_NOFOLLOW',bad:'let flags = OFlag::O_RDWR',crate:'kuntu-store',test:'tests::descriptor_open_rejects_symlink_and_private_modes_are_exact'},
  {task:'M2.2',file:'crates/kuntu-store/src/lib.rs',old:'else if !fd.try_lock_exclusive()? {',bad:'else if false && !fd.try_lock_exclusive()? {',crate:'kuntu-store',test:'tests::permanent_lease_inode_is_exclusive_and_reusable'},
  {task:'M2.3',file:'crates/kuntu-index/src/lib.rs',old:'SELECT entry_id FROM {} WHERE term >= ?1 AND term < ?2 LIMIT ?3',bad:'SELECT entry_id FROM {} WHERE term >= ?1 AND term < ?2 LIMIT ?1',crate:'kuntu-index',test:'m2_tests::production_builders_pin_both_postings_reverse_and_rowid'},
  {task:'M2.4',file:'crates/kuntu-index/src/shared.rs',old:'if read_min > minor {',bad:'if false && read_min > minor {',crate:'kuntu-index',test:'m2_tests::actual_opens_enforce_skew_before_wal_and_old_writer_steps_down'},
  {task:'M2.5',file:'crates/kuntu-index/src/engine.rs',old:"UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='generation'",bad:"UPDATE meta SET value=CAST(value AS INTEGER)+0 WHERE key='generation'",crate:'kuntu-index',test:'m2_tests::batch_generation_is_atomic_and_readers_observe_data_version'},
- {task:'M2.6',file:'crates/kuntu-index/src/shared.rs',old:"status='building' AND active_scan_gen=?2 AND scan_policy_revision=policy_revision",bad:"status='building' AND ?2=?2 AND scan_policy_revision=policy_revision",crate:'kuntu-index',test:'m2_tests::resume_keeps_generation_stale_completion_is_rejected_and_building_is_reported'},
+ {task:'M2.6',file:'crates/kuntu-index/src/shared.rs',old:"status='building' AND active_scan_gen=?2 AND scan_policy_revision=policy_revision",bad:"status='building' AND ?2=?2 AND scan_policy_revision=policy_revision",crate:'kuntu-index',test:'m2_tests::restart_uses_fresh_generation_stale_completion_is_rejected_and_building_is_reported'},
  {task:'M2.7',file:'crates/kuntu-index/src/shared.rs',old:'let _ = t.join();',bad:'drop(t);',crate:'kuntu-index',test:'m2_tests::joined_takeover_service_releases_lease_only_after_worker_stops'},
  {task:'M2.8',file:'crates/kuntu-napi/src/lib.rs',old:'read_only: true,',bad:'read_only: false,',crate:'node',test:'openReadOnly enforces access on rebuild refresh repair and registration'},
- {task:'M2.9',file:'crates/kuntu-daemon/src/lib.rs',old:'if index.is_shared() {',bad:'if false && index.is_shared() {',crate:'kuntu-daemon',test:'tests::non_holder_bulk_endpoint_queues_and_empty_search_is_rejected'},
+ {task:'M2.9',file:'crates/kuntu-daemon/src/lib.rs',old:'("POST", "/index/rebuild") => match parse_roots_request(&request.body, allowed_roots) {\n      Ok(config) => {\n        if index.is_shared() {',bad:'("POST", "/index/rebuild") => match parse_roots_request(&request.body, allowed_roots) {\n      Ok(config) => {\n        if false && index.is_shared() {',crate:'kuntu-daemon',test:'tests::non_holder_bulk_endpoint_queues_and_empty_search_is_rejected'},
  {task:'M2.10',file:'crates/kuntu-cli/src/args.rs',old:'"store" => {',bad:'"store-disabled" => {',crate:'kuntu-cli',test:'args::tests::store_import_parser_accepts_source_and_rejects_missing_source'},
 ];
-const base='/Volumes/Portable2TB/tmp/kuntu-m2/replay';mkdirSync(base,{recursive:true});
+const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/replay';mkdirSync(base,{recursive:true});
 function command(args:string[],cwd?:string){const r=spawnSync(args[0]!,args.slice(1),{cwd,env:{...process.env,...(args[0]==='cargo'?{CARGO_PROFILE_RELEASE_LTO:'false',CARGO_PROFILE_RELEASE_CODEGEN_UNITS:'16'}:{})},encoding:'utf8',maxBuffer:16*1024*1024});return {status:r.status,text:r.stdout+r.stderr};}
 function test(c:Case){
+ if(c.crate==='internal')return command(['bun','scripts/m2-internal-rebuild.ts','--contracts']);
+ if(c.crate==='smoke'){const b=command(['pnpm','run','build:debug'],'crates/kuntu-napi');assert.equal(b.status,0,b.text);return command(['bun','scripts/m2-consumer-smoke.ts']);}
  if(c.crate==='node'){
   const b=command(['pnpm','run','build:debug'],'crates/kuntu-napi');assert.equal(b.status,0,b.text);
   return command(['node','--test','--test-name-pattern',c.test,'test/index.test.cjs'],'crates/kuntu-napi');
@@ -14295,15 +15709,14 @@ function test(c:Case){
 const chosen=process.argv[2];
 for(const c of cases.filter(c=>!chosen||c.task===chosen)){
  const original=readFileSync(c.file,'utf8');
- // M2.9 has the same guard for refresh. Replace exactly the first occurrence,
- // at the unique rebuild arm; it is an exact bounded anchor replacement.
- const n=original.split(c.old).length-1;assert.equal(n,c.task==='M2.9'?2:1,`anchor ${c.task} count=${n}`);
+ const n=original.split(c.old).length-1;assert.equal(n,1,`anchor ${c.task} count=${n}`);
  try {
   writeFileSync(c.file,original.replace(c.old,c.bad));const red=test(c);writeFileSync(`${base}/${c.task}-RED.log`,red.text);
-  assert.notEqual(red.status,0,`${c.task} RED unexpectedly passed`);assert.ok(red.text.includes(c.test),red.text);assert.match(red.text,/FAILED|not ok|✖/);assert.doesNotMatch(red.text,/could not compile|error\[E\d+\]/);
+  assert.notEqual(red.status,0,`${c.task} RED unexpectedly passed`);assert.ok(red.text.includes(c.test),red.text);assert.match(red.text,/FAILED|not ok|✖|AssertionError/);assert.doesNotMatch(red.text,/could not compile|error\[E\d+\]/);
  } finally {writeFileSync(c.file,original);}
  const green=test(c);writeFileSync(`${base}/${c.task}-GREEN.log`,green.text);assert.equal(green.status,0,green.text);
- if(c.crate!=='node')assert.match(green.text,/1 passed; 0 failed/);
+ if(!['node','smoke','internal'].includes(c.crate))assert.match(green.text,/1 passed; 0 failed/);
+ else if(c.crate!=='node')assert.ok(green.text.includes('PASS '+c.test),green.text);
  console.log(`${c.task}: RED named failure, GREEN passed (${c.test})`);
 }
 ````
@@ -14318,9 +15731,10 @@ import {strict as assert} from 'node:assert';
 import {createHash} from 'node:crypto';
 const planPath=process.argv[2];assert.ok(planPath,'pass the git-show committed plan file');
 const plan=readFileSync(planPath,'utf8');
-const base='/Volumes/Portable2TB/tmp/kuntu-m2/replay';mkdirSync(base,{recursive:true});
+const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/replay';mkdirSync(base,{recursive:true});
 process.env.CARGO_TARGET_DIR='/Volumes/Portable2TB/tmp/kuntu-m2/target';
-process.env.KUNTU_TEST_DIR='/Volumes/Portable2TB/tmp/kuntu-m2/contracts';
+process.env.KUNTU_TEST_DIR='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/contracts';
+process.env.KUNTU_ACCEPTANCE_DIR='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/acceptance';
 process.env.TMPDIR='/Volumes/Portable2TB/tmp/kuntu-m2/testtmp';mkdirSync(process.env.TMPDIR,{recursive:true});
 process.env.KUNTU_BENCH_DIR='/Volumes/Portable2TB/tmp/kuntu-m2/bench-final';process.env.KUNTU_BENCH_ROWS='1000000';
 const pattern=/<!-- apply ({[^\n]+}) -->\n(`{3,})[^\n]*\n([\s\S]*?)\n\2/g;
@@ -14345,6 +15759,7 @@ function run(label:string,args:string[],cwd?:string,extra:Record<string,string>=
 run('fmt',['cargo','fmt','--all','--','--check']);
 run('clippy',['cargo','clippy','--workspace','--all-targets','--locked','--','-D','warnings']);
 run('napi-install',['pnpm','install','--frozen-lockfile'],'crates/kuntu-napi');
+run('cli-build',['cargo','build','--release','-p','kuntu-cli']);
 run('reds-greens',['bun','scripts/m2-red.ts']);
 run('workspace',['cargo','test','--workspace','--locked','--','--test-threads=1']);
 const js=readFileSync('crates/kuntu-napi/index.js');const dts=readFileSync('crates/kuntu-napi/index.d.ts');
@@ -14352,56 +15767,220 @@ run('napi-build',['pnpm','run','build:debug'],'crates/kuntu-napi');
 assert.deepEqual(readFileSync('crates/kuntu-napi/index.js'),js,'generated JS differs');assert.deepEqual(readFileSync('crates/kuntu-napi/index.d.ts'),dts,'generated declarations differ');
 run('node',['node','--test','test/index.test.cjs'],'crates/kuntu-napi');run('types',['pnpm','run','typecheck'],'crates/kuntu-napi');
 run('m1-gate',['cargo','test','--release','-p','kuntu-index','realistic_fixture_latency_gate','--','--ignored','--nocapture']);
-run('m1-recall',['cargo','test','--release','-p','kuntu-index','rarest_token_drives_the_search_and_recall_is_exact','--','--ignored','--nocapture']);
+const m2=spawnSync('cargo',['test','--release','-p','kuntu-index','realistic_fixture_m2_latency_acceptance','--','--ignored','--nocapture'],{env:process.env,encoding:'utf8',maxBuffer:64*1024*1024});
+writeFileSync(`${base}/m2-gate.log`,m2.stdout+m2.stderr);
+if(m2.status!==0){assert.match(m2.stdout+m2.stderr,/M2_ACCEPTANCE_MISS/);assert.doesNotMatch(m2.stdout+m2.stderr,/could not compile|error\[E\d+\]/);console.log('OPEN RED: realistic_fixture_m2_latency_acceptance; see measured acceptance JSON');}
+const internal=spawnSync('bun',['scripts/m2-internal-rebuild.ts'],{env:process.env,encoding:'utf8'});writeFileSync(`${base}/internal-rebuild.log`,internal.stdout+internal.stderr);
+if(internal.status===2){assert.match(internal.stdout,/M2_INTERNAL_SSD_NOT_RUN/);console.log('PENDING: internal_ssd_one_million_rebuild_within_120_seconds');}else assert.equal(internal.status,0,internal.stdout+internal.stderr);
+writeFileSync(`${base}/acceptance-status.json`,JSON.stringify({m2_latency:m2.status===0?'PASS':'OPEN RED',internal_ssd:internal.status===2?'NOT RUN':'PASS'},null,2));
+run('m1-recall' ,['cargo','test','--release','-p','kuntu-index','rarest_token_drives_the_search_and_recall_is_exact','--','--ignored','--nocapture']);
 run('m1-budget',['cargo','test','--release','-p','kuntu-index','default_budget_bounds_a_broad_single_token','--','--ignored','--nocapture']);
 run('sqlite-version',['cargo','test','--release','-p','kuntu-index','bundled_runtime_includes_wal_reset_fix','--','--nocapture']);
 run('size-delete',['cargo','test','--release','-p','kuntu-index','realistic_fixture_reverse_delete_cost_and_size_gate','--','--ignored','--nocapture']);
-run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('cli-build',['cargo','build','--release','-p','kuntu-cli']);
-run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
+run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
+run('consumer-smoke',['bun','scripts/m2-consumer-smoke.ts']);
 run('previous-tag',['bun','scripts/m2-previous-tag.ts']);
 run('fmt-final',['cargo','fmt','--all','--','--check']);
 const protectedPaths=['crates/kuntu-crawler','crates/kuntu-watcher','crates/kuntu-scan','.github'];
 assert.equal(run('protected',['git','diff','--name-only','e164d67','--',...protectedPaths]).trim(),'');assert.equal(run('protected-untracked',['git','ls-files','--others','--exclude-standard','--',...protectedPaths]).trim(),'');
 for(const [f,hash]of Object.entries(hashes))assert.equal(createHash('sha256').update(readFileSync(f)).digest('hex'),hash,`payload changed ${f}`);
-console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size} files; all tasks and evidence commands completed`);
+console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size} files; all correctness tasks and evidence commands completed; M2 acceptance status recorded separately`);
+````
+
+
+<!-- apply {"task": "M2.10", "file": "scripts/m2-napi-host.cjs", "mode": "file"} -->
+````javascript
+// Independent Node host implementing the shared-store consumer contract.
+const assert = require('node:assert/strict');
+const readline = require('node:readline');
+const {FileSearchIndex} = require('../crates/kuntu-napi/index.js');
+const [home,root,role] = process.argv.slice(2);
+assert.ok(home && root && ['read-only','writer'].includes(role));
+const consumer = role==='read-only' ? 'xross-smoke' : 'kunkun-smoke';
+const registration = FileSearchIndex.openClient(home,consumer);
+registration.registerRoots([{path:root}]); registration.close();
+const index = role==='read-only' ? FileSearchIndex.openReadOnly(home,consumer) : FileSearchIndex.openShared(home,consumer);
+const request = {roots:[{path:root}],query:'visible file'};
+const output = value => process.stdout.write(JSON.stringify(value)+'\n');
+output({ready:true,pid:process.pid,role,mode:index.mode()});
+const lines = readline.createInterface({input:process.stdin});
+(async () => {
+ try {
+  for await (const line of lines) {
+   const command=JSON.parse(line);assert.ok(command && typeof command==='object');
+   if(command.op==='close') break;
+   if(command.op==='read') {
+    const found=await index.search(request);assert.ok(found.results.some(row=>row.path.endsWith('visible-file.md')));
+    await assert.rejects(index.search({roots:[],query:''}),/scope/);
+    await assert.rejects(index.search({roots:[{path:root+'/foreign'}],query:'file'}),/scope/);
+    const strict=await index.search({roots:[{path:root,includeHidden:true,includeIgnored:true}],query:'file',includeHidden:true,includeIgnored:true});
+    assert.ok(strict.results.every(row=>!row.path.includes('.hidden-file')&&!row.path.includes('node_modules')));
+    if(role==='read-only') {
+     for(const method of ['rebuild','refresh','repair']) await assert.rejects(index[method]([{path:root}]),/read-only/);
+     assert.throws(()=>index.registerRoots([{path:root}]),/read-only/);
+     assert.throws(()=>index.requestRebuild([{path:root}]),/read-only/);
+    }
+    output({read:true,pid:process.pid,role,holder:index.writerLeaseHeld(),matches:found.results.length});
+   } else if(command.op==='queue') {
+    assert.equal(role,'writer');output({queued:index.requestRebuild([{path:root}]),holder:index.writerLeaseHeld()});
+   } else throw new Error('Unknown host command.');
+  }
+ } finally { index.close(); lines.close(); }
+})().catch(error=>{console.error(error);process.exitCode=1;lines.close();process.stdin.destroy();});
+````
+
+
+<!-- apply {"task": "M2.10", "file": "scripts/m2-consumer-smoke.ts", "mode": "file"} -->
+````typescript
+/** macOS contract smoke: CLI, daemon and two independent NAPI host processes. */
+import {spawn,spawnSync,type ChildProcess} from 'node:child_process';
+import {mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
+import {resolve,join} from 'node:path';
+import {strict as assert} from 'node:assert';
+const name='macos_four_host_shared_store_consumer_contract';
+const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/consumer-smoke';
+const kfs=resolve(process.env.CARGO_TARGET_DIR??'target','release/kfs');
+const children=new Set<ChildProcess>();
+function child(args:string[],env:Record<string,string|undefined>={}) {
+ const proc=spawn(args[0]!,args.slice(1),{env:{...process.env,...env},stdio:['pipe','pipe','pipe']});children.add(proc);
+ const lines:string[]=[];let pending='';let all='';
+ proc.stdout?.on('data',(bytes:Buffer)=>{const text=bytes.toString();all+=text;pending+=text;const parts=pending.split('\n');pending=parts.pop()??'';lines.push(...parts);});
+ proc.stderr?.on('data',(bytes:Buffer)=>{all+=bytes.toString();});
+ const done=new Promise<{code:number|null,text:string}>(finish=>proc.on('close',code=>{children.delete(proc);finish({code,text:all});}));
+ async function line(){const end=Date.now()+10000;while(!lines.length){assert.equal(proc.exitCode,null,all);assert.ok(Date.now()<end,`${name}: host reply timeout`);await Bun.sleep(10);}const value:unknown=JSON.parse(lines.shift()!);assert.ok(typeof value==='object'&&value!==null);return value;}
+ return {proc,done,line};
+}
+async function send(host:ReturnType<typeof child>,op:string){host.proc.stdin?.write(JSON.stringify({op})+'\n');return host.line();}
+try {
+ assert.equal(process.platform,'darwin',`${name} requires macOS`);
+ rmSync(base,{recursive:true,force:true});const home=join(base,'home'),root=join(base,'files');mkdirSync(join(root,'node_modules'),{recursive:true});
+ for(const file of ['visible-file.md','.hidden-file.md','node_modules/ignored-file.md'])writeFileSync(join(root,file),'x');
+ const env={KUNTU_HOME:home};
+ const seed=spawnSync(kfs,['index','rebuild','--root',root],{env:{...process.env,...env},encoding:'utf8'});assert.equal(seed.status,0,seed.stderr);
+ const identity=readFileSync(join(home,'store.json'),'utf8');
+ // Keep the daemon alive until the four processes have exercised the store.
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response()});const port=server.port;server.stop(true);
+ const daemon=child([kfs,'daemon','--root',root,'--addr',`127.0.0.1:${port}`,'--duration-ms','6000'],env);
+ const url=`http://127.0.0.1:${port}`;const end=Date.now()+6000;
+ while(true){try{const response=await fetch(url+'/health');if(response.ok)break;}catch{}assert.ok(Date.now()<end);await Bun.sleep(10);}
+ // Verify the daemon actually owns the lease, rather than only being healthy.
+ while(true){const text=readFileSync(join(home,'locks/indexer.lock'),'utf8');if(JSON.parse(text).pid===daemon.proc.pid)break;assert.ok(Date.now()<end);await Bun.sleep(10);}
+ const reader=child(['node','scripts/m2-napi-host.cjs',home,root,'read-only']);const writer=child(['node','scripts/m2-napi-host.cjs',home,root,'writer']);
+ const readyReader=await reader.line(),readyWriter=await writer.line();assert.notEqual(reader.proc.pid,writer.proc.pid);
+ assert.ok('ready'in readyReader&&readyReader.ready===true&&'ready'in readyWriter&&readyWriter.ready===true);
+ const read=await send(reader,'read'),writeRead=await send(writer,'read');assert.ok('holder'in writeRead&&writeRead.holder===false,'daemon must exclude the NAPI writer');
+ const queued=await send(writer,'queue');assert.ok('queued'in queued&&typeof queued.queued==='string');
+ const cli=child([kfs,'search','file','--root',root,'--provider','sqlite','--json'],env);assert.equal(daemon.proc.exitCode,null);assert.equal(reader.proc.exitCode,null);assert.equal(writer.proc.exitCode,null);
+ const searched=await cli.done;assert.equal(searched.code,0,searched.text);assert.ok(searched.text.includes('visible-file'));assert.ok(!searched.text.includes('.hidden-file')&&!searched.text.includes('node_modules'));
+ const response=await fetch(url+'/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({roots:[root],query:'visible file'})});assert.equal(response.status,200);const daemonSearch:unknown=await response.json();assert.ok(typeof daemonSearch==='object'&&daemonSearch!==null&&'results'in daemonSearch&&Array.isArray(daemonSearch.results)&&daemonSearch.results.length>0);
+ const daemonDone=await daemon.done;assert.equal(daemonDone.code,0,daemonDone.text);const released=Date.now();
+ let takeover:unknown;
+ do{takeover=await send(writer,'read');assert.ok(Date.now()-released<=6000,`${name}: NAPI writer never took over`);if(typeof takeover==='object'&&takeover!==null&&'holder'in takeover&&takeover.holder===true)break;await Bun.sleep(20);}while(true);
+ const takeoverMs=Date.now()-released;await send(reader,'read');assert.equal(readFileSync(join(home,'store.json'),'utf8'),identity);
+ reader.proc.stdin?.write('{"op":"close"}\n');writer.proc.stdin?.write('{"op":"close"}\n');assert.equal((await reader.done).code,0);assert.equal((await writer.done).code,0);
+ const report={test:name,cli:true,daemon:true,napi_read_only_pid:reader.proc.pid,napi_writer_pid:writer.proc.pid,readonly:read,writer_queued:queued,takeover_ms:takeoverMs,one_identity:true};
+ writeFileSync(join(base,'result.json'),JSON.stringify(report,null,2));console.log(`PASS ${name} ${JSON.stringify(report)}`);
+} catch(error){console.error(`${name} FAILED`,error);process.exitCode=1;} finally {
+ await Promise.all([...children].map(proc=>new Promise<void>(done=>{proc.once('close',()=>done());proc.kill('SIGKILL');})));
+}
+````
+
+
+<!-- apply {"task": "M2.10", "file": "scripts/m2-internal-rebuild.ts", "mode": "file"} -->
+````typescript
+/** Internal-SSD rebuild acceptance; external-volume evidence cannot satisfy it. */
+import {spawnSync} from 'node:child_process';
+import {writeFileSync,mkdirSync} from 'node:fs';
+import {join,resolve} from 'node:path';
+import {strict as assert} from 'node:assert';
+const name='internal_ssd_one_million_rebuild_within_120_seconds';
+const secondsCeiling=120;
+function withinCeiling(seconds:number){return seconds<=secondsCeiling;}
+if(process.argv[2]==='--contracts'){
+ console.log(`RUN ${name}_ceiling_contract`);
+ assert.ok(withinCeiling(120));assert.equal(withinCeiling(120.001),false,'internal SSD ceiling was loosened');console.log(`PASS ${name}_ceiling_contract`);
+}else{
+ const artifacts=process.env.KUNTU_ACCEPTANCE_DIR??'/Volumes/Portable2TB/tmp/kuntu-m2/rev3/acceptance';mkdirSync(artifacts,{recursive:true});
+ const root=process.env.KUNTU_INTERNAL_SSD_ROOT;const home=process.env.KUNTU_INTERNAL_SSD_HOME;
+ if(!root||!home){
+  const pending={test:name,state:'NOT RUN',ceiling_seconds:secondsCeiling,reason:'No internal-SSD fixture/home within the authorized scratch directory.'};writeFileSync(join(artifacts,'internal-rebuild.json'),JSON.stringify(pending,null,2));console.log(`M2_INTERNAL_SSD_NOT_RUN ${JSON.stringify(pending)}`);process.exitCode=2;
+ }else{
+  for(const path of [root,home])assert.ok(resolve(path).startsWith('/Volumes/Portable2TB/tmp/kuntu-m2/'),'scratch data must stay in the authorized directory');
+  assert.equal(process.platform,'darwin');
+  for(const path of [root,home]){
+   const disk=spawnSync('diskutil',['info','-plist',path],{encoding:'buffer'});assert.equal(disk.status,0);
+   const decoded=spawnSync('python3',['-c','import sys,plistlib; print(plistlib.loads(sys.stdin.buffer.read()).get("Internal",False))'],{input:disk.stdout,encoding:'utf8'});assert.equal(decoded.status,0);assert.equal(decoded.stdout.trim(),'True','target is not an internal SSD');
+  }
+  const bin=resolve(process.env.CARGO_TARGET_DIR??'target','release/examples/m2_probe');
+  const init=spawnSync(bin,['init',home,root,'1'],{encoding:'utf8'});assert.equal(init.status,0,init.stderr);
+  const start=performance.now();const result=spawnSync(bin,['scan',home,root,'1'],{encoding:'utf8'});const seconds=(performance.now()-start)/1000;
+  assert.equal(result.status,0,result.stderr);assert.match(result.stdout,/entries=1000001\b/);
+  const report={test:name,state:withinCeiling(seconds)?'PASS':'OPEN RED',seconds,ceiling_seconds:secondsCeiling,result:result.stdout.trim()};writeFileSync(join(artifacts,'internal-rebuild.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));assert.ok(withinCeiling(seconds),`${name} M2_ACCEPTANCE_MISS ${seconds}>${secondsCeiling}`);
+ }
+}
+````
+
+
+<!-- apply {"task": "M2.10", "file": "docs/consumer-contract.md", "mode": "file"} -->
+````
+# M2 shared-store consumer contract
+
+M2's in-repository consumers are the CLI, daemon and NAPI hosts. The macOS smoke runs the CLI and daemon with two independent Node processes standing in for Xross (read-only) and Kunkun (requesting the writer lease). Actual product integration is M2-X and M2-K, in their repositories after M2 lands (D16).
+
+Consumers resolve one absolute `KUNTU_HOME` (default `$HOME/.kuntu`), use `Home`/shared factories and keep the opened directory and epoch lifetime capability alive. They never open `index.v3.db` themselves or write SQL. Refusals are surfaced; there is no silent temporary-store fallback. Modes express access; `writerLeaseHeld()` is informational and is never authorization for a write.
+
+A stable consumer name identifies persisted root membership. Registration is a small guarded write. Index traversal uses the union of enabled memberships; query admission uses only the requesting consumer's hidden/ignored/priority settings (false/false/0 by default). Every search supplies non-empty configured roots. The engine intersects them with persisted enabled memberships and any explicit Rust `SearchScope`. Callers cannot widen scope or allowances with a request. Remote-peer export mappings remain product-owned. Current compiled sensitive denial always applies, including while a policy reconciliation is interrupted.
+
+Rust uses `KuntuIndex::open_shared`, `open_shared_minor` may only lower the compiled minor, and `open_shared(..., true, ...)` opens read-only. Every public read checks the current reader floor. `acquire_writer` rechecks floors after acquiring the capability and releases it on failure or downgrade. Every writer transaction checks the floor again inside `BEGIN`. Compatible older readers select explicit columns and continue after additive migration; incompatible versions surface `SchemaTooNew` or `ReadOnly`.
+
+NAPI uses `FileSearchIndex.openShared(home, consumer)` for an embedded writer poller, `openClient(home, consumer)` for registration/inbox without a poller, and `openReadOnly(home, consumer)` for reads only. Read-only instances reject registration, requestRebuild, rebuild, refresh and repair on every task. `requestRebuild` queues work; shared rebuild/refresh/repair do not promise synchronous scan completion. Poll `status()` for `building`/`ready` and `search()` coverage; keep a pooled reader per instance. `close()` stops and joins the worker before its lease can leave the process. Outstanding tasks retain their capabilities until completion. The string constructor still opens exactly the supplied private v2/v3 path and preserves its private 50k compatibility budget.
+
+CLI uses shared mode without `--db` and supports `store info|gc|doctor|import`, scoped search, index commands and daemon. `--db` preserves the private path behavior. The daemon accepts only its configured roots, serves concurrent read-only requests, queues shared bulk requests and runs the same persistent writer poller. Its HTTP prototype remains loopback by default; product helper transport/signing is a follow-up.
+
+The poller tries every five seconds, owns every bulk path, and recovers persisted dirty/building roots only after acquisition. Restarted walks use fresh visitation generations; each batch and ready transition rechecks generation and policy. Cleanup seeks by rowid, inspects at most 5,000 rows and checks cancellation/deadline between rows. A stop leaves the root building, cancels the walk/cleanup, joins the worker, then releases the lease. An individual OS call, SQLite statement, commit or scheduling delay can exceed 100 ms; acceptance tests measure shutdown and reader latency rather than claim a universal real-time bound.
+
+Required executable contract tests:
+
+- `macos_four_host_shared_store_consumer_contract`: four live processes on one identity; CLI/daemon/NAPI searches; strict scope; read-only task rejection; queued rebuild; daemon-to-NAPI takeover within six seconds.
+- `strict_consumer_never_inherits_union_or_client_flags` and `requested_scope_cannot_widen_config_even_on_an_early_return`: scope and allowance denial, including empty/miss paths.
+- `preopened_old_writer_rechecks_after_migration_and_releases_capability`, `long_lived_rust_readers_recheck_floor_for_search_status_and_probes`: long-lived skew refusal and capability release.
+- `shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover` and `restarted_walk_removes_deleted_and_renamed_committed_files`: interrupted completion and bounded graceful hand-off.
+- Node `openReadOnly enforces access on rebuild refresh repair and registration` plus `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database`: effective access and private compatibility.
+
+Product lanes must reproduce these boundary conditions through their own hosts. This document supplies the shared-store contract and host smoke, not product integration evidence.
 ````
 
 ## Crash and state checklist
 
-| Question | Behavior and named test |
+| Required question | Executable behavior and named test |
 |---|---|
-| Two concurrent first opens | Bootstrap publishes one identity/schema. `two_concurrent_first_opens_publish_one_random_identity`; process `concurrent_identity`, plus `identity_synced` kill. |
-| Two writers on the same store | Capability refuses the second bulk writer; small inbox writes remain guarded. `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`; 60 s `stress` during a physical 1M-file rebuild. |
-| Kill between batch commit and generation bump | There is no separate bump interval: both are one commit. `batch_generation_is_atomic_and_readers_observe_data_version`; process `kill_30` / `kill_70` kill immediately after commit. |
-| Kill between building and ready | Building resumes its generation, stale completion cannot delete newer data. `resume_keeps_generation_stale_completion_is_rejected_and_building_is_reported`; `building_committed`, `before_ready`, `ready_committed`. |
-| Kill during quarantine | A synced marker names the whole DB/WAL/SHM group; startup finishes it before reuse. `live_readers_prevent_quarantine_and_gc_never_touches_future_epochs`; process `quarantine`. |
-| Kill during migration | DDL and metadata roll back together; next holder reruns the additive step. `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`; process `migration`. |
-| Disable/remove consumer during scan | Policy revision invalidates the active generation; no stale completion. `consumer_removal_and_disable_invalidate_inflight_generation`. |
-| Restart recovery while a live holder exists | No recovery writes until lease acquisition. `restart_recovery_waits_for_live_holder_then_resumes_persisted_generation`. |
-| Is supplied state trusted as truth? | No. Membership, allowance, policy revision, minor floors and generation come from the opened store. The supported build minor comes from compiled code; a caller cannot claim a future version. `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `strict_consumer_never_inherits_union_or_client_flags`, Node strict-consumer test, daemon strict-admission test and `cli_scope`. |
-| Re-check after blocking steps? | Minor after transaction lock; generation/revision after crawl and each transaction wait; metadata after migration lock; lifetime under epoch lock. `every_write_transaction_rechecks_minor_and_rolls_back`, consumer-in-flight test, restart-recovery test and process skew cases. |
+| Two concurrent first opens | Bootstrap serializes identity/schema publication. `two_concurrent_first_opens_publish_one_random_identity`; 100 separate-process first-open pairs. |
+| Two writers on the same store | The second cannot bulk-write; inbox writes remain available. `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`; 60 s stress with two writers/eight readers. |
+| Kill between batch commit and generation bump | Entries, postings, progress and meta generation share one commit, so no separate bump interval exists. `batch_generation_is_atomic_and_readers_observe_data_version`; kill_30/kill_70. |
+| Kill between building and ready | Restart takes fresh visitation and reconciles filesystem changes before ready. `restarted_walk_removes_deleted_and_renamed_committed_files`; `restart_uses_fresh_generation_stale_completion_is_rejected_and_building_is_reported`; building_committed/before_ready/ready_committed kills. |
+| Kill during quarantine | Durable marker precedes every member rename and startup finishes it before reuse. `durable_markers_precede_every_namespace_member_and_only_enoent_is_absent`; marker/main/WAL/SHM process kills. |
+| Kill during GC | Older-epoch lifetime registration resumes durable deletion before pathname reuse. `pending_gc_is_completed_before_an_old_epoch_can_be_reused`; marker/main/WAL/SHM unlink kills. Current/future epochs are refused before touching their files. |
+| Kill during migration | Exclusive guarded DDL/meta transaction rolls back together and reruns under migrate.lock. `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`; migration_ddl kill. |
+| Disable/remove consumer while scan is in flight | Persisted policy revision invalidates completion; inbox does not revive membership. `consumer_removal_and_disable_invalidate_inflight_generation`. |
+| Restart recovery while another live holder exists | Recovery waits for the owned capability; no speculative scan/write. `restart_recovery_waits_for_live_holder_then_resumes_persisted_generation`. |
+| Client-supplied state trusted as truth? | Membership, allowances, policy revision, floor and generation come from the opened store; supported build/policy come from compiled code. `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `strict_consumer_never_inherits_union_or_client_flags`, current-sensitive-policy regression, Node/daemon/CLI scope tests and four-host smoke. |
+| State re-checked after every blocking step? | Floors after lease/transaction locks and pooled-reader locks; generation/revision after crawl and each write lock; stop after filesystem calls and between cleanup chunks; pending namespace recovery after lifetime waits. `preopened_old_writer_rechecks_after_migration_and_releases_capability`, `every_write_transaction_rechecks_minor_and_rolls_back`, `long_lived_rust_readers_recheck_floor_for_search_status_and_probes`, consumer-in-flight regression, shutdown-during-cleanup regression and GC-reuse regression. |
 
-## Finding closure map
+## Round-2 finding closure map
 
-| Finding | Tasks | Named regression/evidence |
+| Finding | Tasks | Named regression / evidence |
 |---|---|---|
-| 1 Mechanical compile | M2.1, M2.3, M2.8–10 | `plan_apply_write_set_matches_complete_payloads`, fmt/clippy/locked workspace build |
-| 2 Complete engine/fixture port | M2.3 | `realistic_fixture_latency_gate`, all preserved M1 recall/shape tests |
-| 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, `executed_child_does_not_inherit_the_permanent_writer_lease`, joined-service test, daemon queue test, exec/takeover process cases |
-| 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, minor skew controller and `previous_tag_epoch_isolation` (v0.4.1 archive) |
-| 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, `slow_delete_triggers_force_the_100_ms_cleanup_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
-| 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
-| 7 Consumer scope | M2.3, M2.8–9 | `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, Node/daemon strict tests, `cli_scope` |
-| 8 FD opens/permissions | M2.1, M2.3 | `descriptor_open_rejects_symlink_and_private_modes_are_exact`, `opened_directory_survives_path_swap_and_sidecars_are_private`, `fd_vfs_preserves_the_unix_open_abi_for_private_connections` |
-| 9 Atomic random identity | M2.1 | `atomic_identity_is_128_bits_and_existing_document_is_preserved`, concurrent-open test, `transient_lock_creation_retries_only_not_found_under_the_same_directory_fd`, 100 process pairs and publication kill |
-| 10 Reader-safe quarantine/GC | M2.4, M2.9 | `live_readers_prevent_quarantine_and_gc_never_touches_future_epochs`, quarantine kill; unregistered private epochs preserved |
-| 11 NAPI actual access/compat | M2.8 | Node read-only operation test, `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` |
-| 12 Import end to end | M2.9–10 | `store_import_parser_accepts_source_and_rejects_missing_source`, real-turso library import test, process `import` |
-| 13 Production SQL pins/binds | M2.3 | `production_builders_pin_both_postings_reverse_and_rowid`, preserved `entry_fetch_is_a_rowid_seek_not_an_index_scan` |
-| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs fourteen pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
-| 15 Complete write set | M2.1–10 | `plan_apply_write_set_matches_complete_payloads`, protected-file checks |
-| 16 Patched WAL engine | M2.3 | `bundled_runtime_includes_wal_reset_fix`, stress and query gates |
-| 17 Honest complete evidence | M2.10 | Full foreground replay logs, crash/stress/skew artifacts and the measured table below |
+| 1 P1 Restart deletes/renames | M2.6 | `restarted_walk_removes_deleted_and_renamed_committed_files`; `restart_uses_fresh_generation_stale_completion_is_rejected_and_building_is_reported`; kill_30/kill_70 now mutate committed files before restart and compare with fresh crawl |
+| 2 P1 Stale lease after migration | M2.4, M2.7 | `preopened_old_writer_rechecks_after_migration_and_releases_capability`; `holder_service_drops_unusable_capability_after_writer_floor_changes`; guarded-transaction test |
+| 3 P1 Import self-alias | M2.9 | `self_snapshot_import_uses_unique_inodes_and_preserves_all_source_hashes`; real-turso/source-hash import and actual CLI import |
+| 4 P1 Interrupted quarantine/GC | M2.1, M2.4 | `durable_markers_precede_every_namespace_member_and_only_enoent_is_absent`; `pending_gc_is_completed_before_an_old_epoch_can_be_reused`; kills after marker publication and every DB/WAL/SHM move/unlink |
+| 5 P1 Sensitive-policy skew | M2.3, M2.4, M2.7 | `current_sensitive_policy_denies_historical_rows_during_interrupted_reconciliation`; separate REDs for admission and invalidation; policy_invalidated process kill |
+| 6 P1 Consumer scope | M2.8–10, D16 | `macos_four_host_shared_store_consumer_contract`; complete consumer contract and independent NAPI host payloads; M2-X/M2-K follow-ups explicitly outside this repo |
+| 7 P2 Long-lived Rust reader | M2.4 | `long_lived_rust_readers_recheck_floor_for_search_status_and_probes` |
+| 8 P2 Cleanup hand-off | M2.5–7 | `cleanup_seek_limits_inspection_even_across_large_current_generation_gaps`; `shutdown_during_cleanup_is_bounded_and_readers_continue_before_takeover`; `slow_delete_triggers_force_the_100_ms_cleanup_boundary`; 1M reverse-delete measurement |
+| 9 P2 M2 ceilings | M2.10 | `m2_ceilings_reject_the_m1_only_latency_range`; `realistic_fixture_m2_latency_acceptance`; `internal_ssd_one_million_rebuild_within_120_seconds_ceiling_contract` and real internal-volume runner. Any measured miss remains OPEN RED; an unrun hardware check remains NOT RUN. |
+
+Every finding's code path has a named defect-sensitivity RED and GREEN in the runner. Acceptance measurements are separate from those correctness regressions. Any P1 that remains after this final round must remain a test-first RED item; this writer supplies executable evidence, not an independent review verdict.
 
 ## Replay invocation
 
@@ -14411,55 +15990,4 @@ Sensitivity tests use release optimization with LTO disabled and 16 codegen unit
 
 ## Replay results
 
-Measurement snapshot: **complete foreground replay 10**, committed source `458f45670863271c94a3866c5d022dae33dbc155`, 2026-10-13. The scratch worktree started at `e164d67`; the controller consumed `git show HEAD:docs/plans/M2-shared-store.md`, installed **34 complete files**, and finished every task and evidence command. Hardware: Apple M4 Pro, 48 GiB RAM, macOS 27.0.1, Rust 1.98.1; data/targets on the external APFS volume. These are measurements of this host and these probes, not installed-product or cross-platform acceptance.
-
-The final documentation-only commit adds this snapshot without altering an executable block. It is then replayed from its own committed blob using the same foreground invocation. Per-file SHA-256 records must remain identical to this snapshot. SHA-256 of the snapshot's `payload-sha256.json`: `345d6240e35c101df00d3e8dff52d61bfb4b7b8dc4571e9d415aba32d1ff90c7`. Logs and artifacts are retained in `/Volumes/Portable2TB/tmp/kuntu-m2/accepted-replay-10/`; the final verification log is `/Volumes/Portable2TB/tmp/kuntu-m2/replay-11.log`. The detached scratch worktree is deleted after that verification.
-
-| Check | Measured outcome |
-|---|---|
-| Mechanical application | 34 declared files matched 34 complete payloads; every installed file retained its payload hash |
-| fmt / clippy | Both passed; clippy used workspace/all-targets/locked and `-D warnings` |
-| Task sensitivity | **14 RED named assertion failures and 14 GREEN passes**, covering all ten tasks; no compile-error or zero-test RED counted |
-| Locked workspace suite | **164 passed**, 6 ignored benchmark tests; the required gate/recall/budget/storage benchmarks ran separately |
-| NAPI | Generated JS/d.ts byte-equal; **5 Node tests passed**; TypeScript passed; exact v2 path/unrelated-DB Rust fixtures passed |
-| Bundled runtime | **SQLite 3.53.2**; the ≥3.51.3 assertion and rejected-3.51.2 sensitivity test passed |
-| 1M storage | **549,076,992 bytes** (549.077 decimal MB), below 550,000,000; only 923,008 bytes headroom |
-| Reverse/stale delete | **5,000 entries**, **54.555 s total**, **13 write batches**; slow-trigger timer regression passed |
-| Stress | Two writer processes and eight readers; readers each ran 60 s during a physical **1,000,001-entry** rebuild; **626,153 probes**, **0 reader errors**, highest per-reader p99 **115 µs**, highest observed query **25.605 ms**; `integrity_check=ok` |
-| Stress writer roles | Lease holder completed one scan; non-holder committed **1,770 inbox writes**. Whole run **177.834 s**, including completion after the readers’ 60 s windows |
-| 30% / 70% kills | Killed just after batch commits at **63,193 / 141,290** entries (each <5,000 past its threshold); both resumed to **200,001**, no stale generation rows, equal to a fresh crawl, `quick_check=ok` |
-| State / migration / quarantine kills | `building_committed`, `before_ready`, `ready_committed`, `migration_ddl`, `quarantine_renamed`, and `identity_synced` all recovered; migration kill left minor 0 and reran atomically; quarantine recovery produced an empty reusable v3 file |
-| Concurrent first opens | **100 separate-process pairs**, both opening fresh SQLite stores; same 128-bit identity within every pair |
-| Takeover / exec | **4,974 ms** after holder kill; a second process reacquired the writer lease while the executed child was still alive; FD_CLOEXEC sensitivity passed |
-| CLI import | Actual `kfs store import`: **1 root, 200,001 entries, 0 errors**; full turso v2 source main/WAL/SHM hashes unchanged |
-| Scope | Rust, Node, daemon and actual CLI strict/empty/foreign-scope regressions passed; client flags did not grant union-only rows |
-| Compiled build authority | Future caller claims are rejected before opening/configuring SQLite; `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor` passed RED/GREEN |
-| Minor skew | **11 cells**: actual opens/writers for minors 0/1, current-reader/current-writer after migration, old-reader success, old-writer step-down, both newer-reader-floor refusals with unchanged main bytes, future epoch sentinel preserved |
-| Previous tag | Actual `v0.4.1` / `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` built from `git archive`; v2 old/new private reads preserved source bytes; old binary refused v3 without changing main bytes; GC preserved unregistered v2 |
-| Protected files | No tracked or untracked changes in `kuntu-crawler`, `kuntu-watcher`, `kuntu-scan`, or `.github` |
-
-The 1M gate uses one untimed warm-up followed by three measured runs, judged by the best. Times are printed to 0.1 ms; `0.0` is rounded, not a zero-duration claim. The fixture generator retains the realistic Zipf/directory/extension distribution and uses the logical root `/Users/kuntu/fixture`; fixture bytes and logs live under the allowed scratch directory. Its v3 cache is separate from M1/v2 caches. The 50,000-row option is covered by budget/recall tests; the table below times the default budget.
-
-| Class | Best measured warm ms | Candidates | M1 ceiling ms |
-|---|---:|---:|---:|
-| miss | 0.3 | 0 | 25 |
-| miss_non_ascii | 0.0 | 0 | 25 |
-| rare | 0.1 | 9 | 50 |
-| mid | 8.4 | 1477 | 100 |
-| broad | 40.5 | 5000 | 400 |
-| prefix3 | 46.8 | 5000 | 400 |
-| mixed | 8.4 | 271 | 300 |
-| all_rows | 28.6 | 5000 | 600 |
-| prefix1 | 37.0 | 5000 | 800 |
-
-All nine M1 ceilings passed. This snapshot missed the tighter M2 ceilings for `broad`. This is not a claim that every run did: the initial cold-fixture replay measured mid **10.2 ms**, broad **37.8 ms** and one-character prefix **43.8 ms**, missing those M2 ceilings while passing M1. Its fixture build took **289.405 s**; later complete replays reused that cache. The cold log remains `/Volumes/Portable2TB/tmp/kuntu-m2/m1-cold-replay-4.log`.
-
-### Deviations and evidence limits
-
-- Stale-ID selection remains a large-root index scan outside the write transaction. The delete measurement's longest complete helper call was **19.893 s**, including selection. The write loop checks the 100 ms deadline between individual deletes; one SQL statement, commit, busy wait or scheduler pause can exceed that deadline. Neither the total cleanup call nor all future reader latencies have a hard 100 ms bound. The measured stress maximum above is the observed bound on this run.
-- The ≤120 s **internal-SSD** rebuild target was not tested. The physical external-volume stress scan completed after **177.834 s** wall time for the whole controller run. Cold fixture generation is a different operation and is reported separately.
-- There is no released v3 minor-0 binary or v0.5.0 tag in this repository. Same-epoch minor skew uses two actual process roles with parameterized build minors; it is not evidence from a separately released N−1 v3 binary. The actual previous release, v0.4.1, is epoch 2 and has its own real-binary isolation test. A future release CI matrix must build its preceding v3 tag.
-- Linux policy is implemented but untested here. Windows shared-store support is not implemented by the Unix fd VFS; Windows, Android/NDK and installed Xross/Kunkun/helper-signing/TCC acceptance are not run. D12 remains macOS first; no consumer pin or release action was performed.
-- Import requires an **absolute, quiescent v2 source**. Copying a changing live v2 writer is not an atomic backup. Private import snapshots are retained in the destination; automatic snapshot cleanup is not implemented. Unregistered old epochs are preserved fail-closed until their binaries participate in lifetime coordination.
-
-Failed/interrupted attempts are not counted as acceptance: the early reverse-index/fixture pilot was interrupted; replay 1 exposed the reused generation/point probe, replay 2 a missing test import, replay 3 the Unix open ABI/mode bug, replay 4 the separate-process lock-create race, replay 6 an insensitive exec RED, and replay 7 its missing assertion. Each was corrected in the document and recommitted before the next clean replay. Replay 5 completed the earlier payload; replays 8 and 9 completed the strengthened payload. The additional checklist regression `caller_cannot_claim_a_future_build_minor_to_bypass_writer_floor` then failed against that payload: the public opener accepted a caller claim above the compiled version. The bound was added, the named RED/GREEN and clippy passed, and replay 10 is the complete final-code snapshot above. Raw top-level logs `replay-1.log` through `replay-10.log` are retained, including failures. No independent round-2 review was performed by this plan writer.
+Revision 3 replay has not yet run from a committed blob. The revision-2 measurements are historical evidence and are not acceptance for this payload. Measured revision-3 numbers will replace this paragraph after the complete foreground replay; executable blocks will then be replayed again from the final documentation commit.
