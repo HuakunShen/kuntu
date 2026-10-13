@@ -1117,11 +1117,14 @@ git commit -m "feat(kuntu-index): migration open rules, quarantine, SearchScope"
 ```
 
 
-**M2.4a2.** Re-export the scope type. This anchor occurs once; insert before it:
+**M2.4a2.** Re-export the scope type. This block occurs once; replace with (keeps rustfmt import order stable):
 
-<!-- apply {"task": "M2.4", "file": "crates/kuntu-core/src/lib.rs", "mode": "insert-before", "anchor": "pub use policy::PathPolicy;"} -->
+<!-- apply {"task": "M2.4", "file": "crates/kuntu-core/src/lib.rs", "mode": "replace-range", "start": "pub use model::{", "end": "pub use policy::PathPolicy;"} -->
 ```rust
-pub use model::SearchScope;
+pub use model::{
+  normalize_root_path, EntryKind, ExplainResult, MatchKind, PolicyDecision, SearchCandidate,
+  SearchConfig, SearchQuery, SearchResult, SearchRoot, SearchScope,
+};
 ```
 
 ## Task M2.5: writer discipline — batches, `BEGIN IMMEDIATE`, requests inbox
@@ -1492,7 +1495,6 @@ pub fn poll_takeover(
     std::thread::sleep(std::time::Duration::from_millis(interval_ms.min(500)));
   }
 }
-
 ```
 
 **M2.7b.** Tests — append to `mod tests` in `crates/kuntu-store/src/lease.rs`:
