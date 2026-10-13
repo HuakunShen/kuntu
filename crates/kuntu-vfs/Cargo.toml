@@ -9,3 +9,6 @@ repository.workspace = true
 rusqlite.workspace = true
 [build-dependencies]
 cc.workspace = true
+
+[features]
+test-hooks = []

@@ -35,6 +35,10 @@ extern sqlite3_vfs *sqlite3_vfs_find(const char*);
 extern int sqlite3_vfs_register(sqlite3_vfs*, int);
 extern int sqlite3_initialize(void);
 static sqlite3_vfs kv;
+static int (*unix_open_directory)(const char*,int*);
+#ifdef KUNTU_TEST_HOOKS
+int kuntu_vfs_test_delete(const char *p) { return kv.xDelete(&kv,p,1); }
+#endif
 static int parse(const char *p, int *fd, const char **leaf) {
  if (strncmp(p,"/kuntu-fd/",10)) return 0;
  char *end; long n=strtol(p+10,&end,10);
@@ -55,10 +59,24 @@ static int ka(const char *p,int m) {int fd;const char*l;int r=parse(p,&fd,&l);if
 static int ku(const char *p) {int fd;const char*l;int r=parse(p,&fd,&l);if(r<0)return -1;return r?unlinkat(fd,l,0):unlink(p);}
 static ssize_t kr(const char *p,char *b,size_t n) {int fd;const char*l;int r=parse(p,&fd,&l);if(r<0)return -1;return r?readlinkat(fd,l,b,n):readlink(p,b,n);}
 static int full(sqlite3_vfs*v,const char*p,int n,char*b) { (void)v;int fd;const char*l;if(parse(p,&fd,&l)!=1 || (int)strlen(p)>=n)return 14;strcpy(b,p);return 0; }
+static int kd(const char *p,int *out) {
+ int fd;const char *leaf;int r=parse(p,&fd,&leaf);
+ *out=-1;
+ if(r==0)return unix_open_directory(p,out);
+ if(r<0)return 14;
+ struct stat s;
+ if(fstat(fd,&s) || !S_ISDIR(s.st_mode))return 14;
+ /* SQLite closes this descriptor after its directory fsync. Keep the
+  * validated home descriptor pinned, and never leak the duplicate on exec. */
+ *out=fcntl(fd,F_DUPFD_CLOEXEC,0);
+ return *out<0?14:0;
+}
 int kuntu_vfs_register(void) {
  if(sqlite3_initialize())return 1;
  sqlite3_vfs*u=sqlite3_vfs_find("unix");if(!u || u->iVersion<3)return 1;
  kv=*u;kv.zName="kuntu-fd";kv.pNext=0;kv.xFullPathname=full;
+ unix_open_directory=(int(*)(const char*,int*))u->xGetSystemCall(u,"openDirectory");
+ if(!unix_open_directory || u->xSetSystemCall(u,"openDirectory",(syscall_ptr)kd))return 1;
  if(u->xSetSystemCall(u,"open",(syscall_ptr)ko) || u->xSetSystemCall(u,"stat",(syscall_ptr)ks) || u->xSetSystemCall(u,"lstat",(syscall_ptr)kl) || u->xSetSystemCall(u,"access",(syscall_ptr)ka) || u->xSetSystemCall(u,"unlink",(syscall_ptr)ku) || u->xSetSystemCall(u,"readlink",(syscall_ptr)kr))return 1;
  return sqlite3_vfs_register(&kv,0);
 }
