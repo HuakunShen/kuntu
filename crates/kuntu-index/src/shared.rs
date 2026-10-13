@@ -34,14 +34,15 @@ pub fn fault(point: &str) {
 #[cfg(test)]
 thread_local! {
   pub(crate) static OPEN_CHECK_ERRORS: std::cell::RefCell<std::collections::VecDeque<i32>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+  pub(crate) static OPEN_INTEGRITY_CHECKS: Cell<usize> = const { Cell::new(0) };
   pub(crate) static OPEN_CHECK_TIMEOUT: Cell<i64> = const { Cell::new(0) };
 }
-fn opening_check(raw: &rusqlite::Connection) -> rusqlite::Result<String> {
+fn injected_open_error(_raw: &rusqlite::Connection) -> rusqlite::Result<()> {
   #[cfg(test)]
   {
     OPEN_CHECK_TIMEOUT.with(|t| {
       t.set(
-        raw
+        _raw
           .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
           .unwrap(),
       )
@@ -53,7 +54,24 @@ fn opening_check(raw: &rusqlite::Connection) -> rusqlite::Result<String> {
       ));
     }
   }
+  Ok(())
+}
+fn opening_check(raw: &rusqlite::Connection) -> rusqlite::Result<()> {
+  injected_open_error(raw)?;
+  // Header validation is bounded; schema, identity and floors follow in from_raw.
+  raw
+    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+    .map(|_| ())
+}
+fn recovery_check(raw: &rusqlite::Connection) -> rusqlite::Result<String> {
+  injected_open_error(raw)?;
+  #[cfg(test)]
+  OPEN_INTEGRITY_CHECKS.with(|n| n.set(n.get() + 1));
   raw.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+}
+fn corruption_error(error: &IndexError) -> bool {
+  matches!(error, IndexError::Engine(e) if matches!(e.sqlite_error_code(),
+    Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)))
 }
 fn confirmed_corruption(checked: rusqlite::Result<String>) -> Result<bool> {
   match checked {
@@ -108,40 +126,44 @@ impl KuntuIndex {
     };
     let raw = rusqlite::Connection::open_with_flags_and_vfs(name, flags, "kuntu-fd")?;
     raw.busy_timeout(Duration::from_millis(5000))?;
-    if confirmed_corruption(opening_check(&raw))? {
-      drop(raw);
-      drop(reader);
-      if readonly {
-        return Err(IndexError::RecreateRequired);
+    let opened = opening_check(&raw)
+      .map_err(IndexError::Engine)
+      .and_then(|_| Self::from_raw(raw, Some(home.clone()), true, readonly, consumer, minor));
+    match opened {
+      Ok(mut result) => {
+        result._reader = Some(reader);
+        Ok(result)
       }
-      let _writer = home
-        .lock("indexer.lock", false)?
-        .ok_or(IndexError::LeaseRequired)?;
-      let _epoch = home
-        .lock("epoch-3.lock", false)?
-        .ok_or(IndexError::LeaseRequired)?;
-      // The failed connection and its lifetime lock are gone. Reopen and
-      // confirm under both recovery capabilities before moving any member.
-      let recheck = rusqlite::Connection::open_with_flags_and_vfs(
-        home.sqlite_name("index.v3.db")?,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        "kuntu-fd",
-      )?;
-      recheck.busy_timeout(Duration::from_millis(5000))?;
-      let corrupt = confirmed_corruption(opening_check(&recheck))?;
-      drop(recheck);
-      if corrupt {
-        home.resume_quarantine(3, &_writer, &_epoch)?;
+      Err(e) if !corruption_error(&e) => Err(e),
+      Err(_) => {
+        drop(reader);
+        if readonly {
+          return Err(IndexError::RecreateRequired);
+        }
+        let writer = home
+          .lock("indexer.lock", false)?
+          .ok_or(IndexError::LeaseRequired)?;
+        let epoch = home
+          .lock("epoch-3.lock", false)?
+          .ok_or(IndexError::LeaseRequired)?;
+        let recheck = rusqlite::Connection::open_with_flags_and_vfs(
+          home.sqlite_name("index.v3.db")?,
+          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+          "kuntu-fd",
+        )?;
+        recheck.busy_timeout(Duration::from_millis(5000))?;
+        let corrupt = confirmed_corruption(recovery_check(&recheck))?;
+        drop(recheck);
+        if corrupt {
+          home.resume_quarantine(3, &writer, &epoch)?;
+        }
+        drop(epoch);
+        drop(writer);
+        drop(_boot);
+        drop(_local);
+        Self::open_shared_minor(home, readonly, consumer, minor)
       }
-      drop(_epoch);
-      drop(_writer);
-      drop(_boot);
-      drop(_local);
-      return Self::open_shared_minor(home, readonly, consumer, minor);
     }
-    let mut result = Self::from_raw(raw, Some(home), true, readonly, consumer, minor)?;
-    result._reader = Some(reader);
-    Ok(result)
   }
   pub(crate) fn open_private(path: &Path, readonly: bool) -> Result<Self> {
     kuntu_vfs::register()?;

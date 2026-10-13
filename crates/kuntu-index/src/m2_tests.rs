@@ -1127,3 +1127,21 @@ fn recovery_operational_error_preserves_database_members() {
   );
   assert_eq!(member_snapshot(&h), before);
 }
+
+#[test]
+fn ordinary_opens_and_requests_skip_whole_store_integrity_checks() {
+  let (h, config, seed) = fixture();
+  drop(seed);
+  shared::OPEN_INTEGRITY_CHECKS.with(|n| n.set(0));
+  for readonly in [true, false] {
+    let index = KuntuIndex::open_shared(h.clone(), readonly, "strict").unwrap();
+    for _ in 0..3 {
+      index.status().unwrap();
+      index
+        .search_with_metrics(&config, &SearchQuery::new("visible"))
+        .unwrap();
+    }
+  }
+  shared::OPEN_INTEGRITY_CHECKS
+    .with(|n| assert_eq!(n.get(), 0, "ordinary opens scanned the database"));
+}

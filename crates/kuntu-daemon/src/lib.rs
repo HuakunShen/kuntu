@@ -32,6 +32,7 @@ pub struct DaemonRunStats {
   pub addr: String,
   pub requests: usize,
   pub elapsed_ms: u128,
+  pub reader_connections: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +108,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
   }
   drop(init);
   let mut requests = 0;
+  let reader_connections = std::sync::atomic::AtomicUsize::new(0);
   let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(8);
   let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
   thread::scope(|scope| -> Result<(), BackendError> {
@@ -114,27 +116,50 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
       let receiver = receiver.clone();
       let home = home.clone();
       let config = &config;
-      scope.spawn(move || loop {
-        let stream = receiver.lock().expect("worker queue").recv();
-        let Ok(stream) = stream else { break };
-        let mut stream = stream;
-        let request = match read_http_request(&mut stream) {
-          Ok(Some(r)) => r,
-          _ => continue,
-        };
-        let readonly = matches!(
-          (request.method.as_str(), request.path.as_str()),
-          ("GET", _) | ("POST", "/search")
-        );
-        let opened = if let Some(h) = &home {
-          KuntuIndex::open_shared(h.clone(), readonly, "daemon")
-        } else if readonly {
-          KuntuIndex::open_read_only(&config.db_path)
-        } else {
-          KuntuIndex::open(&config.db_path)
-        };
-        if let Ok(mut index) = opened {
-          let response = handle_request(&mut index, request, &config.allowed_roots);
+      let reader_connections = &reader_connections;
+      scope.spawn(move || {
+        let mut reader = None;
+        let mut writer = None;
+        loop {
+          let stream = receiver.lock().expect("worker queue").recv();
+          let Ok(stream) = stream else { break };
+          let mut stream = stream;
+          let request = match read_http_request(&mut stream) {
+            Ok(Some(r)) => r,
+            _ => continue,
+          };
+          let readonly = matches!(
+            (request.method.as_str(), request.path.as_str()),
+            ("GET", _) | ("POST", "/search")
+          );
+          let slot = if readonly { &mut reader } else { &mut writer };
+          if slot.is_none() {
+            if readonly {
+              reader_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let opened = if let Some(h) = &home {
+              KuntuIndex::open_shared(h.clone(), readonly, "daemon")
+            } else if readonly {
+              KuntuIndex::open_read_only(&config.db_path)
+            } else {
+              KuntuIndex::open(&config.db_path)
+            };
+            match opened {
+              Ok(index) => *slot = Some(index),
+              Err(e) => {
+                let _ = write_http_response(
+                  &mut stream,
+                  &json_response(500, json!({"error":e.to_string()})),
+                );
+                continue;
+              }
+            }
+          }
+          let response = handle_request(
+            slot.as_mut().expect("opened worker connection"),
+            request,
+            &config.allowed_roots,
+          );
           let _ = write_http_response(&mut stream, &response);
         }
       });
@@ -168,6 +193,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
     addr,
     requests,
     elapsed_ms: started.elapsed().as_millis(),
+    reader_connections: reader_connections.load(std::sync::atomic::Ordering::Relaxed),
   })
 }
 
@@ -664,5 +690,69 @@ mod tests {
     assert_eq!(response.status, 200);
     assert!(response.body.contains("visible-file"));
     assert!(!response.body.contains(".hidden-file"));
+  }
+}
+
+#[cfg(test)]
+mod connection_tests {
+  use super::*;
+  fn health_run(db_path: PathBuf, requests: usize) -> (DaemonRunStats, Vec<f64>) {
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path,
+      addr: addr.clone(),
+      duration: None,
+      max_requests: Some(requests),
+      allowed_roots: vec![],
+      allow_non_loopback: false,
+    };
+    let worker = thread::spawn(move || serve(config).unwrap());
+    let mut samples = Vec::new();
+    for _ in 0..requests {
+      let deadline = Instant::now() + Duration::from_secs(10);
+      let start = Instant::now();
+      let mut stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(stream) => break stream,
+          Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+          Err(e) => panic!("daemon startup: {e}"),
+        }
+      };
+      stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+      stream.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+      let mut response = String::new();
+      stream.read_to_string(&mut response).unwrap();
+      assert!(response.contains("\"ok\":true"), "{response}");
+      samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    (worker.join().unwrap(), samples)
+  }
+  #[test]
+  fn health_requests_reuse_worker_reader_connections() {
+    let path = std::env::temp_dir().join(format!("daemon-pool-{}.sqlite", std::process::id()));
+    let (stats, _) = health_run(path, 16);
+    assert!(
+      stats.reader_connections <= 4,
+      "opened {} readers for 16 requests",
+      stats.reader_connections
+    );
+  }
+  #[test]
+  #[ignore = "owner-supplied 1M shared-store copy; release latency evidence"]
+  fn million_store_daemon_health_latency() {
+    let path = PathBuf::from(std::env::var_os("KUNTU_HEALTH_DB").unwrap());
+    let (stats, samples) = health_run(path, 20);
+    eprintln!(
+      "M2_HEALTH reader_connections={} first_ms={:.3} warm_ms={:?}",
+      stats.reader_connections,
+      samples[0],
+      &samples[1..]
+    );
   }
 }
