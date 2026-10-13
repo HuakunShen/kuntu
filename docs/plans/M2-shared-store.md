@@ -713,8 +713,6 @@ Why: turso holds an exclusive cross-process lock (RESEARCH §6.1); SQLite WAL pa
 ```toml
 rusqlite = { version = "0.32", features = ["bundled"] }
 kuntu-store = { path = "../kuntu-store" }
-
-[lib]
 ```
 
 **M2.3b.** Engine import shim. This block occurs once; replace with:
