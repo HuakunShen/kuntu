@@ -13,8 +13,13 @@ path = "src/lib.rs"
 [dependencies]
 kuntu-core = { path = "../kuntu-core" }
 kuntu-index = { path = "../kuntu-index" }
+kuntu-store.workspace = true
 napi = "3"
 napi-derive = "3"
 
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+kuntu-legacy-index.workspace = true
+rusqlite.workspace = true

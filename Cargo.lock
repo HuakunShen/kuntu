@@ -1147,9 +1147,12 @@ version = "0.1.0"
 dependencies = [
  "kuntu-core",
  "kuntu-index",
+ "kuntu-legacy-index",
+ "kuntu-store",
  "napi",
  "napi-build",
  "napi-derive",
+ "rusqlite",
 ]
 
 [[package]]
