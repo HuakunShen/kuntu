@@ -14375,4 +14375,55 @@ Sensitivity tests use release optimization with LTO disabled and 16 codegen unit
 
 ## Replay results
 
-Pending the committed-blob replay. Pilot compilation/tests are not acceptance evidence. The final revision must replace this paragraph with measured results and retain all failed or not-run targets as explicit deviations.
+Measurement snapshot: **complete foreground replay 8**, committed source `49e1fc23f8b714bb97bbfb1cf2dd29097febc031`, 2026-10-13. The scratch worktree started at `e164d67`; the controller consumed `git show HEAD:docs/plans/M2-shared-store.md`, installed **34 complete files**, and finished every task and evidence command. Hardware: Apple M4 Pro, 48 GiB RAM, macOS 27.0.1, Rust 1.98.1; data/targets on the external APFS volume. These are measurements of this host and these probes, not installed-product or cross-platform acceptance.
+
+The final documentation-only commit adds this snapshot without altering an executable block. It is then replayed from its own committed blob using the same foreground invocation. Per-file SHA-256 records must remain identical to this snapshot. SHA-256 of the snapshot's `payload-sha256.json`: `99283950046907d3e5b5082bf7658cd3800a4450f4cf6a66e87dc39e89a2032d`. Logs and artifacts are retained in `/Volumes/Portable2TB/tmp/kuntu-m2/accepted-replay-8/`; the final verification log is `/Volumes/Portable2TB/tmp/kuntu-m2/replay-9.log`. The detached scratch worktree is deleted after that verification.
+
+| Check | Measured outcome |
+|---|---|
+| Mechanical application | 34 declared files matched 34 complete payloads; every installed file retained its payload hash |
+| fmt / clippy | Both passed; clippy used workspace/all-targets/locked and `-D warnings` |
+| Task sensitivity | **13 RED named assertion failures and 13 GREEN passes**, covering all ten tasks; no compile-error or zero-test RED counted |
+| Locked workspace suite | **163 passed**, 6 ignored benchmark tests; the required gate/recall/budget/storage benchmarks ran separately |
+| NAPI | Generated JS/d.ts byte-equal; **5 Node tests passed**; TypeScript passed; exact v2 path/unrelated-DB Rust fixtures passed |
+| Bundled runtime | **SQLite 3.53.2**; the ≥3.51.3 assertion and rejected-3.51.2 sensitivity test passed |
+| 1M storage | **549,076,992 bytes** (549.077 decimal MB), below 550,000,000; only 923,008 bytes headroom |
+| Reverse/stale delete | **5000 entries**, **16.879 s total**, **6 write batches**; slow-trigger timer regression passed |
+| Stress | Two writer processes and eight readers; readers each ran 60 s during a physical **1,000,001-entry** rebuild; **740,100 probes**, **0 reader errors**, highest per-reader p99 **78 µs**, highest observed query **87.120 ms**; `integrity_check=ok` |
+| Stress writer roles | Lease holder completed one scan; non-holder committed **1,781 inbox writes**. Whole run **168.102 s**, including completion after the readers' 60 s windows |
+| 30% / 70% kills | Killed just after batch commits at **62,435 / 140,593** entries (each <5,000 past its threshold); both resumed to **200,001**, no stale generation rows, equal to a fresh crawl, `quick_check=ok` |
+| State / migration / quarantine kills | `building_committed`, `before_ready`, `ready_committed`, `migration_ddl`, `quarantine_renamed`, and `identity_synced` all recovered; migration kill left minor 0 and reran atomically; quarantine recovery produced an empty reusable v3 file |
+| Concurrent first opens | **100 separate-process pairs**, both opening fresh SQLite stores; same 128-bit identity within every pair |
+| Takeover / exec | **5,172 ms** after holder kill; a second process reacquired the writer lease while the executed child was still alive; FD_CLOEXEC sensitivity passed |
+| CLI import | Actual `kfs store import`: **1 root, 200,001 entries, 0 errors**; full turso v2 source main/WAL/SHM hashes unchanged |
+| Scope | Rust, Node, daemon and actual CLI strict/empty/foreign-scope regressions passed; client flags did not grant union-only rows |
+| Minor skew | **11 cells**: actual opens/writers for minors 0/1, current-reader/current-writer after migration, old-reader success, old-writer step-down, both newer-reader-floor refusals with unchanged main bytes, future epoch sentinel preserved |
+| Previous tag | Actual `v0.4.1` / `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` built from `git archive`; v2 old/new private reads preserved source bytes; old binary refused v3 without changing main bytes; GC preserved unregistered v2 |
+| Protected files | No tracked or untracked changes in `kuntu-crawler`, `kuntu-watcher`, `kuntu-scan`, or `.github` |
+
+The 1M gate uses one untimed warm-up followed by three measured runs, judged by the best. Times are printed to 0.1 ms; `0.0` is rounded, not a zero-duration claim. The fixture generator retains the realistic Zipf/directory/extension distribution and uses the logical root `/Users/kuntu/fixture`; fixture bytes and logs live under the allowed scratch directory. Its v3 cache is separate from M1/v2 caches. The 50,000-row option is covered by budget/recall tests; the table below times the default budget.
+
+| Class | Best measured warm ms | Candidates | M1 ceiling ms |
+|---|---:|---:|---:|
+| miss | 0.0 | 0 | 25 |
+| miss_non_ascii | 0.0 | 0 | 25 |
+| rare | 0.1 | 9 | 50 |
+| mid | 5.3 | 1477 | 100 |
+| broad | 23.7 | 5000 | 400 |
+| prefix3 | 23.1 | 5000 | 400 |
+| mixed | 5.4 | 271 | 300 |
+| all_rows | 16.6 | 5000 | 600 |
+| prefix1 | 21.1 | 5000 | 800 |
+
+
+All nine M1 ceilings passed. In this snapshot the measured miss, rare/mid, 5k broad and one-character prefix classes also met their tighter M2 ceilings. This is not a claim that every run did: the initial cold-fixture replay measured mid **10.2 ms**, broad **37.8 ms** and one-character prefix **43.8 ms**, missing those M2 ceilings while passing M1. Its fixture build took **289.405 s**; later complete replays reused that cache. The cold log remains `/Volumes/Portable2TB/tmp/kuntu-m2/m1-cold-replay-4.log`.
+
+### Deviations and evidence limits
+
+- Stale-ID selection remains a large-root index scan outside the write transaction. The delete measurement's longest complete helper call was **8.603 s**, including selection. The write loop checks the 100 ms deadline between individual deletes; one SQL statement, commit, busy wait or scheduler pause can exceed that deadline. Neither the total cleanup call nor all future reader latencies have a hard 100 ms bound. The measured stress maximum above is the observed bound on this run.
+- The ≤120 s **internal-SSD** rebuild target was not tested. The physical external-volume stress scan completed after **168.102 s** wall time for the whole controller run. Cold fixture generation is a different operation and is reported separately.
+- There is no released v3 minor-0 binary or v0.5.0 tag in this repository. Same-epoch minor skew uses two actual process roles with parameterized build minors; it is not evidence from a separately released N−1 v3 binary. The actual previous release, v0.4.1, is epoch 2 and has its own real-binary isolation test. A future release CI matrix must build its preceding v3 tag.
+- Linux policy is implemented but untested here. Windows shared-store support is not implemented by the Unix fd VFS; Windows, Android/NDK and installed Xross/Kunkun/helper-signing/TCC acceptance are not run. D12 remains macOS first; no consumer pin or release action was performed.
+- Import requires an **absolute, quiescent v2 source**. Copying a changing live v2 writer is not an atomic backup. Private import snapshots are retained in the destination; automatic snapshot cleanup is not implemented. Unregistered old epochs are preserved fail-closed until their binaries participate in lifetime coordination.
+
+Failed/interrupted attempts are not counted as acceptance: the early reverse-index/fixture pilot was interrupted; replay 1 exposed the reused generation/point probe, replay 2 a missing test import, replay 3 the Unix open ABI/mode bug, replay 4 the separate-process lock-create race, replay 6 an insensitive exec RED, and replay 7 its missing assertion. Each was corrected in the document and recommitted before the next clean replay. Replay 5 completed the earlier payload; replay 8 is the complete strengthened snapshot above. Raw top-level logs `replay-1.log` through `replay-8.log` are retained, including failures. No independent round-2 review was performed by this plan writer.
