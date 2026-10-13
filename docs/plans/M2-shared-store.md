@@ -535,8 +535,12 @@ pub fn try_acquire(home: &Path, schema_minor: u32) -> Result<Option<IndexerLease
   use fs4::fs_std::FileExt;
   std::fs::create_dir_all(locks_dir(home)).map_err(|e| StoreError::Io(e.to_string()))?;
   let path = indexer_lock_path(home);
+  // `.truncate(false)` is deliberate: the file is truncated (`set_len(0)`)
+  // only after the lock is acquired, so a contender never observes a
+  // half-written payload.
   let mut file = OpenOptions::new()
     .create(true)
+    .truncate(false)
     .write(true)
     .open(&path)
     .map_err(|e| StoreError::Io(e.to_string()))?;
