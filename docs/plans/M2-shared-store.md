@@ -15696,7 +15696,7 @@ const cases:Case[]=[
  {task:'M2.10',file:'crates/kuntu-cli/src/args.rs',old:'"store" => {',bad:'"store-disabled" => {',crate:'kuntu-cli',test:'args::tests::store_import_parser_accepts_source_and_rejects_missing_source'},
 ];
 const base='/Volumes/Portable2TB/tmp/kuntu-m2/rev3/replay';mkdirSync(base,{recursive:true});
-function command(args:string[],cwd?:string){const r=spawnSync(args[0]!,args.slice(1),{cwd,env:{...process.env,...(args[0]==='cargo'?{CARGO_PROFILE_RELEASE_LTO:'false',CARGO_PROFILE_RELEASE_CODEGEN_UNITS:'16'}:{})},encoding:'utf8',maxBuffer:16*1024*1024});return {status:r.status,text:r.stdout+r.stderr};}
+function command(args:string[],cwd?:string){const r=spawnSync(args[0]!,args.slice(1),{cwd,env:process.env,encoding:'utf8',maxBuffer:16*1024*1024});return {status:r.status,text:r.stdout+r.stderr};}
 function test(c:Case){
  if(c.crate==='internal')return command(['bun','scripts/m2-internal-rebuild.ts','--contracts']);
  if(c.crate==='smoke'){const b=command(['pnpm','run','build:debug'],'crates/kuntu-napi');assert.equal(b.status,0,b.text);return command(['bun','scripts/m2-consumer-smoke.ts']);}
@@ -15704,7 +15704,7 @@ function test(c:Case){
   const b=command(['pnpm','run','build:debug'],'crates/kuntu-napi');assert.equal(b.status,0,b.text);
   return command(['node','--test','--test-name-pattern',c.test,'test/index.test.cjs'],'crates/kuntu-napi');
  }
- return command(['cargo','test','--release','-p',c.crate,c.test,'--','--exact','--test-threads=1','--nocapture']);
+ return command(['cargo','test','-p',c.crate,c.test,'--','--exact','--test-threads=1','--nocapture']);
 }
 const chosen=process.argv[2];
 for(const c of cases.filter(c=>!chosen||c.task===chosen)){
@@ -15986,7 +15986,7 @@ Every finding's code path has a named defect-sensitivity RED and GREEN in the ru
 
 From a detached scratch worktree at `e164d67` under `/Volumes/Portable2TB/ExtDev/`, save `git show HEAD:docs/plans/M2-shared-store.md` from the plan worktree into `/Volumes/Portable2TB/tmp/kuntu-m2/committed-plan.md`. Extract only the `scripts/m2-replay.ts` complete-file block to `/Volumes/Portable2TB/tmp/kuntu-m2/replay-entry.ts`, then run `bun /Volumes/Portable2TB/tmp/kuntu-m2/replay-entry.ts /Volumes/Portable2TB/tmp/kuntu-m2/committed-plan.md` in that scratch worktree. The script itself installs all payload files. Remove only that scratch worktree when done. No task asks an agent to push, merge, tag or commit implementation files.
 
-Sensitivity tests use release optimization with LTO disabled and 16 codegen units to keep repeated fault builds practical. The M1 gate and process acceptance use the repository's default release profile. Cached fixtures are v3-specific and separate from M1/v2 caches. A successful M1 gate is not a claim that the tighter M2 ceilings are met.
+Sensitivity assertions use the debug test profile; NAPI sensitivity uses debug addons. The M1/M2 latency gates, storage measurement and all process acceptance use the repository's default release profile. This profile choice does not relax an acceptance ceiling. Cached fixtures are v3-specific and separate from M1/v2 caches. A successful M1 gate is not a claim that the tighter M2 ceilings are met.
 
 ## Replay results
 
