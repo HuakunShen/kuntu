@@ -63,6 +63,7 @@ The complete write set is the following list, including regenerated dependencies
 - `crates/kuntu-daemon/Cargo.toml`
 - `crates/kuntu-daemon/src/lib.rs`
 - `Cargo.lock`
+- `scripts/m2-previous-tag.ts`
 - `scripts/m2-evidence.ts`
 - `scripts/m2-red.ts`
 - `scripts/m2-replay.ts`
@@ -71,7 +72,7 @@ The complete write set is the following list, including regenerated dependencies
 
 Shared homes are absolute paths resolved with no-follow `openat` directory traversal. Ancestors must belong to root or the user; a user-owned mounted volume may have group-write permissions because each traversed object is opened and pinned. World-write without sticky protection is refused. The final home and `locks/run/logs` require user ownership and exact 0700. Files are 0600 at creation; existing symlinks and hard links are refused. No process-global umask changes or temporary fallback occur. One directory descriptor is reused per inode in a process, so SQLite's shared Unix shm nodes cannot outlive the descriptor encoded in their filenames.
 
-Bootstrap serialization covers identity publication and first schema creation. The bootstrap, migration, indexer and epoch lock files are permanent; JSON holder payloads are informational. `KuntuIndex` owns its lease capability. Shared bulk methods refuse a missing capability; private v3 and v2 methods acquire their private lease first. `WriterService::start` is the persistent embedding entry point, used by the shared NAPI factory and the daemon. A service destructor joins its worker. The daemon uses four scoped workers and an eight-connection queue; every return joins them. Read endpoints open read-only connections; bulk requests enter the guarded inbox. The CLI retains `--db` and otherwise resolves the shared home.
+Transient ENOENT during permanent-lock creation is retried at most 100 times through the same validated directory fd; permission/symlink failures fail immediately. Bootstrap serialization covers identity publication and first schema creation. The bootstrap, migration, indexer and epoch lock files are permanent; JSON holder payloads are informational. `KuntuIndex` owns its lease capability. Shared bulk methods refuse a missing capability; private v3 and v2 methods acquire their private lease first. `WriterService::start` is the persistent embedding entry point, used by the shared NAPI factory and the daemon. A service destructor joins its worker. The daemon uses four scoped workers and an eight-connection queue; every return joins them. Read endpoints open read-only connections; bulk requests enter the guarded inbox. The CLI retains `--db` and otherwise resolves the shared home.
 
 Compatibility is validated before WAL configuration or DDL, including read-only opens, `schema_epoch`, store identity and reader/writer floors. Initial schema creation, migrations, inbox/consumer updates, batches, cleanup and completion use `begin_writer_txn`; RAII rollback applies on error. The empty-store bootstrap exception is available only to an exclusive transaction with no existing user tables. A minor-1 holder migrates under `migrate.lock` plus an exclusive transaction; minor-0 readers keep working and minor-0 writers step down. The private v2 compatibility backend retains the old engine and its original file format. It cannot open a shared store; its guarded transactions re-check v2 user_version instead of v3 metadata.
 
@@ -79,15 +80,15 @@ Each scan registers `building` before crawling without holding a SQL transaction
 
 Name/path postings keep the M1 term-first, covering range scan; fetches keep the bare rowid `IN` projection with `id`. The reverse path is a compressed `reverse_postings` record keyed by entry ID. The lossy-path verifier reads that rowid record. Replacement and delete triggers decode its terms and delete by the term-first primary keys, avoiding an `entry_id` scan of postings. Tests explain the production builders, including the trigger's builder before `OLD.id` substitution. This replaces the space-heavy reverse indexes considered in the pilot.
 
-Every open holds the epoch lifetime lock. Quarantine requires both the indexer lease and exclusive epoch access, publishes a synced recovery marker, moves the DB/WAL/SHM group under that marker, and resumes that sequence before reuse. GC only considers epochs strictly below 3; a live epoch holder blocks it and resets the non-use clock. Future epochs are never deleted. Unregistered old epochs are preserved fail-closed. Old binaries that do not participate in epoch lifetime coordination require a product rollout before automatic retention can be enabled; the skew matrix below simulates cooperating minor versions within v3.
+Every open holds the epoch lifetime lock. Quarantine requires both the indexer lease and exclusive epoch access, publishes a synced recovery marker, moves the DB/WAL/SHM group under that marker, and resumes that sequence before reuse. GC only considers epochs strictly below 3; a live epoch holder blocks it and resets the non-use clock. Future epochs are never deleted. Unregistered old epochs are preserved fail-closed. Old binaries that do not participate in epoch lifetime coordination require a product rollout before automatic retention can be enabled; the minor matrix below simulates cooperating versions within v3. The actual previous-tag controller builds v0.4.1 from archive commit `a5df3559671b09f2af75fdd28ed5a4a06ab7dc56` and checks epoch2/epoch3 isolation and unchanged bytes on refusal. No released v3 minor-0 binary exists yet.
 
 Import snapshots the source main file and sidecars through read-only opened directory handles into the private destination, verifies v2 on that copy, registers its enabled roots, then rebuilds from the filesystem under the destination lease. Source main/WAL/SHM bytes remain unchanged. A source must be quiescent while its three files are copied; importing a live, changing v2 writer is not an atomic snapshot protocol.
 
 ## RED/GREEN method and foreground runner
 
-M2.1–M2.10 each have a named regression and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
+M2.1–M2.10 each have a named regression (plus deterministic lock-creation and slow-delete boundary regressions) and an exact unique-anchor defect replacement in `scripts/m2-red.ts`. The runner first installs the complete compilation prerequisites, then the task's test. RED is a **sensitivity run against the specified defect**, not a claim that a missing workspace member or an unregistered test failed. It requires a non-zero result containing the named test and an assertion failure; it rejects compile failures and zero-test passes. The original payload is restored in `finally`, then the same named test must be GREEN. These replacements are ordinary exact string replacements, never unified diffs. This ordering avoids round-1's invalid compile states while proving each test observes the missing fix.
 
-The final replay installs every complete file from the committed plan in task order, runs all ten RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
+The final replay installs every complete file from the committed plan in task order, runs all ten tasks with twelve RED/GREEN pairs, fmt, clippy, locked workspace tests, generated NAPI checks, the 1M M1 gate, real process crash tests, 60 s stress, and the skew matrix. The controller awaits all processes and kills test children on failure; it launches no detached worker. All data, targets and logs use the scratch directory. `scripts/m2-replay.ts` is the exact entry point; extract its complete payload first, then pass a file obtained with `git show HEAD:docs/plans/M2-shared-store.md`.
 
 
 ## Task M2.1: descriptor-safe foundation and bootstrap
@@ -222,7 +223,7 @@ fn directory(parent: &File, name: &std::ffi::OsStr, create: bool) -> Result<File
   if create {
     match mkdirat(parent, name, Mode::from_bits_truncate(0o700)) {
       Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
-      Err(e) => return Err(err(e)),
+      Err(e) => return Err(err(format!("create-directory: {e}"))),
     }
   }
   let f: OwnedFd = openat(
@@ -231,8 +232,23 @@ fn directory(parent: &File, name: &std::ffi::OsStr, create: bool) -> Result<File
     OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
     Mode::empty(),
   )
-  .map_err(err)?;
+  .map_err(|e| err(format!("open-directory: {e}")))?;
   Ok(f.into())
+}
+// Retry only transient creation failure through the same validated fd.
+fn create_lock_file(parent: &File, mut open: impl FnMut() -> nix::Result<OwnedFd>) -> Result<File> {
+  let mut attempts = 0;
+  loop {
+    match open() {
+      Ok(fd) => return Ok(fd.into()),
+      Err(nix::errno::Errno::ENOENT) if attempts < 100 => {
+        attempts += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        validate(parent, true)?;
+      }
+      Err(e) => return Err(err(format!("open-lock-file: {e}"))),
+    }
+  }
 }
 pub fn allowed_fs(name: &str) -> bool {
   matches!(name, "apfs" | "hfs")
@@ -400,15 +416,18 @@ impl Home {
   pub fn lock(&self, name: &str, wait: bool) -> Result<Option<Lease>> {
     let locks = directory(&self.dir, std::ffi::OsStr::new("locks"), false)?;
     validate(&locks, true)?;
-    let mut fd: File = openat(
-      &locks,
-      name,
-      OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-      Mode::from_bits_truncate(0o600),
-    )
-    .map_err(err)?
-    .into();
-    let s = fstat(&fd).map_err(err)?;
+    if name.contains('/') || name.contains("..") {
+      return Err(err("Invalid lock leaf."));
+    }
+    let mut fd = create_lock_file(&locks, || {
+      openat(
+        &locks,
+        name,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+      )
+    })?;
+    let s = fstat(&fd).map_err(|e| err(format!("lock-file: {e}")))?;
     if s.st_nlink != 1 || s.st_uid != getuid().as_raw() || s.st_mode & 0o777 != 0o600 {
       return Err(err("Invalid permanent lock inode."));
     }
@@ -419,7 +438,7 @@ impl Home {
     }
     if name == "indexer.lock" {
       fd.set_len(0)?;
-      serde_json::to_writer(&mut fd,&serde_json::json!({"pid":std::process::id(),"started_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(err)?.as_secs(),"version":"0.6.0","exe":std::env::current_exe()?.to_string_lossy(),"schema_minor":1})).map_err(err)?;
+      serde_json::to_writer(&mut fd,&serde_json::json!({"pid":std::process::id(),"started_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| err(format!("lock-file: {e}")))?.as_secs(),"version":"0.6.0","exe":std::env::current_exe()?.to_string_lossy(),"schema_minor":1})).map_err(|e| err(format!("lock-file: {e}")))?;
       fd.sync_data()?;
     }
     Ok(Some(Lease {
@@ -462,7 +481,7 @@ impl Home {
     if [a, b].iter().any(|p| p.contains('/') || p.contains("..")) {
       return Err(err("Invalid rename."));
     }
-    nix::fcntl::renameat(&*self.dir, a, &*self.dir, b).map_err(err)
+    nix::fcntl::renameat(&*self.dir, a, &*self.dir, b).map_err(|e| err(format!("rename-file: {e}")))
   }
   pub fn remove(&self, n: &str) -> Result<()> {
     unlinkat(&*self.dir, n, UnlinkatFlags::NoRemoveDir).map_err(std::io::Error::from)
@@ -724,6 +743,35 @@ fn atomic_identity_is_128_bits_and_existing_document_is_preserved() {
   assert_eq!(h.id().unwrap().len(), 32);
   assert_eq!(h.id().unwrap(), Home::open(&h.path).unwrap().id().unwrap());
   assert_eq!(before, std::fs::read(h.path.join("store.json")).unwrap());
+}
+
+#[test]
+fn transient_lock_creation_retries_only_not_found_under_the_same_directory_fd() {
+  let home = home();
+  let parent = directory(&home.dir, std::ffi::OsStr::new("locks"), false).unwrap();
+  let mut first = true;
+  let file = create_lock_file(&parent, || {
+    if first {
+      first = false;
+      return Err(nix::errno::Errno::ENOENT);
+    }
+    openat(
+      &parent,
+      "retry.lock",
+      OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+      Mode::from_bits_truncate(0o600),
+    )
+  })
+  .unwrap();
+  assert_eq!(fstat(&file).unwrap().st_mode & 0o777, 0o600);
+  let mut calls = 0;
+  assert!(create_lock_file(&parent, || {
+    calls += 1;
+    Err(nix::errno::Errno::EACCES)
+  })
+  .is_err());
+  assert_eq!(calls, 1);
+  assert!(home.lock("../escape", false).is_err());
 }
 ````
 
@@ -3250,15 +3298,7 @@ impl KuntuIndex {
     if self.home.is_some() && self.lease.is_none() {
       return Err(IndexError::LeaseRequired);
     }
-    loop {
-      let tx = self.conn.begin_writer_txn(false)?;
-      self.check_scan(root_id, gen)?;
-      let n=tx.conn.raw.execute("DELETE FROM entries WHERE id IN (SELECT id FROM entries WHERE root_id=?1 AND scan_gen<>?2 LIMIT 5000)",params![root_id,gen])?;
-      block_on(tx.commit())?;
-      if n == 0 {
-        break;
-      }
-    }
+    while self.cleanup_stale_batch(root_id, gen)? != 0 {}
     fault("before_ready");
     let tx = self.conn.begin_writer_txn(false)?;
     self.check_scan(root_id, gen)?;
@@ -3266,6 +3306,40 @@ impl KuntuIndex {
     block_on(tx.commit())?;
     fault("ready_committed");
     Ok(())
+  }
+  pub(crate) fn cleanup_stale_batch(&self, root_id: i64, gen: i64) -> Result<usize> {
+    if self.home.is_some() && self.lease.is_none() {
+      return Err(IndexError::LeaseRequired);
+    }
+    let ids: Vec<i64> = {
+      let mut query = self
+        .conn
+        .raw
+        .prepare("SELECT id FROM entries WHERE root_id=?1 AND scan_gen<>?2 LIMIT 5000")?;
+      let ids = query
+        .query_map(params![root_id, gen], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+      ids
+    };
+    if ids.is_empty() {
+      self.check_scan(root_id, gen)?;
+      return Ok(0);
+    }
+    let tx = self.conn.begin_writer_txn(false)?;
+    self.check_scan(root_id, gen)?;
+    let started = std::time::Instant::now();
+    let mut rows = 0;
+    for id in ids {
+      rows += tx
+        .conn
+        .raw
+        .execute("DELETE FROM entries WHERE id=?1", params![id])?;
+      if rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100) {
+        break;
+      }
+    }
+    block_on(tx.commit())?;
+    Ok(rows)
   }
   pub(crate) fn index_config(&self, id: i64) -> Result<SearchConfig> {
     let r = self.conn.raw.query_row(
@@ -7269,17 +7343,32 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
   std::fs::copy(&source, &copy).unwrap();
   let mut i = KuntuIndex::open(&copy).unwrap();
   assert!(i.acquire_writer().unwrap());
-  let started = std::time::Instant::now();
-  let tx = i.conn.begin_writer_txn(false).unwrap();
-  let deleted = tx
+  let root: i64 = i
     .conn
     .raw
-    .execute(
-      "DELETE FROM entries WHERE id IN (SELECT id FROM entries ORDER BY id LIMIT 5000)",
-      [],
-    )
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
     .unwrap();
+  let tx = i.conn.begin_writer_txn(false).unwrap();
+  tx.conn
+    .raw
+    .execute("UPDATE entries SET scan_gen=1 WHERE id<=5000", [])
+    .unwrap();
+  tx.conn.raw.execute("UPDATE root_state SET status='building',active_scan_gen=0,scan_policy_revision=policy_revision WHERE root_id=?1",params![root]).unwrap();
   block_on(tx.commit()).unwrap();
+  let started = std::time::Instant::now();
+  let mut deleted = 0;
+  let mut batches = 0;
+  let mut max_ms = 0.0_f64;
+  loop {
+    let t = std::time::Instant::now();
+    let n = i.cleanup_stale_batch(root, 0).unwrap();
+    if n == 0 {
+      break;
+    }
+    deleted += n;
+    batches += 1;
+    max_ms = max_ms.max(t.elapsed().as_secs_f64() * 1000.0);
+  }
   let ms = started.elapsed().as_secs_f64() * 1000.0;
   assert_eq!(deleted, 5000);
   for table in ["name_postings", "path_postings", "reverse_postings"] {
@@ -7296,7 +7385,7 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
   }
   assert_eq!(i.doctor().unwrap(), "ok");
   eprintln!(
-    "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3}"
+    "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3} batches={batches} max_call_ms={max_ms:.3}"
   );
   assert!(bytes <= 550_000_000, "550 MB size gate: {bytes} bytes");
 }
@@ -7316,6 +7405,48 @@ fn fd_vfs_preserves_the_unix_open_abi_for_private_connections() {
     0o600
   );
   assert!(!std::fs::read(path).unwrap().is_empty());
+}
+
+#[test]
+fn slow_delete_triggers_force_the_100_ms_cleanup_boundary() {
+  let (_, c, i) = fixture();
+  let id: i64 = i
+    .conn
+    .raw
+    .query_row("SELECT id FROM roots", [], |r| r.get(0))
+    .unwrap();
+  let gen = i.begin_scan(id).unwrap();
+  let tx = i.conn.begin_writer_txn(false).unwrap();
+  for n in 0..100 {
+    tx.conn
+      .raw
+      .execute(
+        "INSERT INTO entries(root_id,path,name,kind,scan_gen) VALUES(?1,?2,'stale',1,?3)",
+        params![id, format!("/stale/{n}"), gen - 1],
+      )
+      .unwrap();
+  }
+  block_on(tx.commit()).unwrap();
+  i.conn
+    .raw
+    .create_scalar_function(
+      "slow_delete",
+      0,
+      rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+      |_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Ok(1)
+      },
+    )
+    .unwrap();
+  let tx = i.conn.begin_writer_txn(false).unwrap();
+  tx.conn.raw.execute_batch("CREATE TEMP TRIGGER slow_delete_trigger BEFORE DELETE ON entries BEGIN SELECT slow_delete(); END;").unwrap();
+  block_on(tx.commit()).unwrap();
+  let n = i.cleanup_stale_batch(id, gen).unwrap();
+  assert!((1..=6).contains(&n), "one call deleted {n} slow rows");
+  assert_eq!(i.root_state_name(&c.roots[0].path).unwrap(), "building");
+  i.complete_scan(id, gen).unwrap();
+  assert_eq!(i.root_state_name(&c.roots[0].path).unwrap(), "ready");
 }
 ````
 
@@ -7498,7 +7629,7 @@ RED/GREEN: `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`. Als
 
 ## Task M2.5: guarded batches and reader notification
 
-RED/GREEN: `batch_generation_is_atomic_and_readers_observe_data_version`. `slow_scan_rows_force_the_100_ms_batch_boundary` injects slow row work and asserts that the production scanner commits before consuming all 100 rows. The 30%/70% process tests assert that overshoot is less than 5,000 rows. `meta.generation` is part of the transaction commit; `data_version` is checked on production reads. The 100 ms deadline is checked between rows; a single row, commit, busy wait or scheduler pause can exceed it, so the stress measurements—not an absolute real-time guarantee—establish the latency evidence.
+RED/GREEN: `batch_generation_is_atomic_and_readers_observe_data_version`. `slow_delete_triggers_force_the_100_ms_cleanup_boundary` makes a SQLite trigger spend 20 ms per deleted row and requires one production cleanup call to return after at most six rows. `slow_scan_rows_force_the_100_ms_batch_boundary` injects slow row work and asserts that the production scanner commits before consuming all 100 rows. The 30%/70% process tests assert that overshoot is less than 5,000 rows. `meta.generation` is part of the transaction commit; `data_version` is checked on production reads. The 100 ms deadline is checked between rows; a single row, commit, busy wait or scheduler pause can exceed it, so the stress measurements—not an absolute real-time guarantee—establish the latency evidence.
 
 ## Task M2.6: restart/resume state machine
 
@@ -13945,6 +14076,41 @@ RED/GREEN: `store_import_parser_accepts_source_and_rejects_missing_source`. Inst
 
 Xross moves `xross_search_exports` into its own DB, replaces its direct turso reader with the shared v3 reader, and builds `SearchScope` from host-authorized export root IDs. Its host chooses a stable consumer ID; peers never supply that ID or use index policy as authorization. Kunkun builds/signs the `kfs daemon` helper as `kuntud`, gives that helper TCC grants, and loads `openReadOnly` in app-server. Root registration and rescan requests use a separate writer/inbox client; the app-server does not crawl. Both products pin the owner-approved v0.6.0 engine commit after implementation and installed-product acceptance. Their worktrees are outside this write set; no consumer pin, signature, push, merge or tag is performed by this replay.
 
+<!-- apply {"task": "M2.10", "file": "scripts/m2-previous-tag.ts", "mode": "file"} -->
+````typescript
+/** Actual previous-tag epoch isolation; no checkout, branch or tag mutation. */
+import {spawnSync} from 'node:child_process';
+import {mkdirSync,rmSync,readFileSync,writeFileSync,existsSync} from 'node:fs';
+import {resolve,join} from 'node:path';
+import {strict as assert} from 'node:assert';
+const base='/Volumes/Portable2TB/tmp/kuntu-m2/previous-tag';
+const commit='a5df3559671b09f2af75fdd28ed5a4a06ab7dc56';
+const src=join(base,'source');mkdirSync(src,{recursive:true});
+function call(args:string[],cwd?:string,env:Record<string,string>={}){
+ const r=spawnSync(args[0]!,args.slice(1),{cwd,env:{...process.env,...env},encoding:'utf8',maxBuffer:64*1024*1024});
+ return {status:r.status,text:r.stdout+r.stderr};
+}
+function ok(args:string[],cwd?:string,env:Record<string,string>={}){const r=call(args,cwd,env);assert.equal(r.status,0,r.text);return r.text.trim();}
+const archive=join(base,'previous.tar');
+ok(['git','archive','--format=tar','--output',archive,commit]);ok(['tar','-xf',archive,'-C',src]);
+const build=call(['cargo','build','--release','--locked','-p','kuntu-cli'],src,{CARGO_TARGET_DIR:join(base,'target')});writeFileSync(join(base,'build.log'),build.text);assert.equal(build.status,0,build.text);
+const old=join(base,'target/release/kfs');
+const target=process.env.CARGO_TARGET_DIR??'target';const now=resolve(target,'release/kfs'),probe=resolve(target,'release/examples/m2_probe');
+const root=join(base,'files');mkdirSync(root,{recursive:true});writeFileSync(join(root,'retained-file.md'),'x');
+const home=join(base,'home');rmSync(home,{recursive:true,force:true});ok([probe,'init',home,root]);
+const db=join(home,'index.v2.db');ok([old,'index','rebuild','--root',root,'--db',db]);
+const original=readFileSync(db);
+const cells:Record<string,string>={previous_tag:commit,previous_epoch:ok([old,'index','status','--db',db])};
+cells.current_private_v2=ok([now,'index','status','--db',db]);
+assert.deepEqual(readFileSync(db),original,'new private compatibility must not migrate v2 main file');
+cells.current_epoch=ok([probe,'scan',home,root]);
+const v3=join(home,'index.v3.db');const before=readFileSync(v3);
+const oldOnV3=call([old,'index','status','--db',v3]);assert.notEqual(oldOnV3.status,0);assert.match(oldOnV3.text,/schema|version|supported/i);assert.deepEqual(readFileSync(v3),before,'previous tag refusal must preserve epoch3 main bytes');cells.previous_refuses_epoch3=oldOnV3.text.trim();
+cells.gc=ok([now,'store','gc'],undefined,{KUNTU_HOME:home});assert.ok(existsSync(db));assert.deepEqual(readFileSync(db),original,'unregistered previous-tag epoch remains preserved');
+cells.other_epoch='epoch2 and epoch3 remain distinct; previous tag refuses user_version3; current private-v2 reader preserves source';
+writeFileSync(join(base,'matrix.json'),JSON.stringify(cells,null,2));console.log(JSON.stringify(cells,null,2));
+````
+
 <!-- apply {"task": "M2.10", "file": "scripts/m2-evidence.ts", "mode": "file"} -->
 ````typescript
 /** Process crash/stress evidence. All children are awaited and killed on failure. */
@@ -13993,7 +14159,7 @@ try {
   const mig=join(base,'migration-home');rmSync(mig,{recursive:true,force:true});await ok('init',mig);await killed('scan',mig,'migration_ddl');assert.equal(db(mig,"SELECT value FROM meta WHERE key='schema_minor'"),'[(0,)]');outcomes.migration=await ok('scan',mig);
   await killed('quarantine',home,'quarantine_renamed');outcomes.quarantine=await ok('init',home);assert.equal(db(home,'SELECT count(*) FROM entries'),'[(0,)]');
   const first=join(base,'first-home');rmSync(first,{recursive:true,force:true});await killed('identity',first,'identity_synced');const x=await ok('identity',first);assert.equal(x.length,32);
-  const simultaneous=join(base,'simultaneous');rmSync(simultaneous,{recursive:true,force:true});const a=start('identity',simultaneous);const b=start('identity',simultaneous);const ar=await a.done,br=await b.done;assert.equal(ar.code,0,ar.text);assert.equal(br.code,0,br.text);assert.equal(ar.text,br.text);outcomes.concurrent_identity=ar.text.trim();
+  const simultaneous=join(base,'simultaneous');rmSync(simultaneous,{recursive:true,force:true});mkdirSync(simultaneous);for(let n=0;n<100;n++){const pair=join(simultaneous,`pair-${n}`);const a=start('identity',pair),b=start('identity',pair);const ar=await a.done,br=await b.done;assert.equal(ar.code,0,ar.text);assert.equal(br.code,0,br.text);assert.equal(ar.text,br.text);}outcomes.concurrent_identity='100 concurrent fresh-home pairs: one identity per pair';
   const heldMarker=join(base,'held');rmSync(heldMarker,{force:true});const held=start('hold',fresh,{KUNTU_FAULT_MARKER:heldMarker});await marker(heldMarker,held);
   const denied=await start('quarantine',fresh).done;assert.notEqual(denied.code,0);held.child.kill('SIGKILL');await held.done;
   const held2Marker=join(base,'held2');rmSync(held2Marker,{force:true});const held2=start('hold',fresh,{KUNTU_FAULT_MARKER:held2Marker});await marker(held2Marker,held2);
@@ -14039,6 +14205,8 @@ import {spawnSync} from 'node:child_process';
 import {strict as assert} from 'node:assert';
 type Case={task:string,file:string,old:string,bad:string,crate:string,test:string};
 const cases:Case[]=[
+ {task:'M2.1-lock-create',file:'crates/kuntu-store/src/lib.rs',old:'attempts < 100',bad:'attempts < 0',crate:'kuntu-store',test:'tests::transient_lock_creation_retries_only_not_found_under_the_same_directory_fd'},
+ {task:'M2.5-cleanup',file:'crates/kuntu-index/src/shared.rs',old:'rows >= 5000 || started.elapsed() >= std::time::Duration::from_millis(100)',bad:'rows >= 5000',crate:'kuntu-index',test:'m2_tests::slow_delete_triggers_force_the_100_ms_cleanup_boundary'},
  {task:'M2.1',file:'crates/kuntu-store/src/lib.rs',old:'let flags = OFlag::O_RDWR\n      | OFlag::O_NOFOLLOW',bad:'let flags = OFlag::O_RDWR',crate:'kuntu-store',test:'tests::descriptor_open_rejects_symlink_and_private_modes_are_exact'},
  {task:'M2.2',file:'crates/kuntu-store/src/lib.rs',old:'else if !fd.try_lock_exclusive()? {',bad:'else if false && !fd.try_lock_exclusive()? {',crate:'kuntu-store',test:'tests::permanent_lease_inode_is_exclusive_and_reusable'},
  {task:'M2.3',file:'crates/kuntu-index/src/lib.rs',old:'SELECT entry_id FROM {} WHERE term >= ?1 AND term < ?2 LIMIT ?3',bad:'SELECT entry_id FROM {} WHERE term >= ?1 AND term < ?2 LIMIT ?1',crate:'kuntu-index',test:'m2_tests::production_builders_pin_both_postings_reverse_and_rowid'},
@@ -14124,6 +14292,7 @@ run('m1-budget',['cargo','test','--release','-p','kuntu-index','default_budget_b
 run('size-delete',['cargo','test','--release','-p','kuntu-index','realistic_fixture_reverse_delete_cost_and_size_gate','--','--ignored','--nocapture']);
 run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('cli-build',['cargo','build','--release','-p','kuntu-cli']);
 run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
+run('previous-tag',['bun','scripts/m2-previous-tag.ts']);
 run('fmt-final',['cargo','fmt','--all','--','--check']);
 const protectedPaths=['crates/kuntu-crawler','crates/kuntu-watcher','crates/kuntu-scan','.github'];
 assert.equal(run('protected',['git','diff','--name-only','e164d67','--',...protectedPaths]).trim(),'');assert.equal(run('protected-untracked',['git','ls-files','--others','--exclude-standard','--',...protectedPaths]).trim(),'');
@@ -14153,17 +14322,17 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 1 Mechanical compile | M2.1, M2.3, M2.8–10 | `plan_apply_write_set_matches_complete_payloads`, fmt/clippy/locked workspace build |
 | 2 Complete engine/fixture port | M2.3 | `realistic_fixture_latency_gate`, all preserved M1 recall/shape tests |
 | 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, joined-service test, daemon queue test, exec/takeover process cases |
-| 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, skew controller |
-| 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
+| 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, minor skew controller and `previous_tag_epoch_isolation` (v0.4.1 archive) |
+| 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, `slow_delete_triggers_force_the_100_ms_cleanup_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
 | 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
 | 7 Consumer scope | M2.3, M2.8–9 | `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, Node/daemon strict tests, `cli_scope` |
 | 8 FD opens/permissions | M2.1, M2.3 | `descriptor_open_rejects_symlink_and_private_modes_are_exact`, `opened_directory_survives_path_swap_and_sidecars_are_private`, `fd_vfs_preserves_the_unix_open_abi_for_private_connections` |
-| 9 Atomic random identity | M2.1 | `atomic_identity_is_128_bits_and_existing_document_is_preserved`, concurrent-open test and publication kill |
+| 9 Atomic random identity | M2.1 | `atomic_identity_is_128_bits_and_existing_document_is_preserved`, concurrent-open test, `transient_lock_creation_retries_only_not_found_under_the_same_directory_fd`, 100 process pairs and publication kill |
 | 10 Reader-safe quarantine/GC | M2.4, M2.9 | `live_readers_prevent_quarantine_and_gc_never_touches_future_epochs`, quarantine kill; unregistered private epochs preserved |
 | 11 NAPI actual access/compat | M2.8 | Node read-only operation test, `old_constructor_opens_exact_v2_path_and_refuses_unrelated_database` |
 | 12 Import end to end | M2.9–10 | `store_import_parser_accepts_source_and_rejects_missing_source`, real-turso library import test, process `import` |
 | 13 Production SQL pins/binds | M2.3 | `production_builders_pin_both_postings_reverse_and_rowid`, preserved `entry_fetch_is_a_rowid_seek_not_an_index_scan` |
-| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` requires the named failure and rejects compilation errors/zero-test passes |
+| 14 Real RED/GREEN execution | M2.1–10 | `m2-red.ts` runs twelve pairs across all ten tasks, requires the named failure and rejects compilation errors/zero-test passes |
 | 15 Complete write set | M2.1–10 | `plan_apply_write_set_matches_complete_payloads`, protected-file checks |
 | 16 Patched WAL engine | M2.3 | `bundled_runtime_includes_wal_reset_fix`, stress and query gates |
 | 17 Honest complete evidence | M2.10 | Full foreground replay logs, crash/stress/skew artifacts and the measured table below |
