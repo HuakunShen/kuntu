@@ -791,6 +791,7 @@ fn executed_child_does_not_inherit_the_permanent_writer_lease() {
   drop(lease);
   let reacquired = h.lock("indexer.lock", false).unwrap().is_some();
   assert!(child.wait().unwrap().success());
+  assert!(close_on_exec, "the writer capability lacks FD_CLOEXEC");
   assert!(
     reacquired,
     "an executed child inherited the live writer capability"
