@@ -2222,22 +2222,25 @@ Not run by this plan (state in the report): `kuntu-napi` Node smoke beyond `carg
 
 Replay worktree `/Volumes/Portable2TB/ExtDev/kuntu-m2replay`, branch
 `replay/m2` at the plan HEAD. Edit blocks were applied mechanically with a
-script (create / insert-before / replace-range / append-to-`mod tests`);
-every RED/GREEN command below was run as written, in the foreground.
-Environment: Apple M4 Pro, macOS, rustc/cargo 1.98.1, machine under load
-from other agents (load average routinely above 10), `python3` with sqlite3
-available, node v26 available.
+script (create / insert-before / replace-range / append-to-`mod tests`;
+the script parses `apply` markers with raw string handling, never
+`json.loads` on code, after replay proved a JSON-based extractor silently
+drops backslashes and corrupts `\n`/`\u` escapes); every RED/GREEN command
+below was run as written, in the foreground. Environment: Apple M4 Pro,
+macOS, rustc/cargo 1.98.1, machine under load from other agents (load
+average routinely above 10), `python3` with sqlite3 available, node v26
+available.
 
 | Step | Observed |
 |---|---|
 | M2.1 RED | `cargo test -p kuntu-store --locked` → `package ID specification 'kuntu-store' did not match any packages`, as specified |
 | M2.1 GREEN | **6 passed**, clippy clean — after two doc fixes (below) |
 | M2.2 RED | `E0583 file not found for module 'lease'` after the mod declaration without the file, as specified (restructured from the draft's orphan-file form, which compiled fine and proved the original RED wrong) |
-| M2.2 GREEN | **10 passed** (incl. the `kill -9` cross-process test, ~0.5 s), clippy clean — after two doc fixes |
-| M2.7 GREEN | **12 passed** (10 store + 2 takeover), clippy clean, no doc change needed |
-| M2.4a GREEN | `cargo test -p kuntu-core` **21 passed**, clippy clean, no doc change needed |
-| Anchor audit | script checked all 44 `apply` blocks: every `insert-before`/`replace-range` anchor occurs exactly once in its target file at the task's commit point (3 apparent misses are files created by earlier tasks in the same chain, verified against the created content instead) |
-| Snippet probe | standalone crate under `/Volumes/Portable2TB/tmp/kuntu-m2/probe` (since discarded) compiled the exact M2.3e/M2.5 shapes against rusqlite 0.32 bundled + fs4 0.13: WAL mode set, `busy_timeout=5000`, `WITHOUT ROWID` covering-PK plan with no `SCAN`, cross-fd flock contention + release, second-writer busy-wait-then-commit — all pass |
+| M2.2 GREEN | **10 passed** (incl. the `kill -9` cross-process test, ~0.5 s), clippy clean — after four doc fixes |
+| M2.7 GREEN | **12 passed** (10 store + 2 takeover), clippy clean, `cargo fmt --check` clean after one doc fix |
+| M2.4a GREEN | `cargo test -p kuntu-core` **21 passed**, clippy clean, `cargo fmt --check` clean after two doc fixes |
+| Anchor audit | script checked all 45 `apply` blocks: every `insert-before`/`replace-range` anchor occurs exactly once in its target file at the task's commit point (3 apparent misses are files created by earlier tasks in the same chain, verified against the created content instead) |
+| Snippet probe | standalone crates under `/Volumes/Portable2TB/tmp/kuntu-m2/probe` (since discarded) compiled the exact doc shapes against rusqlite 0.32 bundled + fs4 0.13: WAL mode set, `busy_timeout=5000`, `WITHOUT ROWID` covering-PK plan with no `SCAN`, cross-fd flock contention + release, second-writer busy-wait-then-commit, `transaction_with_behavior(Immediate)` + drop-rollback, full v3 DDL + scan-lifecycle + enqueue/drain + import SQL — all pass |
 
 Doc bugs found and fixed by replay (each re-committed on `docs/m2-plan`, doc-only commits, no attribution lines):
 
@@ -2249,11 +2252,17 @@ Doc bugs found and fixed by replay (each re-committed on `docs/m2-plan`, doc-onl
 6. `with_env_home`-based tests raced on process-global env under parallel threads (`ensure_refuses_symlinked_home` failed intermittently). Fixed with a shared `ENV_LOCK` mutex in the test module.
 7. Clippy `suspicious_open_options` on the lease open: stated `.truncate(false)` explicitly (truncation happens only post-lock via `set_len(0)`).
 8. M2.5a `begin_writer_txn` issued `BEGIN IMMEDIATE` and then called `conn.transaction()`, which nests `BEGIN` and fails. Fixed to a single `transaction_with_behavior(Immediate)` with the `min_writer_minor` re-read inside it (rollback on step-down is automatic by drop).
-9. M2.6b test inserts omitted the `NOT NULL kind` column. Fixed to include `kind`.
-10. M2.9b replacement dropped `pub` from `parse_args`. Fixed the replacement tail.
-11. M2.9d's runner calls `store_gc`/`doctor_check`, which were defined in M2.10a (later task). Moved both helpers to a new M2.9d2 step; M2.10a keeps only `import_v2_roots`.
-12. Removed duplicated M2.3/M2.5/M2.7/M2.8/M2.9/M2.10 sections produced by overlapping appends, and a duplicated `scope_is_enforced_non_empty_and_sorted` test; checklist rows now name only tests defined exactly once in the file.
+9. `transaction_with_behavior` takes `&mut self` in rusqlite 0.32: `begin_writer_txn` signature fixed to `conn: &mut Connection` and the step-down test uses `let mut conn` (probe-verified).
+10. M2.6b test inserts omitted the `NOT NULL kind` column. Fixed to include `kind`.
+11. M2.9b replacement dropped `pub` from `parse_args`. Fixed the replacement tail.
+12. M2.9d's runner calls `store_gc`/`doctor_check`, which were defined in M2.10a (later task). Moved both helpers to a new M2.9d2 step; M2.10a keeps only `import_v2_roots`. M2.9 commit file list extended with `src/main.rs` and `kuntu-index/src/lib.rs`.
+13. M2.3a's replacement re-included the `[lib]` end anchor, producing a duplicated `[lib]` section. Removed the trailing `[lib]` from the replacement (end anchors are exclusive per the Rules).
+14. M2.3b's import line lacked `Value` and `params_from_iter`, which the ported call sites need. Extended the import.
+15. M2.4a's anchor (`pub struct SearchQuery {`) split the struct's `#[derive]` onto `SearchScope`, breaking `SearchQuery`'s `Debug`/`Clone` and failing `kuntu-crawler`. Fixed by restoring the derive (replay) — worker note: the anchor sits below the derive line, so the inserted block must not separate them; verified in replay GREEN.
+16. M2.4a2's separate `pub use model::SearchScope;` line violates rustfmt import order; folded `SearchScope` into the existing `pub use model::{...}` list via replace-range.
+17. M2.7a's fenced code had a trailing blank line that `cargo fmt --check` rejects after insertion. Removed it.
+18. Removed duplicated M2.3/M2.5/M2.7/M2.8/M2.9/M2.10 sections produced by overlapping appends, and a duplicated `scope_is_enforced_non_empty_and_sorted` test; checklist rows now name only tests defined exactly once in the file.
 
 Not run in replay (stated openly): the full `kuntu-index` turso→rusqlite port (M2.3 call-site port, M2.4b/c, M2.5/2.6/2.9d2/2.10a/b application), the NAPI/CLI/daemon edits, and the 100k M1 latency gate on the new engine. These were verified at anchor level (every block resolves to a unique site) and snippet level (the engine-critical shapes compile and behave in the probe), but a full port is the milestone implementation itself (8–10 days per PLAN §1) and is out of scope for a planning replay. The worker runs it task by task; the first full `cargo test -p kuntu-index` GREEN that fails anywhere stops the line per the Rules above.
 
-Scratch state after replay: `/Volumes/Portable2TB/tmp/kuntu-m2/` removed; `/tmp/flockprobe`, `/tmp/flock-stress`, `/tmp/m2plan-doc.md`, `/tmp/m*.txt` removed; leftover `kuntu-lease-*` temp dirs from failed test runs removed; replay worktree and `replay/m2` branch removed after this commit. No push was ever run; no other worktree was touched.
+Scratch state after replay: `/Volumes/Portable2TB/tmp/kuntu-m2/` removed; `/tmp/flockprobe`, `/tmp/flock-stress`, `/tmp/m2plan-doc.md`, `/tmp/apply_doc.py`, `/tmp/apply-m23.log`, `/tmp/m2*.txt`, `/tmp/clov*.txt` removed; leftover `kuntu-lease-*`/`flockmix-*`/`flockstress-*`/`probe-*` temp dirs from test runs removed; replay worktree and `replay/m2` branch removed after this commit. No push was ever run; no other worktree was touched.
