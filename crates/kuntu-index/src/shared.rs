@@ -365,6 +365,7 @@ impl KuntuIndex {
       shared,
       consumer: consumer.into(),
       data_version: Cell::new(0),
+      search_profile: Cell::new(SearchProfile::default()),
     })
   }
   pub fn import_v2(&mut self, source: &Path) -> Result<RebuildStats> {

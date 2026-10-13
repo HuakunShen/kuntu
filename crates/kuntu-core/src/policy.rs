@@ -6,7 +6,7 @@
 
 use std::path::{Component, Path};
 
-use crate::model::{expand_tilde, lowercase_extension, PolicyDecision, SearchConfig, SearchQuery};
+use crate::model::{expand_tilde, PolicyDecision, SearchConfig, SearchQuery};
 
 #[derive(Debug, Clone)]
 pub struct PathPolicy {
@@ -155,26 +155,48 @@ pub fn sensitive_policy_identity() -> String {
 }
 /// Current sensitive denial never trusts a producer's persisted flags.
 pub fn denies_sensitive_path(path: &Path) -> bool {
-  is_sensitive(path, &normal_components(path))
+  path
+    .components()
+    .filter_map(|c| match c {
+      Component::Normal(v) => v.to_str(),
+      _ => None,
+    })
+    .any(sensitive_component)
+    || sensitive_filename(path)
 }
-fn is_sensitive(path: &Path, components: &[String]) -> bool {
-  if components.iter().any(|component| {
-    let lower = component.to_ascii_lowercase();
-    SENSITIVE_COMPONENTS.contains(&component.as_str())
-      || SENSITIVE_SUBSTRINGS
-        .iter()
-        .any(|needle| lower.contains(needle))
-  }) {
+fn sensitive_component(component: &str) -> bool {
+  SENSITIVE_COMPONENTS.contains(&component)
+    || SENSITIVE_SUBSTRINGS.iter().any(|needle| {
+      component
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
+}
+fn sensitive_filename(path: &Path) -> bool {
+  if path
+    .file_name()
+    .and_then(|v| v.to_str())
+    .is_some_and(|name| {
+      name.eq_ignore_ascii_case(".env")
+        || name
+          .get(..5)
+          .is_some_and(|p| p.eq_ignore_ascii_case(".env."))
+    })
+  {
     return true;
   }
-  if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") {
-      return true;
-    }
-  }
-  lowercase_extension(path)
-    .is_some_and(|extension| SENSITIVE_EXTENSIONS.contains(&extension.as_str()))
+  path
+    .extension()
+    .and_then(|v| v.to_str())
+    .is_some_and(|ext| {
+      SENSITIVE_EXTENSIONS
+        .iter()
+        .any(|denied| ext.eq_ignore_ascii_case(denied))
+    })
+}
+fn is_sensitive(path: &Path, components: &[String]) -> bool {
+  components.iter().any(|c| sensitive_component(c)) || sensitive_filename(path)
 }
 
 #[cfg(test)]

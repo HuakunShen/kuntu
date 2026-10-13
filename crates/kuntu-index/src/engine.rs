@@ -5,6 +5,8 @@ use rusqlite::{
   Params,
 };
 use std::cell::Cell;
+#[cfg(test)]
+thread_local! { pub(crate) static OWNED_ROW_COPIES: Cell<usize> = const { Cell::new(0) }; }
 #[derive(Debug)]
 pub struct Connection {
   pub raw: rusqlite::Connection,
@@ -36,6 +38,8 @@ impl Connection {
     let n = s.column_count();
     let rows = s
       .query_map(p, |r| {
+        #[cfg(test)]
+        OWNED_ROW_COPIES.with(|n| n.set(n.get() + 1));
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
           v.push(r.get(i)?);

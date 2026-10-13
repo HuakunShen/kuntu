@@ -3,17 +3,25 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
 fn home(name: &str) -> Home {
+  home_at(
+    name,
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_nanos(),
+  )
+}
+fn home_at(name: &str, nonce: u128) -> Home {
+  static NEXT_HOME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let sequence = NEXT_HOME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
   let p = PathBuf::from(
     std::env::var_os("KUNTU_TEST_DIR").expect("KUNTU_TEST_DIR under scratch required"),
   );
   std::fs::create_dir_all(&p).unwrap();
   let p = p.join(format!(
-    "{name}-{}-{}",
+    "{name}-{}-{}-{sequence}",
     std::process::id(),
-    SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .unwrap()
-      .as_nanos()
+    nonce
   ));
   Home::open(&p).unwrap()
 }
@@ -1144,4 +1152,14 @@ fn ordinary_opens_and_requests_skip_whole_store_integrity_checks() {
   }
   shared::OPEN_INTEGRITY_CHECKS
     .with(|n| assert_eq!(n.get(), 0, "ordinary opens scanned the database"));
+}
+
+#[test]
+fn simultaneous_fixture_timestamps_allocate_distinct_homes() {
+  let first = home_at("simultaneous-fixture", 0);
+  let second = home_at("simultaneous-fixture", 0);
+  assert_ne!(
+    first.path, second.path,
+    "equal-resolution timestamps shared a fixture home"
+  );
 }

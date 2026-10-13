@@ -33,6 +33,16 @@ fn realistic_fixture_m2_latency_acceptance() {
   assert_eq!(rows, 1_000_000);
   let f = fixture::open_or_build(rows);
   let q = &f.queries;
+  eprintln!(
+    "M2_LOAD before={}",
+    String::from_utf8_lossy(
+      &std::process::Command::new("uptime")
+        .output()
+        .unwrap()
+        .stdout
+    )
+    .trim()
+  );
   let classes = vec![
     ("miss", "zzqqx".to_string()),
     ("miss_non_ascii", "zzqqé".to_string()),
@@ -81,6 +91,16 @@ fn realistic_fixture_m2_latency_acceptance() {
     serde_json::to_vec_pretty(&measurements).unwrap(),
   )
   .unwrap();
+  eprintln!(
+    "M2_LOAD after={}",
+    String::from_utf8_lossy(
+      &std::process::Command::new("uptime")
+        .output()
+        .unwrap()
+        .stdout
+    )
+    .trim()
+  );
   assert!(
     misses.is_empty(),
     "M2_ACCEPTANCE_MISS: {}",

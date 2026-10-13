@@ -6,91 +6,111 @@
 
 use std::path::Path;
 
-use crate::model::{lowercase_extension, MatchKind, SearchCandidate, SearchQuery};
+use crate::model::{MatchKind, SearchCandidate, SearchQuery};
 
+/// Query normalization shared by every candidate in one ranking pass.
+pub struct PreparedQuery {
+  text: String,
+  tokens: Vec<String>,
+  compact: String,
+  chars: Vec<char>,
+}
+impl PreparedQuery {
+  pub fn new(query: &SearchQuery) -> Self {
+    let text = query.query.trim().to_ascii_lowercase();
+    let tokens = tokenize(&text);
+    let compact = compact_for_match(&text);
+    let chars = compact.chars().collect();
+    Self {
+      text,
+      tokens,
+      compact,
+      chars,
+    }
+  }
+  pub fn score(&self, path: &Path, root_priority: i32) -> (i32, Vec<MatchKind>) {
+    let mut matches = Vec::new();
+    let mut score = 0;
+    if self.text.is_empty() {
+      score += 1;
+      matches.push(MatchKind::Empty);
+    } else {
+      let basename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+      let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+      if basename.eq_ignore_ascii_case(&self.text) || stem.eq_ignore_ascii_case(&self.text) {
+        score += 1000;
+        matches.push(MatchKind::ExactBasename);
+      }
+      if prefix_ascii_case(basename, &self.text) || prefix_ascii_case(stem, &self.text) {
+        score += 800;
+        matches.push(MatchKind::BasenamePrefix);
+      }
+      if !self.tokens.is_empty()
+        && self.tokens.iter().all(|q| {
+          basename
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .any(|t| prefix_ascii_case(t, q))
+        })
+      {
+        score += 600;
+        matches.push(MatchKind::BasenameToken);
+      }
+      if !self.tokens.is_empty()
+        && self.tokens.iter().all(|q| {
+          path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .any(|c| prefix_ascii_case(c, q))
+        })
+      {
+        score += 300;
+        matches.push(MatchKind::PathComponent);
+      }
+      let compact_path = compact_for_match(&path.to_string_lossy());
+      if compact_path.contains(&self.compact) {
+        score += 100;
+        matches.push(MatchKind::Substring);
+      } else {
+        let compact_basename = compact_for_match(basename);
+        if let Some(fuzzy) = ordered_fuzzy_score(&self.chars, &compact_basename, 90) {
+          score += fuzzy;
+          matches.push(MatchKind::Fuzzy);
+        }
+      }
+      if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| self.tokens.iter().any(|q| ext.eq_ignore_ascii_case(q)))
+      {
+        score += 150;
+        matches.push(MatchKind::Extension);
+      }
+    }
+    if root_priority != 0 {
+      score += root_priority * 10;
+      matches.push(MatchKind::RootPriority);
+    }
+    (score, matches)
+  }
+}
+fn prefix_ascii_case(value: &str, prefix: &str) -> bool {
+  value
+    .get(..prefix.len())
+    .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+}
 pub fn score_candidate(
   query: &SearchQuery,
   candidate: &SearchCandidate,
   root_priority: i32,
 ) -> (i32, Vec<MatchKind>) {
-  let query_text = query.query.trim().to_ascii_lowercase();
-  let query_tokens = tokenize(&query_text);
-  let mut matches = Vec::new();
-  let mut score = 0;
-
-  if query_text.is_empty() {
-    matches.push(MatchKind::Empty);
-    score += 1;
-  } else {
-    let basename = lower_file_name(&candidate.path);
-    let stem = lower_file_stem(&candidate.path);
-    let basename_tokens = tokenize(&basename);
-    let path_components = lower_path_components(&candidate.path);
-
-    if basename == query_text || stem == query_text {
-      score += 1000;
-      matches.push(MatchKind::ExactBasename);
-    }
-
-    if basename.starts_with(&query_text) || stem.starts_with(&query_text) {
-      score += 800;
-      matches.push(MatchKind::BasenamePrefix);
-    }
-
-    if !query_tokens.is_empty()
-      && query_tokens.iter().all(|query_token| {
-        basename_tokens
-          .iter()
-          .any(|basename_token| basename_token.starts_with(query_token))
-      })
-    {
-      score += 600;
-      matches.push(MatchKind::BasenameToken);
-    }
-
-    if !query_tokens.is_empty()
-      && query_tokens.iter().all(|query_token| {
-        path_components
-          .iter()
-          .any(|component| component.starts_with(query_token))
-      })
-    {
-      score += 300;
-      matches.push(MatchKind::PathComponent);
-    }
-
-    if !query_text.is_empty() {
-      let compact_query = compact_for_match(&query_text);
-      let compact_basename = compact_for_match(&basename);
-      let path_text = candidate.path.to_string_lossy();
-      let compact_path = compact_for_match(path_text.as_ref());
-      if compact_path.contains(&compact_query) {
-        score += 100;
-        matches.push(MatchKind::Substring);
-      } else if let Some(fuzzy_score) = ordered_fuzzy_score(&compact_query, &compact_basename, 90) {
-        // Keep this fallback below exact, prefix, token, and compact substring matches.
-        // It intentionally checks only the basename: matching the whole path makes
-        // parent directories too influential and can surface unrelated files whose
-        // folder names happen to provide the missing letters.
-        score += fuzzy_score;
-        matches.push(MatchKind::Fuzzy);
-      }
-    }
-
-    if let Some(extension) = lowercase_extension(&candidate.path) {
-      if query_tokens.iter().any(|token| token == &extension) {
-        score += 150;
-        matches.push(MatchKind::Extension);
-      }
-    }
-  }
-
-  if root_priority != 0 {
-    score += root_priority * 10;
-    matches.push(MatchKind::RootPriority);
-  }
-
-  (score, matches)
+  PreparedQuery::new(query).score(&candidate.path, root_priority)
 }
 
 pub fn tokenize(value: &str) -> Vec<String> {
@@ -108,11 +128,11 @@ pub fn tokenize(value: &str) -> Vec<String> {
 /// alphanumeric characters lets `aws pdf`, `aws-pdf`, and `awspdf` share the
 /// same comparison surface without changing the original indexed terms.
 fn compact_for_match(value: &str) -> String {
-  value
-    .chars()
-    .filter(|ch| ch.is_alphanumeric())
-    .map(|ch| ch.to_ascii_lowercase())
-    .collect()
+  let mut compact = String::with_capacity(value.len());
+  for ch in value.chars().filter(|ch| ch.is_alphanumeric()) {
+    compact.push(ch.to_ascii_lowercase());
+  }
+  compact
 }
 
 /// Scores an ordered, character-level fuzzy match against a compact target.
@@ -131,8 +151,7 @@ fn compact_for_match(value: &str) -> String {
 ///
 /// Returning `None` means "not a fuzzy match"; otherwise the returned score is
 /// added to the candidate's total ranking score.
-fn ordered_fuzzy_score(query: &str, target: &str, base_score: i32) -> Option<i32> {
-  let query_chars = query.chars().collect::<Vec<_>>();
+fn ordered_fuzzy_score(query_chars: &[char], target: &str, base_score: i32) -> Option<i32> {
   let target_chars = target.chars().collect::<Vec<_>>();
   if query_chars.len() < 3 || target_chars.is_empty() {
     return None;
@@ -145,7 +164,7 @@ fn ordered_fuzzy_score(query: &str, target: &str, base_score: i32) -> Option<i32
   let mut first_match = None;
   let mut last_match = 0usize;
 
-  for query_char in &query_chars {
+  for query_char in query_chars {
     // Continue searching after the previous hit so the query must match in order.
     // For `awspdf`, this accepts `a` -> `w` -> `s` -> ... -> `p` -> `d` -> `f`
     // in a long filename, but rejects targets where the same letters appear out
@@ -190,30 +209,6 @@ fn ordered_fuzzy_score(query: &str, target: &str, base_score: i32) -> Option<i32
   let miss_penalty = i32::try_from(misses).ok()? * 30;
   let score = base_score + density_bonus + start_bonus - miss_penalty;
   (score > 0).then_some(score)
-}
-
-fn lower_file_name(path: &Path) -> String {
-  path
-    .file_name()
-    .and_then(|value| value.to_str())
-    .unwrap_or_default()
-    .to_ascii_lowercase()
-}
-
-fn lower_file_stem(path: &Path) -> String {
-  path
-    .file_stem()
-    .and_then(|value| value.to_str())
-    .unwrap_or_default()
-    .to_ascii_lowercase()
-}
-
-fn lower_path_components(path: &Path) -> Vec<String> {
-  path
-    .components()
-    .filter_map(|component| component.as_os_str().to_str())
-    .map(|component| component.to_ascii_lowercase())
-    .collect()
 }
 
 #[cfg(test)]

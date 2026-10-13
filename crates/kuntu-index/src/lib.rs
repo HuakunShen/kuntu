@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kuntu_core::{
-  ranking::{score_candidate, tokenize},
+  ranking::{tokenize, PreparedQuery},
   BackendError, EntryKind, IndexRebuildStats, IndexRefreshStats, IndexRepairStats, IndexRootStatus,
-  MatchKind, MetadataIndex, SearchCandidate, SearchConfig, SearchQuery, SearchResult, SearchRoot,
+  MatchKind, MetadataIndex, SearchConfig, SearchQuery, SearchResult, SearchRoot,
 };
 use kuntu_crawler::CrawlOptions;
 use rusqlite::types::Value;
@@ -132,6 +132,15 @@ pub struct IndexedSearchOutcome {
   pub coverage: CandidateCoverage,
 }
 
+/// Per-phase wall time and retained ranking state for the most recent v3 search.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchProfile {
+  pub postings_ns: u128,
+  pub fetch_admission_ns: u128,
+  pub scoring_ns: u128,
+  pub sorting_ns: u128,
+  pub peak_retained_results: usize,
+}
 #[derive(Debug)]
 pub struct KuntuIndex {
   conn: engine::Connection,
@@ -142,6 +151,7 @@ pub struct KuntuIndex {
   shared: bool,
   consumer: String,
   data_version: std::cell::Cell<i64>,
+  search_profile: std::cell::Cell<SearchProfile>,
 }
 
 /// Default number of candidates one search loads and ranks. Candidates are
@@ -467,6 +477,7 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
+    self.search_profile.set(SearchProfile::default());
     self.recheck_read_access()?;
     if self.legacy.is_some() {
       return Err(IndexError::RecreateRequired);
@@ -527,6 +538,7 @@ impl KuntuIndex {
       // exactly the predicate the terms table encodes. Only when every token
       // is too broad to load completely are the capped lists intersected, and
       // the result is then reported as truncated.
+      let postings_started = std::time::Instant::now();
       let unique_terms: std::collections::BTreeSet<String> = query_terms.into_iter().collect();
 
       let mut lists: Vec<(String, TokenPostings)> = Vec::new();
@@ -565,11 +577,18 @@ impl KuntuIndex {
             (rank_ids(&[&lists[position].1.ids]), verify_tokens, false)
           }
           None => {
-            let id_maps: Vec<&std::collections::BTreeMap<i64, bool>> =
-              lists.iter().map(|(_, postings)| &postings.ids).collect();
+            let id_maps: Vec<&dyn PostingMap> = lists
+              .iter()
+              .map(|(_, postings)| &postings.ids as &dyn PostingMap)
+              .collect();
             (rank_ids(&id_maps), Vec::new(), true)
           }
         };
+      let mut profile = SearchProfile {
+        postings_ns: postings_started.elapsed().as_nanos(),
+        ..SearchProfile::default()
+      };
+      let fetch_started = std::time::Instant::now();
       // Stage 2: load the candidate rows by id and filter in Rust.
       //
       // The fetch statement carries no predicate at all. turso's planner turns
@@ -591,7 +610,7 @@ impl KuntuIndex {
       let mut candidates: Vec<CandidateRow> = Vec::new();
       let mut examined = 0usize;
       'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
-        let mut admitted: HashMap<i64, CandidateRow> = HashMap::new();
+        let mut admitted: HashMap<i64, CandidateRow> = HashMap::with_capacity(chunk.len());
         for entry in fetch_entries_by_id(&self.conn, chunk).await? {
           if !verify_tokens.is_empty()
             && !verify_candidate_tokens(&self.conn, entry.id, &entry.path, &verify_tokens).await?
@@ -619,35 +638,54 @@ impl KuntuIndex {
       let candidate_count = candidates.len();
       let candidate_saturated = any_token_saturated;
 
-      let mut results = Vec::new();
-      for row in candidates {
-        let candidate = SearchCandidate {
-          path: row.path,
-          kind: row.kind,
-          provider: "sqlite".to_string(),
-        };
-        let (score, matches) = score_candidate(query, &candidate, row.root_priority);
+      profile.fetch_admission_ns = fetch_started.elapsed().as_nanos();
+      let prepared = PreparedQuery::new(query);
+      let mut retained =
+        std::collections::BinaryHeap::<RetainedResult>::with_capacity(query.limit.min(budget));
+      let mut positives = 0;
+      for (ordinal, row) in candidates.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let (score, matches) = prepared.score(&row.path, row.root_priority);
+        profile.scoring_ns += started.elapsed().as_nanos();
+        let started = std::time::Instant::now();
         if score > 0 {
-          results.push(SearchResult {
-            path: candidate.path,
-            score,
-            provider: candidate.provider,
-            matches,
-            kind: row.kind,
-            byte_size: row.byte_size,
-            modified_unix_seconds: row.modified_unix_seconds,
-          });
+          positives += 1;
+          if query.limit > 0
+            && (retained.len() < query.limit
+              || retained.peek().is_some_and(|worst| {
+                score > worst.result.score
+                  || (score == worst.result.score && row.path < worst.result.path)
+              }))
+          {
+            if retained.len() == query.limit {
+              retained.pop();
+            }
+            retained.push(RetainedResult {
+              ordinal,
+              result: SearchResult {
+                path: row.path,
+                score,
+                provider: "sqlite".into(),
+                matches,
+                kind: row.kind,
+                byte_size: row.byte_size,
+                modified_unix_seconds: row.modified_unix_seconds,
+              },
+            });
+            profile.peak_retained_results = profile.peak_retained_results.max(retained.len());
+          }
         }
+        profile.sorting_ns += started.elapsed().as_nanos();
       }
-
-      results.sort_by(|left, right| {
-        right
-          .score
-          .cmp(&left.score)
-          .then_with(|| left.path.cmp(&right.path))
-      });
-      let truncated = results.len() > query.limit;
-      results.truncate(query.limit);
+      let started = std::time::Instant::now();
+      let results = retained
+        .into_sorted_vec()
+        .into_iter()
+        .map(|r| r.result)
+        .collect();
+      let truncated = positives > query.limit;
+      profile.sorting_ns += started.elapsed().as_nanos();
+      self.search_profile.set(profile);
       let coverage = if self.has_building(root_ids)? {
         CandidateCoverage::Building
       } else if candidate_saturated {
@@ -662,6 +700,10 @@ impl KuntuIndex {
         coverage,
       })
     })
+  }
+
+  pub fn last_search_profile(&self) -> SearchProfile {
+    self.search_profile.get()
   }
 
   pub fn status(&self) -> Result<Vec<RootStatus>> {
@@ -722,25 +764,23 @@ fn entry_fetch_sql(id_count: usize) -> String {
 }
 
 async fn fetch_entries_by_id(conn: &engine::Connection, ids: &[i64]) -> Result<Vec<FetchedEntry>> {
-  let values: Vec<Value> = ids.iter().copied().map(Value::from).collect();
-  let mut rows = conn
-    .query(&entry_fetch_sql(ids.len()), params_from_iter(values))
-    .await?;
+  let mut statement = conn.raw.prepare_cached(&entry_fetch_sql(ids.len()))?;
+  let mut rows = statement.query(params_from_iter(ids.iter()))?;
   let mut fetched = Vec::with_capacity(ids.len());
-  while let Some(row) = rows.next().await? {
+  while let Some(row) = rows.next()? {
     let mtime: Option<i64> = row.get(5)?;
     fetched.push(FetchedEntry {
-      id: row.get::<i64>(0)?,
-      root_id: row.get::<i64>(1)?,
-      path: PathBuf::from(row.get::<String>(2)?),
-      kind: int_to_kind(row.get::<i64>(3)?),
-      size: u64::try_from(row.get::<i64>(4).unwrap_or(-1)).ok(),
+      id: row.get(0)?,
+      root_id: row.get(1)?,
+      path: PathBuf::from(row.get::<_, String>(2)?),
+      kind: int_to_kind(row.get(3)?),
+      size: u64::try_from(row.get::<_, i64>(4).unwrap_or(-1)).ok(),
       mtime: u64::try_from(mtime.unwrap_or(-1)).ok(),
       extension: row.get(6)?,
-      hidden: row.get::<i64>(7)? != 0,
-      ignored: row.get::<i64>(8)? != 0,
-      sensitive: row.get::<i64>(9)? != 0,
-      deleted: row.get::<i64>(10)? != 0,
+      hidden: row.get::<_, i64>(7)? != 0,
+      ignored: row.get::<_, i64>(8)? != 0,
+      sensitive: row.get::<_, i64>(9)? != 0,
+      deleted: row.get::<_, i64>(10)? != 0,
     });
   }
   Ok(fetched)
@@ -935,7 +975,7 @@ const DRIVER_PROBE_ROWS: usize = 1_000;
 /// One token's posting list: entry id -> whether the token hit the file name
 /// (field 1) of that entry.
 struct TokenPostings {
-  ids: std::collections::BTreeMap<i64, bool>,
+  ids: HashMap<i64, bool>,
   /// False when a row or distinct-id limit cut the list short.
   complete: bool,
 }
@@ -950,7 +990,7 @@ async fn load_postings(
   row_limit: usize,
   distinct_cap: usize,
 ) -> Result<TokenPostings> {
-  let mut ids = std::collections::BTreeMap::new();
+  let mut ids = HashMap::new();
   let mut complete = true;
   for name in [true, false] {
     let values = vec![
@@ -963,7 +1003,7 @@ async fn load_postings(
     let mut count = 0;
     while let Some(row) = rows.next()? {
       let id = row.get::<_, i64>(0)?;
-      if count == row_limit || (!ids.contains_key(&id) && ids.len() == distinct_cap) {
+      if count == row_limit || (ids.len() == distinct_cap && !ids.contains_key(&id)) {
         complete = false;
         break;
       }
@@ -998,17 +1038,38 @@ fn smallest_complete(lists: &[(String, TokenPostings)]) -> Option<usize> {
 /// Ids present in every list, file-name hits first (by how many tokens hit
 /// the file name), then by id, so a truncated search keeps the strongest rows
 /// and stays deterministic.
-fn rank_ids(lists: &[&std::collections::BTreeMap<i64, bool>]) -> Vec<i64> {
+trait PostingMap {
+  fn hits(&self) -> Box<dyn Iterator<Item = (i64, bool)> + '_>;
+  fn hit(&self, id: &i64) -> Option<bool>;
+}
+impl PostingMap for HashMap<i64, bool> {
+  fn hits(&self) -> Box<dyn Iterator<Item = (i64, bool)> + '_> {
+    Box::new(self.iter().map(|(&id, &hit)| (id, hit)))
+  }
+  fn hit(&self, id: &i64) -> Option<bool> {
+    self.get(id).copied()
+  }
+}
+#[cfg(test)]
+impl PostingMap for std::collections::BTreeMap<i64, bool> {
+  fn hits(&self) -> Box<dyn Iterator<Item = (i64, bool)> + '_> {
+    Box::new(self.iter().map(|(&id, &hit)| (id, hit)))
+  }
+  fn hit(&self, id: &i64) -> Option<bool> {
+    self.get(id).copied()
+  }
+}
+fn rank_ids(lists: &[&dyn PostingMap]) -> Vec<i64> {
   let Some((first, rest)) = lists.split_first() else {
     return Vec::new();
   };
   let mut ranked: Vec<(usize, i64)> = Vec::new();
-  for (&id, &name_hit) in first.iter() {
+  for (id, name_hit) in first.hits() {
     let mut name_hits = usize::from(name_hit);
     let mut in_every_list = true;
     for other in rest {
-      match other.get(&id) {
-        Some(&hit) => name_hits += usize::from(hit),
+      match other.hit(&id) {
+        Some(hit) => name_hits += usize::from(hit),
         None => {
           in_every_list = false;
           break;
@@ -1019,8 +1080,34 @@ fn rank_ids(lists: &[&std::collections::BTreeMap<i64, bool>]) -> Vec<i64> {
       ranked.push((name_hits, id));
     }
   }
-  ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+  ranked.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
   ranked.into_iter().map(|(_, id)| id).collect()
+}
+
+struct RetainedResult {
+  result: SearchResult,
+  ordinal: usize,
+}
+impl PartialEq for RetainedResult {
+  fn eq(&self, other: &Self) -> bool {
+    self.cmp(other) == std::cmp::Ordering::Equal
+  }
+}
+impl Eq for RetainedResult {}
+impl PartialOrd for RetainedResult {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+impl Ord for RetainedResult {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    other
+      .result
+      .score
+      .cmp(&self.result.score)
+      .then_with(|| self.result.path.cmp(&other.result.path))
+      .then_with(|| self.ordinal.cmp(&other.ordinal))
+  }
 }
 
 #[derive(Debug)]
@@ -2815,3 +2902,6 @@ mod m2_tests;
 fn legacy_error(e: kuntu_legacy_index::IndexError) -> IndexError {
   IndexError::Io(std::io::Error::other(e.to_string()))
 }
+
+#[cfg(test)]
+mod search_review_tests;
