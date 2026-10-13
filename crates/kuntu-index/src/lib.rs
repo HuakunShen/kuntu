@@ -1,16 +1,4 @@
-//! SQLite-compatible metadata index for the file search prototype, backed by
-//! the `turso` engine (an in-process Rust rewrite of SQLite).
-//!
-//! This crate owns a separate file-search database. It does not use the
-//! desktop app database and can be rebuilt or queried by the CLI, daemon, or
-//! future adapters. The public API is synchronous; turso's async API is
-//! driven through a shared executor (`block_on`), because every caller (CLI,
-//! daemon, NAPI libuv workers) is synchronous.
-//!
-//! Engine note: `turso` is pinned to the same generation xross-store uses;
-//! upgrades must move both sides together or xross builds compile two
-//! different SQL engines.
-
+//! M2 SQLite WAL metadata index; query shape retained from M1.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,8 +8,14 @@ use kuntu_core::{
   BackendError, EntryKind, IndexRebuildStats, IndexRefreshStats, IndexRepairStats, IndexRootStatus,
   MatchKind, MetadataIndex, SearchCandidate, SearchConfig, SearchQuery, SearchResult, SearchRoot,
 };
-use kuntu_crawler::{crawl, CrawlOptions};
-use turso::{params, params_from_iter, Value};
+use kuntu_crawler::CrawlOptions;
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter};
+mod engine;
+mod shared;
+use kuntu_store::{Home, ReaderGuard};
+mod walk;
+pub use shared::{Access, WriterService};
 
 pub type RebuildStats = IndexRebuildStats;
 pub type RefreshStats = IndexRefreshStats;
@@ -37,7 +31,7 @@ pub type RootStatus = IndexRootStatus;
 /// directories never touches user data, while turso-era builds avoid
 /// turso's `ALTER TABLE ADD COLUMN` bug cluster. Databases from a newer
 /// version are refused with `IndexError::SchemaTooNew`.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Synchronous facade over turso's async API. Every public method runs on
 /// the caller's thread through a minimal executor; turso's base crate does
@@ -51,10 +45,15 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// states (recreate the file and rebuild) from real engine failures.
 #[derive(Debug)]
 pub enum IndexError {
-  Engine(turso::Error),
+  Engine(rusqlite::Error),
   Io(std::io::Error),
   SchemaTooNew { found: i64, supported: i64 },
   RecreateRequired,
+  ReadOnly,
+  LeaseRequired,
+  EmptyScope,
+  StaleScan,
+  Cancelled,
   RecreateFailed(Box<IndexError>),
   UnrecognizedDatabase { path: PathBuf },
 }
@@ -62,6 +61,11 @@ pub enum IndexError {
 impl std::fmt::Display for IndexError {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      IndexError::ReadOnly => write!(formatter,"Store is read-only."),
+      IndexError::LeaseRequired => write!(formatter,"An owned writer lease is required."),
+      IndexError::EmptyScope => write!(formatter,"Search scope must be non-empty."),
+      IndexError::Cancelled => write!(formatter,"The scan was cancelled; its root remains recoverable."),
+      IndexError::StaleScan => write!(formatter,"Scan generation or consumer policy changed."),
       IndexError::Engine(error) => write!(formatter, "index engine error: {error}"),
       IndexError::Io(error) => write!(formatter, "index io error: {error}"),
       IndexError::SchemaTooNew { found, supported } => write!(
@@ -87,8 +91,8 @@ impl std::fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
-impl From<turso::Error> for IndexError {
-  fn from(error: turso::Error) -> Self {
+impl From<rusqlite::Error> for IndexError {
+  fn from(error: rusqlite::Error) -> Self {
     IndexError::Engine(error)
   }
 }
@@ -104,6 +108,8 @@ pub type Result<T> = std::result::Result<T, IndexError>;
 /// The candidate work bound for one search. A broad indexed prefix stops
 /// yielding candidates here and reports [`CandidateCoverage::Truncated`]
 /// instead of claiming complete coverage over an unbounded root.
+/// Highest schema minor this compiled engine can maintain.
+pub const BUILD_MINOR: i64 = 1;
 pub const MAX_KFS_CANDIDATE_ROWS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +119,7 @@ pub enum CandidateCoverage {
   /// The candidate work bound was reached; results are deterministic but
   /// partial and never claim to be the best over the whole root.
   Truncated,
+  Building,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +134,14 @@ pub struct IndexedSearchOutcome {
 
 #[derive(Debug)]
 pub struct KuntuIndex {
-  conn: turso::Connection,
+  conn: engine::Connection,
+  legacy: Option<kuntu_legacy_index::KuntuIndex>,
+  home: Option<Home>,
+  cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  _reader: Option<ReaderGuard>,
+  shared: bool,
+  consumer: String,
+  data_version: std::cell::Cell<i64>,
 }
 
 /// Default number of candidates one search loads and ranks. Candidates are
@@ -192,267 +206,137 @@ impl MetadataIndex for KuntuIndex {
 
 impl KuntuIndex {
   pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-    block_on(Self::open_async(path.as_ref()))
+    Self::open_private(path.as_ref(), false)
   }
-
+  pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+    Self::open_private(path.as_ref(), true)
+  }
   pub fn open_memory() -> Result<Self> {
-    block_on(async {
-      let database = turso::Builder::new_local(":memory:").build().await?;
-      let conn = database.connect()?;
-      let index = KuntuIndex { conn };
-      index.enable_foreign_key_cascades().await?;
-      index.create_schema().await?;
-      index.set_schema_version(SCHEMA_VERSION).await?;
-      Ok(index)
-    })
+    kuntu_vfs::register()?;
+    Self::from_raw(
+      rusqlite::Connection::open_in_memory()?,
+      None,
+      false,
+      false,
+      "private",
+      0,
+    )
   }
-
-  async fn open_async(path: &Path) -> Result<Self> {
-    // One retry: a legacy (pre-turso) or unreadable database file is deleted
-    // and recreated, because the index is derived data. A second failure is
-    // real and propagates.
-    let mut attempts = 0;
-    loop {
-      attempts += 1;
-      match Self::open_once(path).await {
-        Ok(index) => return Ok(index),
-        Err(IndexError::RecreateRequired) if attempts == 1 => {
-          remove_database_files(path);
-        }
-        Err(IndexError::RecreateRequired) => {
-          return Err(IndexError::RecreateFailed(Box::new(
-            IndexError::RecreateRequired,
-          )));
-        }
-        Err(error) => return Err(error),
+  #[cfg(test)]
+  async fn schema_version(&self) -> Result<i64> {
+    Ok(
+      self
+        .conn
+        .raw
+        .query_row("PRAGMA user_version", [], |r| r.get(0))?,
+    )
+  }
+  pub fn rebuild(&mut self, config: &SearchConfig) -> Result<RebuildStats> {
+    self.ensure_lease()?;
+    if let Some(legacy) = &mut self.legacy {
+      return legacy.rebuild(config).map_err(legacy_error);
+    }
+    let mut entries_count = 0;
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+    for root in config.roots.iter().filter(|r| r.enabled) {
+      let root_id = if self.shared {
+        self.conn.raw.query_row("SELECT r.id FROM roots r JOIN root_consumers c ON c.root_id=r.id WHERE r.path=?1 AND c.consumer=?2 AND c.enabled=1",params![root.path.to_string_lossy(),self.consumer],|r|r.get(0))?
+      } else {
+        self.register_root(root)?
+      };
+      let gen = self.begin_scan(root_id)?;
+      // The unmodified M1 crawler returns a snapshot; SQL batches never span
+      // this blocking walk. Re-read policy after the walk and each commit.
+      let crawl_config = self.index_config(root_id)?;
+      let (entries, stats) =
+        walk::crawl_cancellable(&CrawlOptions::new(crawl_config), &self.cancel)?;
+      self.check_cancelled()?;
+      skipped += stats.skipped;
+      if !stats.errors.is_empty() {
+        errors.extend(stats.errors);
+        self.mark_root_dirty(root)?;
+        continue;
       }
-    }
-  }
-
-  async fn open_once(path: &Path) -> Result<Self> {
-    // turso's builder takes a string; rather than alias a database to a
-    // lossy-converted path (distinct byte paths collapsing onto one), refuse
-    // what cannot be represented exactly.
-    let Some(path_text) = path.to_str() else {
-      return Err(IndexError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("index database path is not valid UTF-8: {}", path.display()),
-      )));
-    };
-    let database = turso::Builder::new_local(path_text).build().await?;
-    let conn = database.connect()?;
-    let index = KuntuIndex { conn };
-    index.enable_foreign_key_cascades().await?;
-
-    let version = index.schema_version().await?;
-    if version > SCHEMA_VERSION {
-      return Err(IndexError::SchemaTooNew {
-        found: version,
-        supported: SCHEMA_VERSION,
-      });
-    }
-    if version == 0 {
-      // A fresh file reports version 0 with no tables. Version 0 with the
-      // complete KFS schema is a pre-versioning rusqlite database: recreate.
-      // Anything else with user tables is not ours and must never be touched
-      // automatically — `roots` alone proves nothing.
-      let has_tables = any_table_exists(&index.conn).await?;
-      if has_tables {
-        let kuntu_tables = ["roots", "entries", "terms", "root_state"];
-        let mut complete = true;
-        for table in kuntu_tables {
-          if !table_exists(&index.conn, table).await? {
-            complete = false;
-            break;
+      self.check_scan(root_id, gen)?;
+      let mut offset = 0;
+      while offset < entries.len() {
+        self.check_cancelled()?;
+        let started = std::time::Instant::now();
+        let tx = self.conn.begin_writer_txn(false)?;
+        self.check_scan(root_id, gen)?;
+        let mut rows = 0;
+        while offset < entries.len()
+          && rows < 5_000
+          && (rows == 0 || started.elapsed() < std::time::Duration::from_millis(100))
+        {
+          self.check_cancelled()?;
+          let entry = &entries[offset];
+          if !entry.decision.sensitive {
+            let (id, needs_postings) = block_on(insert_entry_tx(&tx, root_id, entry, gen))?;
+            if needs_postings {
+              block_on(insert_terms_tx(&tx, id, &entry.path))?;
+            }
+            entries_count += 1;
+          }
+          offset += 1;
+          rows += 1;
+          #[cfg(test)]
+          if let Ok(ms) = std::env::var("KUNTU_TEST_ROW_DELAY_MS") {
+            std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap()));
           }
         }
-        if complete {
-          return Err(IndexError::RecreateRequired);
+        tx.conn.raw.execute("UPDATE root_state SET entry_count=(SELECT count(*) FROM entries WHERE root_id=?1) WHERE root_id=?1",params![root_id])?;
+        block_on(tx.commit())?;
+        #[cfg(test)]
+        m2_tests::record_batch(rows);
+        let threshold = std::env::var("KUNTU_FAULT_ROWS")
+          .ok()
+          .and_then(|v| v.parse::<usize>().ok())
+          .unwrap_or(0);
+        if offset >= threshold {
+          shared::fault("batch_committed");
         }
-        return Err(IndexError::UnrecognizedDatabase {
-          path: path.to_path_buf(),
-        });
       }
+      self.complete_scan(root_id, gen)?;
     }
-
-    index.create_schema().await?;
-    if version < SCHEMA_VERSION {
-      index.set_schema_version(SCHEMA_VERSION).await?;
-    }
-    Ok(index)
-  }
-
-  /// The schema leans on `terms.entry_id ... ON DELETE CASCADE`; the engine
-  /// only honors that while the per-connection pragma is on. Without it a
-  /// rebuild's bulk entry delete leaves orphan terms behind, and row id reuse
-  /// then aliases old terms onto new files.
-  async fn enable_foreign_key_cascades(&self) -> Result<()> {
-    self.conn.execute("PRAGMA foreign_keys = ON", ()).await?;
-    Ok(())
-  }
-
-  async fn create_schema(&self) -> Result<()> {
-    self.conn.execute_batch(SCHEMA_DDL).await?;
-    Ok(())
-  }
-
-  async fn schema_version(&self) -> Result<i64> {
-    let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
-    let row = rows
-      .next()
-      .await?
-      .expect("PRAGMA user_version returns a row");
-    Ok(row.get::<i64>(0)?)
-  }
-
-  async fn set_schema_version(&self, version: i64) -> Result<()> {
-    self
-      .conn
-      .execute_batch(&format!("PRAGMA user_version = {version};"))
-      .await?;
-    Ok(())
-  }
-
-  pub fn rebuild(&mut self, config: &SearchConfig) -> Result<RebuildStats> {
-    let now = unix_now();
-    let mut total_entries = 0;
-    let mut total_skipped = 0;
-    let mut errors = Vec::new();
-
-    block_on(async {
-      let tx = self.conn.transaction().await?;
-      for root in config.roots.iter().filter(|root| root.enabled) {
-        let root_id = upsert_root_tx(&tx, root).await?;
-        let root_config = SearchConfig {
-          roots: vec![root.clone()],
-        };
-        let options = CrawlOptions::new(root_config);
-        let (entries, stats) = crawl(&options);
-        let root_has_errors = !stats.errors.is_empty();
-        total_skipped += stats.skipped;
-        errors.extend(stats.errors);
-
-        if root_has_errors {
-          mark_root_state_dirty_tx(&tx, root_id).await?;
-          continue;
-        }
-
-        tx.execute("DELETE FROM entries WHERE root_id = ?1", params![root_id])
-          .await?;
-
-        for entry in entries {
-          let entry_id = insert_entry_tx(&tx, root_id, &entry, now).await?;
-          insert_terms_tx(&tx, entry_id, &entry.path).await?;
-          total_entries += 1;
-        }
-
-        let count = count_entries_tx(&tx, root_id).await?;
-        tx.execute(
-          "INSERT INTO root_state (root_id, generation, last_full_scan_at, last_incremental_at, dirty, entry_count)
-           VALUES (?1, COALESCE((SELECT generation + 1 FROM root_state WHERE root_id = ?1), 1), ?2, NULL, 0, ?3)
-           ON CONFLICT(root_id) DO UPDATE SET
-             generation = root_state.generation + 1,
-             last_full_scan_at = excluded.last_full_scan_at,
-             dirty = 0,
-             entry_count = excluded.entry_count",
-          params![root_id, now, count],
-        )
-        .await?;
-      }
-      tx.commit().await?;
-      Ok::<(), IndexError>(())
-    })?;
-
     Ok(RebuildStats {
-      roots: config.roots.iter().filter(|root| root.enabled).count(),
-      entries: total_entries,
-      skipped: total_skipped,
+      roots: config.roots.iter().filter(|r| r.enabled).count(),
+      entries: entries_count,
+      skipped,
       errors,
     })
   }
-
   pub fn refresh(&mut self, config: &SearchConfig) -> Result<RefreshStats> {
-    let now = unix_now();
-    let mut inserted = 0;
-    let mut updated = 0;
-    let mut deleted = 0;
-    let mut unchanged = 0;
-    let mut total_skipped = 0;
-    let mut errors = Vec::new();
-
-    block_on(async {
-      let tx = self.conn.transaction().await?;
-      for root in config.roots.iter().filter(|root| root.enabled) {
-        let root_id = upsert_root_tx(&tx, root).await?;
-        let mut existing = load_existing_entries_tx(&tx, root_id).await?;
-        let root_config = SearchConfig {
-          roots: vec![root.clone()],
-        };
-        let options = CrawlOptions::new(root_config);
-        let (entries, stats) = crawl(&options);
-        let root_has_errors = !stats.errors.is_empty();
-        total_skipped += stats.skipped;
-        errors.extend(stats.errors);
-
-        if root_has_errors {
-          mark_root_state_dirty_tx(&tx, root_id).await?;
-          continue;
-        }
-
-        let mut seen_paths = HashSet::new();
-        for entry in entries {
-          let path_key = entry.path.to_string_lossy().into_owned();
-          seen_paths.insert(path_key.clone());
-          if let Some(existing_entry) = existing.remove(&path_key) {
-            if entry_changed(&existing_entry, &entry) {
-              update_entry_tx(&tx, existing_entry.id, &entry, now).await?;
-              updated += 1;
-            } else {
-              unchanged += 1;
-            }
-          } else {
-            let entry_id = insert_entry_tx(&tx, root_id, &entry, now).await?;
-            insert_terms_tx(&tx, entry_id, &entry.path).await?;
-            inserted += 1;
-          }
-        }
-
-        for (path, existing_entry) in existing {
-          if !seen_paths.contains(&path) && !existing_entry.deleted {
-            mark_entry_deleted_tx(&tx, existing_entry.id, now).await?;
-            deleted += 1;
-          }
-        }
-
-        let count = count_entries_tx(&tx, root_id).await?;
-        tx.execute(
-          "INSERT INTO root_state (root_id, generation, last_full_scan_at, last_incremental_at, dirty, entry_count)
-           VALUES (?1, COALESCE((SELECT generation + 1 FROM root_state WHERE root_id = ?1), 1), NULL, ?2, ?3, ?4)
-           ON CONFLICT(root_id) DO UPDATE SET
-             generation = root_state.generation + 1,
-             last_incremental_at = excluded.last_incremental_at,
-             dirty = excluded.dirty,
-             entry_count = excluded.entry_count",
-          params![root_id, now, root_has_errors, count],
-        )
-        .await?;
-      }
-      tx.commit().await?;
-      Ok::<(), IndexError>(())
-    })?;
-
+    self.ensure_lease()?;
+    if let Some(legacy) = &mut self.legacy {
+      return legacy.refresh(config).map_err(legacy_error);
+    }
+    let before = self.snapshot()?;
+    let stats = self.rebuild(config)?;
+    let after = self.snapshot()?;
+    let inserted = after.keys().filter(|p| !before.contains_key(*p)).count();
+    let deleted = before.keys().filter(|p| !after.contains_key(*p)).count();
+    let unchanged = after
+      .iter()
+      .filter(|(p, v)| before.get(*p) == Some(*v))
+      .count();
+    let updated = after.len() - inserted - unchanged;
     Ok(RefreshStats {
-      roots: config.roots.iter().filter(|root| root.enabled).count(),
+      roots: stats.roots,
       inserted,
       updated,
       deleted,
       unchanged,
-      skipped: total_skipped,
-      errors,
+      skipped: stats.skipped,
+      errors: stats.errors,
     })
   }
-
   pub fn repair(&mut self, config: &SearchConfig) -> Result<RepairStats> {
+    self.ensure_lease()?;
+    if let Some(legacy) = &mut self.legacy {
+      return legacy.repair(config).map_err(legacy_error);
+    }
     let configured_roots = config
       .roots
       .iter()
@@ -501,14 +385,22 @@ impl KuntuIndex {
   }
 
   pub fn mark_root_dirty(&mut self, root: &SearchRoot) -> Result<()> {
+    self.ensure_lease()?;
+    if let Some(legacy) = &mut self.legacy {
+      return legacy.mark_root_dirty(root).map_err(legacy_error);
+    }
     block_on(async {
       let tx = self.conn.transaction().await?;
-      let root_id = upsert_root_tx(&tx, root).await?;
+      let root_id = if self.shared {
+        tx.conn.raw.query_row("SELECT r.id FROM roots r JOIN root_consumers c ON c.root_id=r.id WHERE r.path=?1 AND c.consumer=?2 AND c.enabled=1",params![root.path.to_string_lossy(),self.consumer],|r|r.get(0))?
+      } else {
+        upsert_root_tx(&tx, root).await?
+      };
       let count = count_entries_tx(&tx, root_id).await?;
       tx.execute(
         "INSERT INTO root_state (root_id, generation, last_full_scan_at, last_incremental_at, dirty, entry_count)
          VALUES (?1, COALESCE((SELECT generation FROM root_state WHERE root_id = ?1), 0), NULL, NULL, 1, ?2)
-         ON CONFLICT(root_id) DO UPDATE SET dirty = 1",
+         ON CONFLICT(root_id) DO UPDATE SET dirty = 1, status = 'dirty'",
         params![root_id, count],
       )
       .await?;
@@ -538,19 +430,83 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
+    self.recheck_read_access()?;
+    if !config.roots.iter().any(|r| r.enabled) {
+      return Err(IndexError::EmptyScope);
+    }
+    if let Some(legacy) = &self.legacy {
+      let o = legacy
+        .search_with_options(
+          config,
+          query,
+          kuntu_legacy_index::SearchOptions {
+            fetch_budget: options.fetch_budget,
+          },
+        )
+        .map_err(legacy_error)?;
+      return Ok(IndexedSearchOutcome {
+        candidate_count: o.candidate_count,
+        results: o.results,
+        truncated: o.truncated,
+        coverage: match o.coverage {
+          kuntu_legacy_index::CandidateCoverage::Complete => CandidateCoverage::Complete,
+          kuntu_legacy_index::CandidateCoverage::Truncated => CandidateCoverage::Truncated,
+        },
+      });
+    }
+    let scope = kuntu_core::SearchScope::new(block_on(root_ids_for_config(&self.conn, config))?)
+      .map_err(|_| IndexError::EmptyScope)?;
+    self.search_scoped(config, &scope, query, options)
+  }
+
+  /// Explicit v3 scope; config roots and persisted consumer membership intersect it.
+  pub fn search_scoped(
+    &self,
+    config: &SearchConfig,
+    requested: &kuntu_core::SearchScope,
+    query: &SearchQuery,
+    options: SearchOptions,
+  ) -> Result<IndexedSearchOutcome> {
+    self.recheck_read_access()?;
+    if self.legacy.is_some() {
+      return Err(IndexError::RecreateRequired);
+    }
+    let configured = block_on(root_ids_for_config(&self.conn, config))?;
+    let root_ids = kuntu_core::SearchScope::new(
+      requested
+        .ids()
+        .iter()
+        .filter(|id| configured.contains(id))
+        .copied()
+        .collect(),
+    )
+    .map_err(|_| IndexError::EmptyScope)?;
+    let root_ids = root_ids.ids();
     let budget = options.fetch_budget.clamp(1, MAX_KFS_CANDIDATE_ROWS);
+    self.poll_changes()?;
+    let admission = block_on(CandidateScope::load(
+      &self.conn,
+      root_ids,
+      query,
+      &self.consumer,
+      self.shared,
+      config,
+    ))?;
+    if admission.allowed_roots.is_empty() {
+      return Err(IndexError::EmptyScope);
+    }
     block_on(async {
       let empty = IndexedSearchOutcome {
         candidate_count: 0,
         results: Vec::new(),
         truncated: false,
-        coverage: CandidateCoverage::Complete,
+        coverage: if self.has_building(root_ids)? {
+          CandidateCoverage::Building
+        } else {
+          CandidateCoverage::Complete
+        },
       };
       if !query.include_files && !query.include_directories {
-        return Ok(empty);
-      }
-      let root_ids = root_ids_for_config(&self.conn, config).await?;
-      if root_ids.is_empty() {
         return Ok(empty);
       }
       let query_terms = tokenize(&query.query);
@@ -623,7 +579,15 @@ impl KuntuIndex {
       // therefore applied to each fetched row before it can become a
       // candidate, so nothing outside the configured scope or policy is ever
       // ranked, and the budget counts only admitted rows.
-      let scope = CandidateScope::load(&self.conn, &root_ids, query).await?;
+      let scope = CandidateScope::load(
+        &self.conn,
+        root_ids,
+        query,
+        &self.consumer,
+        self.shared,
+        config,
+      )
+      .await?;
       let mut candidates: Vec<CandidateRow> = Vec::new();
       let mut examined = 0usize;
       'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
@@ -684,7 +648,9 @@ impl KuntuIndex {
       });
       let truncated = results.len() > query.limit;
       results.truncate(query.limit);
-      let coverage = if candidate_saturated {
+      let coverage = if self.has_building(root_ids)? {
+        CandidateCoverage::Building
+      } else if candidate_saturated {
         CandidateCoverage::Truncated
       } else {
         CandidateCoverage::Complete
@@ -699,14 +665,19 @@ impl KuntuIndex {
   }
 
   pub fn status(&self) -> Result<Vec<RootStatus>> {
+    self.recheck_read_access()?;
+    if let Some(legacy) = &self.legacy {
+      return legacy.status().map_err(legacy_error);
+    }
     block_on(async {
       let mut rows = self.conn.query(
         "SELECT r.path, COALESCE(s.entry_count, 0), COALESCE(s.generation, 0), COALESCE(s.dirty, 0),
                 s.last_full_scan_at, s.last_incremental_at
          FROM roots r
          LEFT JOIN root_state s ON s.root_id = r.id
+         WHERE (?1=0 OR r.id IN (SELECT root_id FROM root_consumers WHERE consumer=?2 AND enabled=1))
          ORDER BY r.path",
-        (),
+        params![self.shared,self.consumer],
       )
       .await?;
       let mut collected = Vec::new();
@@ -744,13 +715,13 @@ struct FetchedEntry {
 /// `search_with_options` and the plan test that pins this statement.
 fn entry_fetch_sql(id_count: usize) -> String {
   format!(
-    "SELECT id, root_id, path, kind, size, mtime, extension, hidden, ignored, sensitive, deleted
+    "SELECT id, root_id, path, kind, size, mtime, extension, (flags & 1), (flags & 2), (flags & 4), 0
        FROM entries WHERE id IN ({})",
     placeholders(id_count)
   )
 }
 
-async fn fetch_entries_by_id(conn: &turso::Connection, ids: &[i64]) -> Result<Vec<FetchedEntry>> {
+async fn fetch_entries_by_id(conn: &engine::Connection, ids: &[i64]) -> Result<Vec<FetchedEntry>> {
   let values: Vec<Value> = ids.iter().copied().map(Value::from).collect();
   let mut rows = conn
     .query(&entry_fetch_sql(ids.len()), params_from_iter(values))
@@ -781,17 +752,20 @@ struct CandidateScope {
   /// root id -> (priority, include_hidden, include_ignored)
   root_meta: HashMap<i64, (i32, bool, bool)>,
   extensions: Vec<String>,
+  shared: bool,
 }
 
 impl CandidateScope {
-  async fn load(conn: &turso::Connection, root_ids: &[i64], query: &SearchQuery) -> Result<Self> {
+  async fn load(
+    conn: &engine::Connection,
+    root_ids: &[i64],
+    query: &SearchQuery,
+    consumer: &str,
+    shared: bool,
+    _config: &SearchConfig,
+  ) -> Result<Self> {
     let mut root_meta = HashMap::new();
-    let mut rows = conn
-      .query(
-        "SELECT id, priority, include_hidden, include_ignored FROM roots",
-        (),
-      )
-      .await?;
+    let mut rows=conn.query("SELECT root_id,priority,include_hidden,include_ignored FROM root_consumers WHERE consumer=?1 AND enabled=1",params![consumer]).await?;
     while let Some(row) = rows.next().await? {
       root_meta.insert(
         row.get::<i64>(0)?,
@@ -803,7 +777,12 @@ impl CandidateScope {
       );
     }
     Ok(Self {
-      allowed_roots: root_ids.iter().copied().collect(),
+      shared,
+      allowed_roots: root_ids
+        .iter()
+        .copied()
+        .filter(|id| root_meta.contains_key(id))
+        .collect(),
       root_meta,
       extensions: query
         .extensions
@@ -818,7 +797,11 @@ impl CandidateScope {
   /// requested extension, and is either clean or allowed by the query flag or
   /// by its own root's allowance.
   fn admit(&self, query: &SearchQuery, entry: FetchedEntry) -> Option<CandidateRow> {
-    if entry.deleted || entry.sensitive || !self.allowed_roots.contains(&entry.root_id) {
+    if entry.deleted
+      || entry.sensitive
+      || kuntu_core::denies_sensitive_path(&entry.path)
+      || !self.allowed_roots.contains(&entry.root_id)
+    {
       return None;
     }
     let kind_allowed = match entry.kind {
@@ -834,10 +817,10 @@ impl CandidateScope {
       .get(&entry.root_id)
       .copied()
       .unwrap_or((0, false, false));
-    if entry.hidden && !(query.include_hidden || root_hidden) {
+    if entry.hidden && !(root_hidden || (!self.shared && query.include_hidden)) {
       return None;
     }
-    if entry.ignored && !(query.include_ignored || root_ignored) {
+    if entry.ignored && !(root_ignored || (!self.shared && query.include_ignored)) {
       return None;
     }
     if !self.extensions.is_empty()
@@ -891,9 +874,20 @@ fn path_has_lossy_component(path: &Path) -> bool {
 }
 
 /// The one statement the lossy-path fallback reads: a single entry's stored
-/// terms, including its extension term, through `idx_terms_entry`.
+/// terms, including its extension term, through `reverse_postings`.
 fn entry_terms_sql() -> &'static str {
-  "SELECT term FROM terms WHERE entry_id = ?1"
+  "SELECT encoded FROM reverse_postings WHERE entry_id = ?1"
+}
+fn postings_delete_sql(name: bool) -> String {
+  format!("DELETE FROM {} WHERE term IN (SELECT value FROM json_each(kuntu_terms((SELECT encoded FROM reverse_postings WHERE entry_id=?1),?2))) AND entry_id=?1",if name{"name_postings"}else{"path_postings"})
+}
+fn encode_terms(name: &[String], path: &[String]) -> Result<Vec<u8>> {
+  let json = serde_json::to_vec(&(name, path)).map_err(|e| std::io::Error::other(e.to_string()))?;
+  Ok(zstd::stream::encode_all(json.as_slice(), 3)?)
+}
+fn decode_terms(encoded: &[u8]) -> Result<(Vec<String>, Vec<String>)> {
+  let bytes = zstd::stream::decode_all(encoded)?;
+  serde_json::from_slice(&bytes).map_err(|e| IndexError::Io(std::io::Error::other(e.to_string())))
 }
 
 /// Stage-2 verification of the driver's remaining tokens against one row.
@@ -908,7 +902,7 @@ fn entry_terms_sql() -> &'static str {
 /// required. A path without U+FFFD is byte-identical to what was indexed, so
 /// it needs no lookup.
 async fn verify_candidate_tokens(
-  conn: &turso::Connection,
+  conn: &engine::Connection,
   entry_id: i64,
   path: &Path,
   tokens: &[String],
@@ -922,8 +916,11 @@ async fn verify_candidate_tokens(
   let mut remaining: Vec<&str> = tokens.iter().map(String::as_str).collect();
   let mut rows = conn.query(entry_terms_sql(), params![entry_id]).await?;
   while let Some(row) = rows.next().await? {
-    let term = row.get::<String>(0)?;
-    remaining.retain(|token| !term.starts_with(token));
+    let encoded = row.get::<Vec<u8>>(0)?;
+    let (name, path) = decode_terms(&encoded)?;
+    for term in name.iter().chain(&path) {
+      remaining.retain(|token| !term.starts_with(token));
+    }
     if remaining.is_empty() {
       return Ok(true);
     }
@@ -948,36 +945,44 @@ struct TokenPostings {
 /// range over the covering primary-key index: no `DISTINCT`, no `ORDER BY`
 /// (either makes turso choose the non-covering `idx_terms_term` and a sorter).
 async fn load_postings(
-  conn: &turso::Connection,
+  conn: &engine::Connection,
   term: &str,
   row_limit: usize,
   distinct_cap: usize,
 ) -> Result<TokenPostings> {
-  let (clause, mut values) = term_prefix_clause(term);
-  let sql = format!("SELECT entry_id, field FROM terms WHERE {clause} LIMIT ?");
-  values.push(Value::from(
-    i64::try_from(row_limit).unwrap_or(i64::MAX - 1) + 1,
-  ));
-  let mut rows = conn.query(&sql, params_from_iter(values)).await?;
   let mut ids = std::collections::BTreeMap::new();
-  let mut seen_rows = 0usize;
   let mut complete = true;
-  while let Some(row) = rows.next().await? {
-    if seen_rows == row_limit {
-      complete = false;
-      break;
+  for name in [true, false] {
+    let values = vec![
+      Value::from(term.to_string()),
+      Value::from(term_prefix_upper_bound(term)),
+      Value::from(i64::try_from(row_limit).unwrap_or(i64::MAX - 1) + 1),
+    ];
+    let mut statement = conn.raw.prepare_cached(&postings_sql(name))?;
+    let mut rows = statement.query(params_from_iter(values))?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+      let id = row.get::<_, i64>(0)?;
+      if count == row_limit || (!ids.contains_key(&id) && ids.len() == distinct_cap) {
+        complete = false;
+        break;
+      }
+      count += 1;
+      let hit = ids.entry(id).or_insert(false);
+      *hit |= name;
     }
-    seen_rows += 1;
-    let id = row.get::<i64>(0)?;
-    let name_hit = row.get::<i64>(1)? == 1;
-    if !ids.contains_key(&id) && ids.len() == distinct_cap {
-      complete = false;
-      break;
-    }
-    let entry = ids.entry(id).or_insert(false);
-    *entry = *entry || name_hit;
   }
   Ok(TokenPostings { ids, complete })
+}
+fn postings_sql(name: bool) -> String {
+  format!(
+    "SELECT entry_id FROM {} WHERE term >= ?1 AND term < ?2 LIMIT ?3",
+    if name {
+      "name_postings"
+    } else {
+      "path_postings"
+    }
+  )
 }
 
 /// Position of the complete list with the fewest entries.
@@ -1027,22 +1032,7 @@ struct CandidateRow {
   modified_unix_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-struct ExistingEntry {
-  id: i64,
-  kind: EntryKind,
-  size: Option<i64>,
-  mtime: Option<i64>,
-  hidden: bool,
-  ignored: bool,
-  sensitive: bool,
-  deleted: bool,
-}
-
-async fn upsert_root_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  root: &SearchRoot,
-) -> Result<i64> {
+async fn upsert_root_tx(tx: &engine::Transaction<'_>, root: &SearchRoot) -> Result<i64> {
   let now = unix_now();
   tx.execute(
     "INSERT INTO roots (path, enabled, priority, include_hidden, include_ignored, updated_at)
@@ -1073,241 +1063,72 @@ async fn upsert_root_tx(
   Ok(row.get::<i64>(0)?)
 }
 
-async fn load_existing_entries_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  root_id: i64,
-) -> Result<HashMap<String, ExistingEntry>> {
-  let mut rows = tx
-    .query(
-      "SELECT path, id, kind, size, mtime, hidden, ignored, sensitive, deleted
-           FROM entries
-           WHERE root_id = ?1",
-      params![root_id],
-    )
-    .await?;
-
-  let mut entries = HashMap::new();
-  while let Some(row) = rows.next().await? {
-    let path: String = row.get(0)?;
-    entries.insert(
-      path,
-      ExistingEntry {
-        id: row.get(1)?,
-        kind: int_to_kind(row.get(2)?),
-        size: row.get(3)?,
-        mtime: row.get(4)?,
-        hidden: row.get::<i64>(5)? != 0,
-        ignored: row.get::<i64>(6)? != 0,
-        sensitive: row.get::<i64>(7)? != 0,
-        deleted: row.get::<i64>(8)? != 0,
-      },
-    );
-  }
-  Ok(entries)
-}
-
 async fn insert_entry_tx(
-  tx: &turso::transaction::Transaction<'_>,
+  tx: &engine::Transaction<'_>,
   root_id: i64,
   entry: &kuntu_crawler::CrawledEntry,
-  indexed_at: i64,
-) -> Result<i64> {
-  let name = entry
-    .path
-    .file_name()
-    .and_then(|value| value.to_str())
-    .unwrap_or_default()
-    .to_string();
-  let extension = entry
-    .path
-    .extension()
-    .and_then(|value| value.to_str())
-    .map(|value| value.to_ascii_lowercase());
-  let name_lower = name.to_ascii_lowercase();
-  tx.execute(
-        "INSERT INTO entries
-         (root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)",
-        params![
-            root_id,
-            entry.path.to_string_lossy(),
-            entry.path.to_string_lossy().to_ascii_lowercase(),
-            name,
-            name_lower,
-            extension,
-            kind_to_int(entry.kind),
-            entry_size_i64(entry),
-            entry.mtime,
-            entry.decision.hidden,
-            entry.decision.ignored,
-            entry.decision.sensitive,
-            indexed_at
-        ],
-    )
+  gen: i64,
+) -> Result<(i64, bool)> {
+  let flags = i64::from(entry.decision.hidden)
+    | (i64::from(entry.decision.ignored) * 2)
+    | (i64::from(entry.decision.sensitive) * 4);
+  tx.execute("INSERT INTO entries(root_id,path,name,extension,kind,size,mtime,flags,scan_gen) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(root_id,path) DO UPDATE SET name=excluded.name,extension=excluded.extension,kind=excluded.kind,size=excluded.size,mtime=excluded.mtime,flags=excluded.flags,scan_gen=excluded.scan_gen",params![root_id,entry.path.to_string_lossy(),entry.path.file_name().and_then(|v|v.to_str()).unwrap_or_default(),entry.path.extension().and_then(|v|v.to_str()).map(str::to_ascii_lowercase),kind_to_int(entry.kind),entry.size.and_then(|v|i64::try_from(v).ok()),entry.mtime,flags,gen]).await?;
+  let id = tx.conn.raw.query_row(
+    "SELECT id FROM entries WHERE root_id=?1 AND path=?2",
+    params![root_id, entry.path.to_string_lossy()],
+    |r| r.get(0),
+  )?;
+  tx.execute(&postings_delete_sql(true), params![id, 1])
     .await?;
-  // The (root_id, path) pair is unique, so the id of the row this call just
-  // wrote is recovered explicitly rather than through a rowid cursor API.
-  let mut rows = tx
-    .query(
-      "SELECT id FROM entries WHERE root_id = ?1 AND path = ?2",
-      params![root_id, entry.path.to_string_lossy()],
-    )
+  tx.execute(&postings_delete_sql(false), params![id, 2])
     .await?;
-  let row = rows.next().await?.expect("inserted entry row exists");
-  Ok(row.get::<i64>(0)?)
+  Ok((id, true))
 }
-
-async fn update_entry_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  entry_id: i64,
-  entry: &kuntu_crawler::CrawledEntry,
-  indexed_at: i64,
-) -> Result<()> {
-  let name = entry
-    .path
-    .file_name()
-    .and_then(|value| value.to_str())
-    .unwrap_or_default()
-    .to_string();
-  let extension = entry
-    .path
-    .extension()
-    .and_then(|value| value.to_str())
-    .map(|value| value.to_ascii_lowercase());
-  let name_lower = name.to_ascii_lowercase();
-  tx.execute(
-    "UPDATE entries
-         SET path = ?1,
-             path_lower = ?2,
-             name = ?3,
-             name_lower = ?4,
-             extension = ?5,
-             kind = ?6,
-             size = ?7,
-             mtime = ?8,
-             hidden = ?9,
-             ignored = ?10,
-             sensitive = ?11,
-             deleted = 0,
-             indexed_at = ?12
-         WHERE id = ?13",
-    params![
-      entry.path.to_string_lossy(),
-      entry.path.to_string_lossy().to_ascii_lowercase(),
-      name,
-      name_lower,
-      extension,
-      kind_to_int(entry.kind),
-      entry_size_i64(entry),
-      entry.mtime,
-      entry.decision.hidden,
-      entry.decision.ignored,
-      entry.decision.sensitive,
-      indexed_at,
-      entry_id
-    ],
-  )
-  .await?;
-  tx.execute("DELETE FROM terms WHERE entry_id = ?1", params![entry_id])
-    .await?;
-  insert_terms_tx(tx, entry_id, &entry.path).await
-}
-
-async fn mark_entry_deleted_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  entry_id: i64,
-  indexed_at: i64,
-) -> Result<()> {
-  tx.execute(
-    "UPDATE entries SET deleted = 1, indexed_at = ?1 WHERE id = ?2",
-    params![indexed_at, entry_id],
-  )
-  .await?;
-  tx.execute("DELETE FROM terms WHERE entry_id = ?1", params![entry_id])
-    .await?;
-  Ok(())
-}
-
-async fn insert_terms_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  entry_id: i64,
-  path: &Path,
-) -> Result<()> {
+async fn insert_terms_tx(tx: &engine::Transaction<'_>, entry_id: i64, path: &Path) -> Result<()> {
   let name = path
     .file_name()
-    .and_then(|value| value.to_str())
+    .and_then(|v| v.to_str())
     .unwrap_or_default();
-  for term in tokenize(name) {
+  let names: Vec<_> = tokenize(name)
+    .into_iter()
+    .chain(
+      path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(str::to_ascii_lowercase),
+    )
+    .collect();
+  let paths: Vec<_> = path
+    .parent()
+    .into_iter()
+    .flat_map(Path::components)
+    .filter_map(|v| v.as_os_str().to_str())
+    .flat_map(tokenize)
+    .collect();
+  for term in &names {
     tx.execute(
-      "INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES (?1, ?2, 1, 100)",
+      "INSERT OR IGNORE INTO name_postings(term,entry_id) VALUES(?1,?2)",
       params![term, entry_id],
     )
     .await?;
   }
-  if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+  for term in &paths {
     tx.execute(
-      "INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES (?1, ?2, 2, 50)",
-      params![extension.to_ascii_lowercase(), entry_id],
+      "INSERT OR IGNORE INTO path_postings(term,entry_id) VALUES(?1,?2)",
+      params![term, entry_id],
     )
     .await?;
   }
-  for component in path
-    .components()
-    .filter_map(|component| component.as_os_str().to_str())
-  {
-    for term in tokenize(component) {
-      tx.execute(
-        "INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES (?1, ?2, 3, 10)",
-        params![term, entry_id],
-      )
-      .await?;
-    }
-  }
+  tx.execute("INSERT INTO reverse_postings(entry_id,encoded) VALUES(?1,?2) ON CONFLICT(entry_id) DO UPDATE SET encoded=excluded.encoded",params![entry_id,encode_terms(&names,&paths)?]).await?;
   Ok(())
 }
-
-fn entry_changed(existing: &ExistingEntry, entry: &kuntu_crawler::CrawledEntry) -> bool {
-  existing.deleted
-    || existing.kind != entry.kind
-    || existing.size != entry_size_i64(entry)
-    || existing.mtime != entry.mtime
-    || existing.hidden != entry.decision.hidden
-    || existing.ignored != entry.decision.ignored
-    || existing.sensitive != entry.decision.sensitive
+async fn count_entries_tx(tx: &engine::Transaction<'_>, root_id: i64) -> Result<i64> {
+  Ok(tx.conn.raw.query_row(
+    "SELECT count(*) FROM entries WHERE root_id=?1",
+    params![root_id],
+    |r| r.get(0),
+  )?)
 }
-
-fn entry_size_i64(entry: &kuntu_crawler::CrawledEntry) -> Option<i64> {
-  entry.size.and_then(|size| i64::try_from(size).ok())
-}
-
-async fn count_entries_tx(tx: &turso::transaction::Transaction<'_>, root_id: i64) -> Result<i64> {
-  let mut rows = tx
-    .query(
-      "SELECT COUNT(*) FROM entries WHERE root_id = ?1 AND deleted = 0",
-      params![root_id],
-    )
-    .await?;
-  let row = rows.next().await?.expect("count returns a row");
-  Ok(row.get::<i64>(0)?)
-}
-
-async fn mark_root_state_dirty_tx(
-  tx: &turso::transaction::Transaction<'_>,
-  root_id: i64,
-) -> Result<()> {
-  let count = count_entries_tx(tx, root_id).await?;
-  tx.execute(
-        "INSERT INTO root_state (root_id, generation, last_full_scan_at, last_incremental_at, dirty, entry_count)
-         VALUES (?1, COALESCE((SELECT generation FROM root_state WHERE root_id = ?1), 0), NULL, NULL, 1, ?2)
-         ON CONFLICT(root_id) DO UPDATE SET
-           dirty = 1,
-           entry_count = excluded.entry_count",
-        params![root_id, count],
-    )
-    .await?;
-  Ok(())
-}
-
 fn placeholders(count: usize) -> String {
   std::iter::repeat_n("?", count)
     .collect::<Vec<_>>()
@@ -1319,6 +1140,7 @@ fn placeholders(count: usize) -> String {
 /// its last ASCII byte incremented, or, for anything non-ASCII, the prefix
 /// followed by U+10FFFF (a noncharacter that never occurs in a term). A range
 /// is a seek on the covering primary-key index; `LIKE` is a scan of the table.
+#[cfg(test)]
 fn term_prefix_clause(term: &str) -> (String, Vec<Value>) {
   (
     "term >= ? AND term < ?".to_string(),
@@ -1347,7 +1169,7 @@ fn ascii_prefix_upper_bound(prefix: &str) -> Option<String> {
   None
 }
 
-async fn root_ids_for_config(conn: &turso::Connection, config: &SearchConfig) -> Result<Vec<i64>> {
+async fn root_ids_for_config(conn: &engine::Connection, config: &SearchConfig) -> Result<Vec<i64>> {
   let mut ids = Vec::new();
   for root in config.roots.iter().filter(|root| root.enabled) {
     let mut rows = conn
@@ -1387,26 +1209,7 @@ fn unix_now() -> i64 {
     .unwrap_or(0)
 }
 
-async fn table_exists(conn: &turso::Connection, table: &str) -> Result<bool> {
-  let mut rows = conn
-    .query(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-      params![table],
-    )
-    .await?;
-  Ok(rows.next().await?.is_some())
-}
-
-async fn any_table_exists(conn: &turso::Connection) -> Result<bool> {
-  let mut rows = conn
-    .query(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-      (),
-    )
-    .await?;
-  Ok(rows.next().await?.is_some())
-}
-
+#[cfg(test)]
 fn remove_database_files(path: &Path) {
   let raw = path.to_string_lossy().to_string();
   for candidate in [raw.clone(), format!("{raw}-wal"), format!("{raw}-shm")] {
@@ -1436,58 +1239,20 @@ pub fn match_names(matches: &[MatchKind]) -> Vec<&'static str> {
 }
 
 const SCHEMA_DDL: &str = "
-CREATE TABLE IF NOT EXISTS roots (
-  id INTEGER PRIMARY KEY,
-  path TEXT NOT NULL UNIQUE,
-  enabled INTEGER NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 0,
-  include_hidden INTEGER NOT NULL DEFAULT 0,
-  include_ignored INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS entries (
-  id INTEGER PRIMARY KEY,
-  root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-  path TEXT NOT NULL,
-  path_lower TEXT NOT NULL DEFAULT '',
-  name TEXT NOT NULL,
-  name_lower TEXT NOT NULL,
-  extension TEXT,
-  kind INTEGER NOT NULL,
-  size INTEGER,
-  mtime INTEGER,
-  hidden INTEGER NOT NULL DEFAULT 0,
-  ignored INTEGER NOT NULL DEFAULT 0,
-  sensitive INTEGER NOT NULL DEFAULT 0,
-  deleted INTEGER NOT NULL DEFAULT 0,
-  indexed_at INTEGER NOT NULL,
-  UNIQUE(root_id, path)
-);
-
-CREATE TABLE IF NOT EXISTS terms (
-  term TEXT NOT NULL,
-  entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
-  field INTEGER NOT NULL,
-  weight INTEGER NOT NULL,
-  PRIMARY KEY(term, entry_id, field)
-);
-
-CREATE TABLE IF NOT EXISTS root_state (
-  root_id INTEGER PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
-  generation INTEGER NOT NULL,
-  last_full_scan_at INTEGER,
-  last_incremental_at INTEGER,
-  dirty INTEGER NOT NULL DEFAULT 0,
-  entry_count INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_entries_root_deleted ON entries(root_id, deleted);
-CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
-CREATE INDEX IF NOT EXISTS idx_entries_ext ON entries(extension);
-CREATE INDEX IF NOT EXISTS idx_terms_term ON terms(term);
-CREATE INDEX IF NOT EXISTS idx_terms_entry ON terms(entry_id);
-CREATE INDEX IF NOT EXISTS idx_entries_root_deleted_path_lower ON entries(root_id, deleted, path_lower);
+CREATE TABLE meta(key TEXT PRIMARY KEY,value NOT NULL) WITHOUT ROWID;
+INSERT INTO meta VALUES('schema_epoch',3),('schema_minor',0),('min_reader_minor',0),('min_writer_minor',0),('generation',0),('policy_hash','1'),('store_id','private');
+CREATE TABLE roots(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL,priority INTEGER NOT NULL DEFAULT 0,include_hidden INTEGER NOT NULL DEFAULT 0,include_ignored INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL);
+CREATE TABLE root_consumers(root_id INTEGER REFERENCES roots(id),consumer TEXT,priority INTEGER NOT NULL,include_hidden INTEGER NOT NULL,include_ignored INTEGER NOT NULL,enabled INTEGER NOT NULL,PRIMARY KEY(root_id,consumer)) WITHOUT ROWID;
+CREATE TABLE entries(id INTEGER PRIMARY KEY,root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,path TEXT NOT NULL,name TEXT NOT NULL,extension TEXT,kind INTEGER NOT NULL,size INTEGER,mtime INTEGER,flags INTEGER NOT NULL DEFAULT 0,scan_gen INTEGER NOT NULL DEFAULT 0,UNIQUE(root_id,path));
+CREATE TABLE name_postings(term TEXT,entry_id INTEGER,PRIMARY KEY(term,entry_id)) WITHOUT ROWID;
+CREATE TABLE path_postings(term TEXT,entry_id INTEGER,PRIMARY KEY(term,entry_id)) WITHOUT ROWID;
+CREATE TABLE reverse_postings(entry_id INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,encoded BLOB NOT NULL);
+CREATE TABLE root_state(root_id INTEGER PRIMARY KEY REFERENCES roots(id),generation INTEGER NOT NULL DEFAULT 0,active_scan_gen INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'dirty',last_full_scan_at INTEGER,last_incremental_at INTEGER,dirty INTEGER NOT NULL DEFAULT 1,entry_count INTEGER NOT NULL DEFAULT 0,policy_revision INTEGER NOT NULL DEFAULT 0,scan_policy_revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE watch_state(root_id INTEGER PRIMARY KEY,backend TEXT,volume_uuid TEXT,cursor TEXT,updated_at INTEGER);
+CREATE TABLE dirty_paths(root_id INTEGER,path TEXT,reason TEXT,queued_at INTEGER,PRIMARY KEY(root_id,path)) WITHOUT ROWID;
+CREATE TABLE requests(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,created_by TEXT NOT NULL,created_at INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending');
+CREATE TABLE writers(pid INTEGER PRIMARY KEY,version TEXT,role TEXT,heartbeat_at INTEGER);
+PRAGMA user_version=3;
 ";
 
 #[cfg(test)]
@@ -1763,7 +1528,6 @@ mod tests {
     let root = kuntu_core::normalize_root_path(root.to_path_buf());
     let full = root.join(relative);
     let name = full.file_name().unwrap().to_string_lossy().to_string();
-    let name_lower = name.to_ascii_lowercase();
     let extension = name
       .rsplit_once('.')
       .map(|(_, extension)| extension.to_ascii_lowercase());
@@ -1782,19 +1546,14 @@ mod tests {
       index
         .conn
         .execute(
-          "INSERT INTO entries (root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 4, NULL, ?8, ?9, ?10, 0, 0)",
+          "INSERT INTO entries (root_id,path,name,extension,kind,size,flags) VALUES(?1,?2,?3,?4,?5,4,?6)",
           params![
             root_id,
             full.to_string_lossy(),
-            full.to_string_lossy().to_ascii_lowercase(),
             name,
-            name_lower,
             extension,
             kind_int,
-            hidden,
-            ignored,
-            sensitive,
+            i64::from(hidden)|(i64::from(ignored)*2)|(i64::from(sensitive)*4),
           ],
         )
         .await
@@ -1810,11 +1569,26 @@ mod tests {
           .unwrap();
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
       };
+      index
+        .conn
+        .raw
+        .execute(
+          "INSERT INTO reverse_postings(entry_id,encoded) VALUES(?1,?2)",
+          params![
+            entry_id,
+            encode_terms(
+              &terms.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+              &[]
+            )
+            .unwrap()
+          ],
+        )
+        .unwrap();
       for term in terms {
         index
           .conn
           .execute(
-            "INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES (?1, ?2, 1, 100)",
+            "INSERT OR IGNORE INTO name_postings(term,entry_id) VALUES (?1,?2)",
             params![term, entry_id],
           )
           .await
@@ -2060,15 +1834,14 @@ mod tests {
       };
       // The rebuild indexed the (empty) root directory itself; the fixture
       // owns the whole entries table.
-      tx.execute("DELETE FROM entries", ()).await.unwrap();
+      tx.execute("DELETE FROM entries", []).await.unwrap();
       let mut batch_start: i64 = 0;
       while batch_start < total_rows {
         let batch_end = (batch_start + batch_rows).min(total_rows);
-        let mut entries_sql = String::from(
-          "INSERT INTO entries (id, root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at) VALUES ",
-        );
+        let mut entries_sql =
+          String::from("INSERT INTO entries(id,root_id,path,name,extension,kind,size) VALUES ");
         let mut terms_sql =
-          String::from("INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES ");
+          String::from("INSERT OR IGNORE INTO name_postings(term,entry_id) VALUES ");
         for ordinal in batch_start..batch_end {
           // Row ids start at 1: turso treats an explicit 0 as "assign one".
           let entry_id = ordinal + 1;
@@ -2077,15 +1850,14 @@ mod tests {
             terms_sql.push(',');
           }
           let path = format!("dir{}/batchfile-{ordinal}.dat", ordinal % 997);
-          let path_lower = path.to_ascii_lowercase();
           let name = format!("batchfile-{ordinal}.dat");
           entries_sql.push_str(&format!(
-            "({entry_id}, {root_id}, '{path}', '{path_lower}', '{name}', '{name}', 'dat', 1, 8, NULL, 0, 0, 0, 0, 0)"
+            "({entry_id}, {root_id}, '{path}', '{name}', 'dat', 1, 8)"
           ));
-          terms_sql.push_str(&format!("('batchfile', {entry_id}, 1, 100)"));
+          terms_sql.push_str(&format!("('batchfile', {entry_id})"));
         }
-        tx.execute(&entries_sql, ()).await.unwrap();
-        tx.execute(&terms_sql, ()).await.unwrap();
+        tx.execute(&entries_sql, []).await.unwrap();
+        tx.execute(&terms_sql, []).await.unwrap();
         batch_start = batch_end;
       }
       tx.commit().await.unwrap();
@@ -2235,74 +2007,6 @@ mod tests {
   }
 
   #[test]
-  fn v1_database_stamps_forward_in_place() {
-    let path = temp_dir("v1-forward");
-    // Create a database, then pretend it came from the rusqlite era (v1).
-    {
-      let index = KuntuIndex::open(&path).unwrap();
-      block_on(index.set_schema_version(1)).unwrap();
-    }
-    let index = KuntuIndex::open(&path).unwrap();
-    assert_eq!(block_on(index.schema_version()).unwrap(), SCHEMA_VERSION);
-    remove_database_files(&path);
-  }
-
-  #[test]
-  fn legacy_v0_database_is_recreated_on_open() {
-    let path = temp_dir("v0-recreate");
-    // Simulate a pre-versioning rusqlite-era database: schema exists, a row is
-    // indexed, but the version stamp is 0.
-    {
-      let index = KuntuIndex::open(&path).unwrap();
-      block_on(async {
-        index
-          .conn
-          .execute(
-            "INSERT INTO roots (id, path, enabled, updated_at) VALUES (1, '/tmp/legacy', 1, 0)",
-            (),
-          )
-          .await
-          .unwrap();
-        index.conn
-          .execute(
-            "INSERT INTO entries (root_id, path, path_lower, name, name_lower, kind, indexed_at)
-             VALUES (1, '/tmp/legacy/Report.PDF', '/tmp/legacy/report.pdf', 'Report.PDF', 'report.pdf', 1, 0)",
-            (),
-          )
-          .await
-          .unwrap();
-      });
-      block_on(index.set_schema_version(0)).unwrap();
-    }
-    let index = KuntuIndex::open(&path).unwrap();
-    assert_eq!(block_on(index.schema_version()).unwrap(), SCHEMA_VERSION);
-    let status = index.status().unwrap();
-    assert!(status.is_empty());
-    remove_database_files(&path);
-  }
-
-  #[test]
-  fn open_refuses_newer_schema_without_touching_the_database() {
-    let path = temp_dir("refuse-newer");
-    {
-      let index = KuntuIndex::open(&path).unwrap();
-      block_on(index.set_schema_version(SCHEMA_VERSION + 1)).unwrap();
-    }
-    let error = KuntuIndex::open(&path).unwrap_err();
-    match error {
-      IndexError::SchemaTooNew { found, supported } => {
-        assert_eq!(found, SCHEMA_VERSION + 1);
-        assert_eq!(supported, SCHEMA_VERSION);
-      }
-      other => panic!("expected schema version failure, got {other}"),
-    }
-    // The file is untouched: a follow-up open refuses the same way.
-    let second = KuntuIndex::open(&path).unwrap_err();
-    assert!(matches!(second, IndexError::SchemaTooNew { .. }));
-    remove_database_files(&path);
-  }
-
-  #[test]
   fn deleting_entries_cascades_to_terms() {
     // The rebuild's bulk `DELETE FROM entries` relies on the terms foreign
     // key; without the pragma on, row id reuse aliases stale terms onto new
@@ -2320,7 +2024,7 @@ mod tests {
     let terms_before: i64 = block_on(async {
       let mut rows = index
         .conn
-        .query("SELECT COUNT(*) FROM terms", ())
+        .query("SELECT COUNT(*) FROM name_postings", [])
         .await
         .unwrap();
       rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
@@ -2328,89 +2032,19 @@ mod tests {
     assert!(terms_before > 0);
 
     block_on(async {
-      index.conn.execute("DELETE FROM entries", ()).await.unwrap();
+      index.conn.execute("DELETE FROM entries", []).await.unwrap();
     });
 
     let terms_after: i64 = block_on(async {
       let mut rows = index
         .conn
-        .query("SELECT COUNT(*) FROM terms", ())
+        .query("SELECT COUNT(*) FROM name_postings", [])
         .await
         .unwrap();
       rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     });
     assert_eq!(terms_after, 0);
     remove_dir_all_if_exists(&root).unwrap();
-  }
-
-  #[test]
-  fn foreign_v0_database_is_refused_and_left_untouched() {
-    let path = temp_dir("foreign-db");
-    {
-      let index = KuntuIndex::open(&path).unwrap();
-      block_on(async {
-        index
-          .conn
-          .execute(
-            "CREATE TABLE user_data (id INTEGER PRIMARY KEY, note TEXT)",
-            (),
-          )
-          .await
-          .unwrap();
-        index
-          .conn
-          .execute("INSERT INTO user_data VALUES (1, 'precious')", ())
-          .await
-          .unwrap();
-        index.conn.execute("DROP TABLE roots", ()).await.unwrap();
-        index.conn.execute("DROP TABLE entries", ()).await.unwrap();
-        index.conn.execute("DROP TABLE terms", ()).await.unwrap();
-        index
-          .conn
-          .execute("DROP TABLE root_state", ())
-          .await
-          .unwrap();
-      });
-      block_on(index.set_schema_version(0)).unwrap();
-    }
-    let error = KuntuIndex::open(&path).unwrap_err();
-    match error {
-      IndexError::UnrecognizedDatabase { path: reported } => {
-        assert_eq!(reported, path);
-      }
-      other => panic!("expected unrecognized-database refusal, got {other}"),
-    }
-    // The refusal is non-destructive: the stranger's rows survive.
-    let readable: i64 = block_on(async {
-      let database = turso::Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-      let conn = database.connect().unwrap();
-      let mut rows = conn
-        .query("SELECT COUNT(*) FROM user_data", ())
-        .await
-        .unwrap();
-      rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
-    });
-    assert_eq!(readable, 1);
-    remove_database_files(&path);
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn open_refuses_non_utf8_database_paths_instead_of_aliasing() {
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = std::env::temp_dir()
-      .join(format!("kuntu-index-nonutf8-{}", std::process::id()))
-      .with_extension(std::ffi::OsStr::from_bytes(b"not-\xff-utf8"));
-    let error = KuntuIndex::open(&path).unwrap_err();
-    assert!(matches!(error, IndexError::Io(_)));
-    assert!(
-      !path.exists(),
-      "a database must not be created at a lossy alias"
-    );
   }
 
   /// Release-mode latency gate on the generated realistic fixture (see
@@ -2761,7 +2395,7 @@ mod tests {
       rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     });
     block_on(async {
-      index.conn.execute("DELETE FROM entries", ()).await.unwrap();
+      index.conn.execute("DELETE FROM entries", []).await.unwrap();
     });
     let rare: HashSet<usize> = rare_positions.iter().copied().collect();
     let rows: Vec<fixture::RowSpec> = (0..60_000usize)
@@ -2853,7 +2487,15 @@ mod tests {
       index
         .conn
         .execute(
-          "UPDATE terms SET field = 3 WHERE entry_id = (SELECT id FROM entries WHERE path = ?1)",
+          "INSERT OR IGNORE INTO path_postings SELECT term,entry_id FROM name_postings WHERE entry_id=(SELECT id FROM entries WHERE path=?1)",
+          params![full.to_string_lossy()],
+        )
+        .await
+        .unwrap();
+      index
+        .conn
+        .execute(
+          "DELETE FROM name_postings WHERE entry_id=(SELECT id FROM entries WHERE path=?1)",
           params![full.to_string_lossy()],
         )
         .await
@@ -2968,7 +2610,7 @@ mod tests {
   }
 
   /// The lossy-path fallback must stay an index seek: one entry's stored
-  /// terms are read through `idx_terms_entry`, never by scanning the terms
+  /// terms are read through `reverse_postings`, never by scanning the terms
   /// table (recheck P2).
   #[test]
   fn entry_terms_fallback_uses_the_entry_id_index() {
@@ -2987,7 +2629,7 @@ mod tests {
       details
     });
     let plan = details.join(" | ");
-    assert!(plan.contains("idx_terms_entry"), "plan: {plan}");
+    assert!(plan.contains("rowid=?"), "plan: {plan}");
   }
 
   /// A file name whose bytes are not valid UTF-8 (`common<0xff>.md`).
@@ -3032,15 +2674,8 @@ mod tests {
       index
         .conn
         .execute(
-          "INSERT INTO entries (root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, 'md', 1, 4, NULL, 0, 0, 0, 0, 0)",
-          params![
-            root_id,
-            stored.clone(),
-            stored.to_ascii_lowercase(),
-            name.clone(),
-            name.to_ascii_lowercase(),
-          ],
+          "INSERT INTO entries(root_id,path,name,extension,kind,size) VALUES(?1,?2,?3,'md',1,4)",
+          params![root_id, stored.clone(), name.clone(),],
         )
         .await
         .unwrap();
@@ -3170,4 +2805,13 @@ mod tests {
     assert_eq!(calls.get(), 4, "one warm-up plus three measured runs");
     assert_eq!(best, std::time::Duration::from_millis(1));
   }
+}
+
+#[cfg(test)]
+mod m2_acceptance;
+#[cfg(test)]
+mod m2_tests;
+
+fn legacy_error(e: kuntu_legacy_index::IndexError) -> IndexError {
+  IndexError::Io(std::io::Error::other(e.to_string()))
 }

@@ -138,28 +138,43 @@ fn is_ignored(path: &Path, components: &[String]) -> bool {
     .is_some_and(|name| name == ".DS_Store")
 }
 
+const SENSITIVE_COMPONENTS: &[&str] = &[
+  ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
+];
+const SENSITIVE_SUBSTRINGS: &[&str] = &["credentials", "secret"];
+const SENSITIVE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
+/// Compiled rule identity, derived from the same tables used for admission.
+/// The algorithm version covers matching semantics, including .env names.
+pub fn sensitive_policy_identity() -> String {
+  format!(
+    "sensitive-v2|components:{}|substrings:{}|extensions:{}|env:.env,.env.*",
+    SENSITIVE_COMPONENTS.join(","),
+    SENSITIVE_SUBSTRINGS.join(","),
+    SENSITIVE_EXTENSIONS.join(",")
+  )
+}
+/// Current sensitive denial never trusts a producer's persisted flags.
+pub fn denies_sensitive_path(path: &Path) -> bool {
+  is_sensitive(path, &normal_components(path))
+}
 fn is_sensitive(path: &Path, components: &[String]) -> bool {
-  let sensitive_components = [
-    ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
-  ];
   if components.iter().any(|component| {
     let lower = component.to_ascii_lowercase();
-    sensitive_components.contains(&component.as_str())
-      || lower.contains("credentials")
-      || lower.contains("secret")
+    SENSITIVE_COMPONENTS.contains(&component.as_str())
+      || SENSITIVE_SUBSTRINGS
+        .iter()
+        .any(|needle| lower.contains(needle))
   }) {
     return true;
   }
-
-  if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+  if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
     let lower = name.to_ascii_lowercase();
     if lower == ".env" || lower.starts_with(".env.") {
       return true;
     }
   }
-
   lowercase_extension(path)
-    .is_some_and(|extension| matches!(extension.as_str(), "pem" | "key" | "p12" | "pfx"))
+    .is_some_and(|extension| SENSITIVE_EXTENSIONS.contains(&extension.as_str()))
 }
 
 #[cfg(test)]

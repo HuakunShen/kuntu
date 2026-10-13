@@ -229,3 +229,20 @@ mod tests {
     assert!(root.path.ends_with("relative-project"));
   }
 }
+
+/// Non-empty explicit root identities; hosts resolve paths before constructing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchScope(Vec<i64>);
+impl SearchScope {
+  pub fn new(mut ids: Vec<i64>) -> Result<Self, crate::BackendError> {
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() || ids.iter().any(|id| *id <= 0) {
+      return Err(crate::BackendError::new("Search scope must be non-empty."));
+    }
+    Ok(Self(ids))
+  }
+  pub fn ids(&self) -> &[i64] {
+    &self.0
+  }
+}
