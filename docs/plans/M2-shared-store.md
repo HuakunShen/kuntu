@@ -721,7 +721,7 @@ kuntu-store = { path = "../kuntu-store" }
 
 <!-- apply {"task": "M2.3", "file": "crates/kuntu-index/src/lib.rs", "mode": "replace-range", "start": "use turso::{params, params_from_iter, Value};", "end": "pub type RebuildStats = IndexRebuildStats;"} -->
 ```rust
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Value};
 
 pub type RebuildStats = IndexRebuildStats;
 ```
