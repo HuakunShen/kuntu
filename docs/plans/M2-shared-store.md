@@ -282,8 +282,10 @@ pub fn ensure_store_home() -> Result<PathBuf, StoreError> {
   } else {
     std::fs::create_dir_all(&home).map_err(|e| StoreError::Io(e.to_string()))?;
   }
-  set_dir_private(&home)?;
+  // Refuse before repairing: a pre-existing group/world-writable or
+  // foreign-owned home is an error (PLAN §5.2), never silently chmodded.
   check_dir_permissions(&home)?;
+  set_dir_private(&home)?;
   #[cfg(any(target_os = "macos", target_os = "linux"))]
   {
     match nix::sys::statfs::statfs(home.as_path()) {
@@ -458,17 +460,18 @@ Expected: `error: package ID specification 'kuntu-store' did not match any packa
 **GREEN** (after M2.1a–M2.1c):
 
 ```
+cargo generate-lockfile
 cargo test -p kuntu-store --locked
 cargo clippy -p kuntu-store --all-targets --locked -- -D warnings
 ```
 
-Expected: 6 passed; clippy clean. On Linux CI the `statfs` leg runs the same way (`apfs` replaced by `ext4`/`overlayfs`, still allowed; `nfs` still refused by the mock test).
+Expected: 6 passed; clippy clean. `cargo generate-lockfile` is required once here because `nix`/`fs4` are new dependencies (replay proved `--locked` fails before it). On Linux CI the `statfs` leg runs the same way (`apfs` replaced by `ext4`/`overlayfs`, still allowed; `nfs` still refused by the mock test).
 
 **Commit:**
 
 ```
 cargo fmt --all
-git add Cargo.toml crates/kuntu-store/Cargo.toml crates/kuntu-store/src/lib.rs
+git add Cargo.toml Cargo.lock crates/kuntu-store/Cargo.toml crates/kuntu-store/src/lib.rs
 git commit -m "feat(kuntu-store): shared home resolution, permissions, store.json"
 ```
 
@@ -535,7 +538,7 @@ pub fn try_acquire(home: &Path, schema_minor: u32) -> Result<Option<IndexerLease
   }
   use std::io::{Seek, SeekFrom, Write};
   file.set_len(0).map_err(|e| StoreError::Io(e.to_string()))?;
-  file.seek(SeekFrom::Start).map_err(|e| StoreError::Io(e.to_string()))?;
+  file.seek(SeekFrom::Start(0)).map_err(|e| StoreError::Io(e.to_string()))?;
   file
     .write_all(lease_payload(schema_minor).as_bytes())
     .map_err(|e| StoreError::Io(e.to_string()))?;
