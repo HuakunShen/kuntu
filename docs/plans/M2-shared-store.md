@@ -7270,7 +7270,7 @@ fn realistic_fixture_reverse_delete_cost_and_size_gate() {
   std::fs::copy(&source, &copy).unwrap();
   let mut i = KuntuIndex::open(&copy).unwrap();
   assert!(i.acquire_writer().unwrap());
-  let started = Instant::now();
+  let started = std::time::Instant::now();
   let tx = i.conn.begin_writer_txn(false).unwrap();
   let deleted = tx
     .conn
