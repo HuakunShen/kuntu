@@ -16013,4 +16013,74 @@ Sensitivity assertions use the debug test profile; NAPI sensitivity uses debug a
 
 ## Replay results
 
-Revision 3 replay has not yet run from a committed blob. The revision-2 measurements are historical evidence and are not acceptance for this payload. Measured revision-3 numbers will replace this paragraph after the complete foreground replay; executable blocks will then be replayed again from the final documentation commit.
+Measurement snapshot: **complete foreground replay 3**, committed source `2c2c75973c0fbc7395900af676d17ee6a7369e0b`, completed 2026-10-13 UTC. The scratch worktree started at `e164d67`; the controller consumed `git show HEAD:docs/plans/M2-shared-store.md`, installed **41 complete files**, and completed every correctness task and evidence command. Hardware: Apple M4 Pro, 48 GiB RAM, macOS 27.0.1, Rust 1.98.1, Bun 1.4.2; data and targets on the external APFS volume. This is mechanical test evidence, not an independent review verdict or installed-product acceptance.
+
+The results-only documentation commit changes no executable block and is then replayed from its own committed blob. Per-file payload hashes must match this snapshot. SHA-256 of `payload-sha256.json`: `ed7ea46fe3a35f14a508f6f643eb8f320223f223f7123c7cd8db2e057359f67f`. Measurement logs and JSON are retained in `/Volumes/Portable2TB/tmp/kuntu-m2/rev3/run-3/`; the final committed-blob verification uses `/Volumes/Portable2TB/tmp/kuntu-m2/rev3/replay-4.log` and `run-4/`. Only the owned detached scratch worktree is removed afterwards.
+
+| Check | Measured outcome |
+|---|---|
+| Application / write set | 41 declared complete files installed; final per-file hashes unchanged |
+| fmt / clippy | Passed; workspace/all-targets/locked clippy with `-D warnings`; final fmt passed |
+| Sensitivity | **29 named RED failures and 29 GREEN passes** across all ten tasks; compile-error/zero-test failures are rejected |
+| Locked workspace | **175 passed**, 7 ignored benchmarks; required latency/recall/budget/storage benchmarks ran separately |
+| NAPI | Generated JS/d.ts byte-equal, **5 Node tests passed**, TypeScript passed; old exact-path v2 and unrelated-database Rust fixtures passed |
+| Runtime | **SQLite 3.53.2**; ≥3.51.3 runtime guard passed |
+| 1M realistic storage | **549,076,992 bytes**; 923,008 bytes below the unchanged 550,000,000-byte ceiling; reused v3 fixture cache, no rev-3 cold-build claim |
+| Indexed reverse cleanup | **5,000 deletes**, **9.558565 s**, **227 batches**, **1,000,000 inspected rows**; longest complete helper **199.240 ms** |
+| Active-cleanup graceful shutdown | **26.135 ms**; **571 reader probes**, observed maximum **0.108 ms**; root remained building and the next supported writer acquired/recovered it |
+| Stress | Two writer processes/eight readers, each reader ran 60 s during a physical **1,000,001-entry** rebuild; **379,303 probes**, **0 errors**, worst p99 **1713 µs**, maximum **238.275 ms**, integrity_check=ok |
+| Stress roles / duration | One holder completed one scan; non-holder committed **1,658 inbox writes**; whole controller run **376.975 s**, including scan completion after readers finished |
+| Reader acceptance | p99 1.713 ms ≤5 ms passed; maximum 238.275 ms >100 ms **failed, OPEN RED** |
+| 30% / 70% kills | Killed after commits at **60,052 / 140,684** rows, each <5,000 beyond threshold; deleted and renamed committed files before restart; both reached **200,000** entries, equal to fresh crawls, no stale generations, quick_check=ok |
+| Other crash boundaries | building_committed, before_ready, ready_committed, migration_ddl and policy_invalidated recovered; migration reverted to minor 0 before rerun |
+| Namespace interruption | Quarantine and GC each killed after durable marker publication and after main/WAL/SHM member operations: **8 process cases** recovered before epoch reuse; durability-order/ENOENT-only tests passed. These are SIGKILL tests, not power-loss simulation. |
+| Concurrent first opens | **100 separate-process pairs**, one 128-bit identity per pair, actual SQLite opens |
+| Holder death / exec | **5,163 ms** takeover after kill; exec child remained alive while another process reacquired; FD_CLOEXEC assertion passed |
+| Import | Actual CLI: **1 root, 200,001 entries, 0 errors**, main/WAL/SHM source hashes unchanged; self-snapshot import kept all source bytes unchanged |
+| Four-host macOS smoke | CLI, daemon and independent NAPI read-only/writer processes shared one identity; scope/read-only/queue checks passed; daemon-to-NAPI takeover **4,548 ms** |
+| Skew | **11 cells** passed: minors 0/1 reader/writer roles, migration, older writer refusal, newer reader floors with unchanged main bytes, future epoch sentinel preserved; pre-open/migrate/acquire barrier test also passed |
+| Previous tag | Actual v0.4.1 / a5df3559671b09f2af75fdd28ed5a4a06ab7dc56 archive built; v2 source bytes preserved, old binary refused v3 without main-byte change, unregistered v2 preserved by GC |
+| Protected files | No tracked/untracked changes in kuntu-crawler, kuntu-watcher, kuntu-scan or .github |
+
+The M1 gate passed all nine legacy ceilings. Each class used one untimed warm-up and the best of three measured warm runs. Its printed 0.0 ms is rounded, not a zero-duration measurement.
+
+| M1 class | Best warm ms | Candidates | M1 ceiling ms |
+|---|---:|---:|---:|
+| miss | 0.1 | 0 | 25 |
+| miss_non_ascii | 0.0 | 0 | 25 |
+| rare | 0.1 | 9 | 50 |
+| mid | 10.0 | 1477 | 100 |
+| broad | 44.7 | 5000 | 400 |
+| prefix3 | 44.7 | 5000 | 400 |
+| mixed | 8.9 | 271 | 300 |
+| all_rows | 33.2 | 5000 | 600 |
+| prefix1 | 42.0 | 5000 | 800 |
+
+The separate M2 gate applies the unchanged targets and records every class before asserting. It **failed**; M1 success does not waive M2 acceptance. All 18 budget/class measurements are retained in `run-3/acceptance/m2-latency.json`.
+
+| Class | 5k warm ms | 5k ceiling ms | 50k warm ms | 50k ceiling ms |
+|---|---:|---:|---:|---:|
+| miss | 0.049 | 2 | 0.044 | 150 |
+| miss_non_ascii | 0.044 | 2 | 0.042 | 150 |
+| rare | 0.113 | 10 | 0.111 | 150 |
+| mid | 12.685 **FAIL** | 10 | 12.765 | 150 |
+| broad | 49.237 **FAIL** | 25 | 346.790 **FAIL** | 150 |
+| prefix3 | 50.398 **FAIL** | 25 | 349.915 **FAIL** | 150 |
+| mixed | 10.300 | 25 | 10.157 | 150 |
+| all_rows | 37.209 **FAIL** | 25 | 300.957 **FAIL** | 150 |
+| prefix1 | 47.907 **FAIL** | 40 | 410.530 **FAIL** | 150 |
+
+### Open acceptance items and deviations
+
+- **OPEN RED — search latency:** `realistic_fixture_m2_latency_acceptance` failed nine class/budget cells above. Default-budget mid, broad, prefix3, all_rows and prefix1 missed; at 50k, broad, prefix3, all_rows and prefix1 missed. The 2/10/25/40/150 ms ceilings remain unchanged. `m2_ceilings_reject_the_m1_only_latency_range` prevents substitution of the looser M1 ceiling.
+- **OPEN RED — reader maximum:** the 60 s two-writer/eight-reader stress had zero errors and p99 within 5 ms, but its maximum of **238.275 ms** exceeded 100 ms. `readerAcceptanceMisses` still asserts that ceiling; `m2_reader_ceilings_reject_a_100ms_overrun` fails if it is loosened. The controller recognizes only the explicit performance-miss tag, preserves the failing assertion/log, and completes the remaining evidence. Correctness errors, invalid counts, integrity failures, compile failures and other unexpected exits still stop the replay.
+- **Cleanup limit:** inspected rows now advance through a rowid seek cursor; cancellation and the 100 ms deadline are checked between chunks/rows, and an active cleanup joined in 26.135 ms. The longest complete 1M-fixture helper still took **199.240 ms**. This does not establish a hard 100 ms total-helper bound; selection, a native SQLite statement, commit, lock wait or scheduling can overrun a cooperative deadline. The measurements do not isolate which component caused that maximum. The cleanup test uses an interrupted 100-stale-row fixture with 20 ms injected row work; it does not prove every 1M cleanup shutdown finishes in 26.135 ms.
+- **NOT RUN — internal SSD:** `internal_ssd_one_million_rebuild_within_120_seconds` has a strict 120 s assertion and checks that both fixture/home are on an internal device. No internal-SSD fixture/home exists inside the authorized external-volume scratch directory, so the real gate remains pending. Its ceiling-contract RED/GREEN passed. External-volume stress wall time of 376.975 s is not internal-SSD evidence and does not waive that target.
+- Sensitivity assertions and NAPI fault builds use debug profiles; performance, storage and process evidence use the repository's default release profile. Replay 1 was deliberately interrupted during a slow release sensitivity build and is not acceptance. This changes no acceptance threshold.
+- Replay 2 completed correctness, M1/M2 gates and crash evidence, then stopped at the strict reader maximum assertion (**178.067 ms**, p99 maximum 124 µs, zero errors). Its whole stress run was 525.756 s. The controller was amended to retain that performance miss as OPEN RED and continue; replay 3 then completed every evidence command. Raw `replay-1.log`, `replay-2.log`, their archived partial runs, and the complete run-3 logs remain under the scratch directory.
+- The 60 s reader windows covered the active 1M rebuild; the writer finished later. They do not cover its entire 376.975 s completion or every cleanup chunk. Elapsed timings include scheduling; no cause was isolated for the latency misses.
+- Same-epoch minor skew uses two actual process roles with conservative minors 0/1 in this compiled binary. There is no released v3 minor-0 binary/tag here. The actual previous-tag test uses v0.4.1 (epoch 2); future release CI must test its real preceding v3 tag. Refusal checks compare main-file bytes, not a claim that SQLite never updates shared-memory coordination bytes.
+- SIGKILL interruption and syscall-order assertions are not a power-loss simulation. Import requires an absolute, quiescent v2 source; a changing live v2 writer is not an atomic backup. Normal return/error paths remove only snapshots created by that attempt; a kill may retain uniquely named private copies. Unregistered old epochs remain preserved fail-closed.
+- D12 remains macOS first. Linux/Android acceptance is not run and Windows shared-store support is not implemented by this Unix VFS. The four-host smoke uses independent NAPI stand-ins; actual Xross mapping migration and Kunkun helper signing/TCC are M2-X/M2-K under D16, outside this write set and not claimed complete.
+
+The P1 regression contracts pass with this payload and fail under their named defects. This writer did not independently review the result. Any P1 left by the final external review becomes a named test-first RED item; the performance misses above remain open acceptance work.
