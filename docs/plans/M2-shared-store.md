@@ -3295,6 +3295,16 @@ impl KuntuIndex {
       .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
   }
+  pub fn generation_probe(&self) -> Result<i64> {
+    Ok(
+      self
+        .conn
+        .raw
+        .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| {
+          r.get(0)
+        })?,
+    )
+  }
   pub fn point_probe(&self) -> Result<i64> {
     use rusqlite::OptionalExtension;
     Ok(
@@ -6694,14 +6704,16 @@ pub fn open_or_build(rows: usize) -> Fixture {
   {
     let mut index = KuntuIndex::open(&db_path).unwrap();
     let root_id = index.register_root(&config.roots[0]).unwrap();
-    index
-      .conn
+    let tx = index.conn.begin_writer_txn(false).unwrap();
+    tx.conn
       .raw
       .execute(
         "UPDATE root_state SET status='ready',dirty=0 WHERE root_id=?1",
         params![root_id],
       )
       .unwrap();
+    tx.conn.raw.execute("DELETE FROM entries", []).unwrap();
+    block_on(tx.commit()).unwrap();
     let root_id: i64 = block_on(async {
       let mut found = index
         .conn
@@ -6712,11 +6724,6 @@ pub fn open_or_build(rows: usize) -> Fixture {
         .await
         .unwrap();
       found.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
-    });
-    // The rebuild indexed the (empty) root directory itself; the fixture owns
-    // the whole entries table.
-    block_on(async {
-      index.conn.execute("DELETE FROM entries", []).await.unwrap();
     });
     insert_rows(&mut index, root_id, &specs, 1);
   }
@@ -6962,9 +6969,9 @@ fn batch_generation_is_atomic_and_readers_observe_data_version() {
   let (h, c, i) = fixture();
   let r = KuntuIndex::open_shared(h, true, "strict").unwrap();
   r.poll_changes().unwrap();
-  let before = r.point_probe().unwrap();
+  let before = r.generation_probe().unwrap();
   i.register_root(&c.roots[0]).unwrap();
-  assert!(r.point_probe().unwrap() > before);
+  assert!(r.generation_probe().unwrap() > before);
   assert!(r.poll_changes().unwrap());
   assert!(!r.poll_changes().unwrap());
 }
@@ -7196,7 +7203,7 @@ fn restart_recovery_waits_for_live_holder_then_resumes_persisted_generation() {
     .query_row("SELECT id FROM roots", [], |r| r.get(0))
     .unwrap();
   let gen = i.begin_scan(id).unwrap();
-  let before = i.point_probe().unwrap();
+  let before = i.generation_probe().unwrap();
   let service = WriterService::start(h.clone());
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
   while !service.is_started() {
@@ -7204,7 +7211,7 @@ fn restart_recovery_waits_for_live_holder_then_resumes_persisted_generation() {
     std::thread::yield_now();
   }
   assert!(!service.is_holder());
-  assert_eq!(i.point_probe().unwrap(), before);
+  assert_eq!(i.generation_probe().unwrap(), before);
   assert_eq!(i.root_state_name(&c.roots[0].path).unwrap(), "building");
   drop(service);
   drop(i);
@@ -7237,6 +7244,62 @@ fn private_open_cannot_bypass_a_shared_store_lease() {
   let mut other = KuntuIndex::open_shared(h, false, "strict").unwrap();
   assert!(!other.acquire_writer().unwrap());
   assert!(matches!(other.rebuild(&c), Err(IndexError::LeaseRequired)));
+}
+
+#[test]
+#[ignore = "1M storage and production reverse-delete evidence"]
+fn realistic_fixture_reverse_delete_cost_and_size_gate() {
+  let rows = std::env::var("KUNTU_BENCH_ROWS")
+    .unwrap()
+    .parse::<usize>()
+    .unwrap();
+  let f = fixture::open_or_build(rows);
+  f.index
+    .conn
+    .raw
+    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+    .unwrap();
+  let base = PathBuf::from(std::env::var_os("KUNTU_BENCH_DIR").unwrap());
+  let source = base.join(format!("realistic-v3-rev2-compact-{rows}.sqlite"));
+  let copy = base.join("reverse-delete-measurement.sqlite");
+  drop(f);
+  for suffix in ["", "-wal", "-shm"] {
+    let _ = std::fs::remove_file(format!("{}{suffix}", copy.display()));
+  }
+  let bytes = std::fs::metadata(&source).unwrap().len();
+  std::fs::copy(&source, &copy).unwrap();
+  let mut i = KuntuIndex::open(&copy).unwrap();
+  assert!(i.acquire_writer().unwrap());
+  let started = Instant::now();
+  let tx = i.conn.begin_writer_txn(false).unwrap();
+  let deleted = tx
+    .conn
+    .raw
+    .execute(
+      "DELETE FROM entries WHERE id IN (SELECT id FROM entries ORDER BY id LIMIT 5000)",
+      [],
+    )
+    .unwrap();
+  block_on(tx.commit()).unwrap();
+  let ms = started.elapsed().as_secs_f64() * 1000.0;
+  assert_eq!(deleted, 5000);
+  for table in ["name_postings", "path_postings", "reverse_postings"] {
+    let left: i64 = i
+      .conn
+      .raw
+      .query_row(
+        &format!("SELECT count(*) FROM {table} WHERE entry_id<=5000"),
+        [],
+        |r| r.get(0),
+      )
+      .unwrap();
+    assert_eq!(left, 0);
+  }
+  assert_eq!(i.doctor().unwrap(), "ok");
+  eprintln!(
+    "REVERSE_DELETE rows={rows} database_bytes={bytes} deleted={deleted} elapsed_ms={ms:.3}"
+  );
+  assert!(bytes <= 550_000_000, "550 MB size gate: {bytes} bytes");
 }
 ````
 
@@ -7316,7 +7379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       println!(
         "entries={} generation={} check={}",
         s.entries,
-        index.point_probe()?,
+        index.generation_probe()?,
         index.doctor()?
       );
     }
@@ -7324,7 +7387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       println!(
         "entries={} generation={} check={} access={:?}",
         index.count_entries()?,
-        index.point_probe()?,
+        index.generation_probe()?,
         index.doctor()?,
         index.access()
       );
@@ -14042,6 +14105,7 @@ run('node',['node','--test','test/index.test.cjs'],'crates/kuntu-napi');run('typ
 run('m1-gate',['cargo','test','--release','-p','kuntu-index','realistic_fixture_latency_gate','--','--ignored','--nocapture']);
 run('m1-recall',['cargo','test','--release','-p','kuntu-index','rarest_token_drives_the_search_and_recall_is_exact','--','--ignored','--nocapture']);
 run('m1-budget',['cargo','test','--release','-p','kuntu-index','default_budget_bounds_a_broad_single_token','--','--ignored','--nocapture']);
+run('size-delete',['cargo','test','--release','-p','kuntu-index','realistic_fixture_reverse_delete_cost_and_size_gate','--','--ignored','--nocapture']);
 run('probe-build',['cargo','build','--release','-p','kuntu-index','--example','m2_probe']);run('cli-build',['cargo','build','--release','-p','kuntu-cli']);
 run('crash',['bun','scripts/m2-evidence.ts','crash']);run('stress',['bun','scripts/m2-evidence.ts','stress']);run('skew',['bun','scripts/m2-evidence.ts','skew']);
 run('fmt-final',['cargo','fmt','--all','--','--check']);
@@ -14075,7 +14139,7 @@ console.log(`PASS: plan_apply_write_set_matches_complete_payloads; ${files.size}
 | 3 Lease gates/lifetime/hosts | M2.2, M2.7–9 | `lease_capability_blocks_second_writer_and_payload_is_not_authority`, `private_open_cannot_bypass_a_shared_store_lease`, joined-service test, daemon queue test, exec/takeover process cases |
 | 4 Actual skew/migration/guards | M2.4 | `actual_opens_enforce_skew_before_wal_and_old_writer_steps_down`, `every_write_transaction_rechecks_minor_and_rolls_back`, migration kill, skew controller |
 | 5 Batches/recovery/notifications | M2.5–6 | `slow_scan_rows_force_the_100_ms_batch_boundary`, atomic-generation/data-version test, resume/building test, 30%/70% kills |
-| 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; measured fixture size/cleanup |
+| 6 Indexed reverse deletes/lossy recall | M2.3, M2.6 | `production_builders_pin_both_postings_reverse_and_rowid`, `entry_terms_fallback_uses_the_entry_id_index`, both M1 lossy-path tests; `realistic_fixture_reverse_delete_cost_and_size_gate` (measured size and 5,000-row delete) |
 | 7 Consumer scope | M2.3, M2.8–9 | `strict_consumer_never_inherits_union_or_client_flags`, `requested_scope_cannot_widen_config_even_on_an_early_return`, Node/daemon strict tests, `cli_scope` |
 | 8 FD opens/permissions | M2.1, M2.3 | `descriptor_open_rejects_symlink_and_private_modes_are_exact`, `opened_directory_survives_path_swap_and_sidecars_are_private` |
 | 9 Atomic random identity | M2.1 | `atomic_identity_is_128_bits_and_existing_document_is_preserved`, concurrent-open test and publication kill |
