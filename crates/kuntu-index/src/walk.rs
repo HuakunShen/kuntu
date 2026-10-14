@@ -1,14 +1,13 @@
 //! Cancellable snapshot walk for M2 hosts; the protected crawler stays unchanged.
-use crate::{IndexError, Result};
+use crate::Result;
 use kuntu_core::{EntryKind, PathPolicy};
 use kuntu_crawler::{CrawlOptions, CrawlStats, CrawledEntry};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 pub(crate) fn crawl_cancellable(
   options: &CrawlOptions,
-  stop: &AtomicBool,
+  check: &impl Fn() -> Result<()>,
 ) -> Result<(Vec<CrawledEntry>, CrawlStats)> {
   let policy = PathPolicy::new(options.config.clone());
   let mut entries = Vec::new();
@@ -24,30 +23,23 @@ pub(crate) fn crawl_cancellable(
       0,
       options,
       &policy,
-      stop,
+      check,
       &mut entries,
       &mut stats,
     )?;
   }
   Ok((entries, stats))
 }
-fn check(stop: &AtomicBool) -> Result<()> {
-  if stop.load(Ordering::Acquire) {
-    Err(IndexError::Cancelled)
-  } else {
-    Ok(())
-  }
-}
 fn visit(
   path: &Path,
   depth: usize,
   options: &CrawlOptions,
   policy: &PathPolicy,
-  stop: &AtomicBool,
+  check: &impl Fn() -> Result<()>,
   entries: &mut Vec<CrawledEntry>,
   stats: &mut CrawlStats,
 ) -> Result<()> {
-  check(stop)?;
+  check()?;
   stats.visited += 1;
   let decision = policy.evaluate(path, Some(&options.query));
   if !decision.allowed {
@@ -61,7 +53,7 @@ fn visit(
       return Ok(());
     }
   };
-  check(stop)?;
+  check()?;
   let kind = if metadata.is_dir() {
     EntryKind::Directory
   } else if metadata.is_file() {
@@ -90,16 +82,16 @@ fn visit(
         return Ok(());
       }
     };
-    check(stop)?;
+    check()?;
     for child in children {
-      check(stop)?;
+      check()?;
       match child {
         Ok(child) => visit(
           &child.path(),
           depth + 1,
           options,
           policy,
-          stop,
+          check,
           entries,
           stats,
         )?,

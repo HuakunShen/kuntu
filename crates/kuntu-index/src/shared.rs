@@ -393,6 +393,7 @@ impl KuntuIndex {
       conn,
       home,
       cancel: Arc::new(AtomicBool::new(false)),
+      operation_deadline: None,
       _reader: None,
       shared,
       consumer: consumer.into(),
@@ -543,8 +544,23 @@ impl KuntuIndex {
     }
     Ok(true)
   }
+  /// Bind cooperative scan cancellation to the host's shutdown and request budget.
+  /// Cancellation rolls back the current batch and leaves committed scan state
+  /// available to a later rebuild.
+  pub fn set_operation_control(
+    &mut self,
+    cancellation: Arc<AtomicBool>,
+    deadline: Option<std::time::Instant>,
+  ) {
+    self.cancel = cancellation;
+    self.operation_deadline = deadline;
+  }
   pub(crate) fn check_cancelled(&self) -> Result<()> {
-    if self.cancel.load(Ordering::Acquire) {
+    if self.cancel.load(Ordering::Acquire)
+      || self
+        .operation_deadline
+        .is_some_and(|d| std::time::Instant::now() >= d)
+    {
       Err(IndexError::Cancelled)
     } else {
       Ok(())
@@ -686,6 +702,7 @@ impl KuntuIndex {
     let tx = self.conn.begin_writer_txn(false)?;
     self.check_scan(root_id, gen)?;
     tx.conn.raw.execute("UPDATE root_state SET status='ready',dirty=0,generation=generation+1,last_full_scan_at=?3,entry_count=(SELECT count(*) FROM entries WHERE root_id=?1) WHERE root_id=?1 AND active_scan_gen=?2",params![root_id,gen,unix_now()])?;
+    self.check_cancelled()?;
     block_on(tx.commit())?;
     fault("ready_committed");
     Ok(())
@@ -772,14 +789,19 @@ impl KuntuIndex {
     Ok(SearchConfig { roots: vec![root] })
   }
   pub(crate) fn snapshot(&self) -> Result<EntrySnapshot> {
+    self.check_cancelled()?;
     let mut s = self
       .conn
       .raw
       .prepare("SELECT path,kind,size,mtime FROM entries")?;
-    let rows = s
-      .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
-      .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    let rows = s.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?;
+    let mut snapshot = HashMap::new();
+    for row in rows {
+      self.check_cancelled()?;
+      let (path, metadata) = row?;
+      snapshot.insert(path, metadata);
+    }
+    Ok(snapshot)
   }
   pub fn generation_probe(&self) -> Result<i64> {
     self.recheck_read_access()?;

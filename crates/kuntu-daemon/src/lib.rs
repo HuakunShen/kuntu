@@ -100,7 +100,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
     .to_string();
   let started = Instant::now();
   let server_deadline = config.duration.map(|d| started + d);
-  let cancelled = std::sync::atomic::AtomicBool::new(false);
+  let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
   let shared = config.store_mode == StoreMode::Shared;
   let home = if shared {
     Some(
@@ -138,7 +138,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
       let home = home.clone();
       let config = &config;
       let reader_connections = &reader_connections;
-      let cancelled = &cancelled;
+      let cancelled = cancelled.clone();
       scope.spawn(move || {
         let mut reader = None;
         let mut writer = None;
@@ -149,7 +149,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
             mut stream,
             deadline,
           } = stream;
-          let request = match read_http_request_until(&mut stream, deadline, cancelled) {
+          let request = match read_http_request_until(&mut stream, deadline, &cancelled) {
             Ok(Some(r)) => r,
             _ => continue,
           };
@@ -176,12 +176,16 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
                   &mut stream,
                   &json_response(500, json!({"error":e.to_string()})),
                   deadline,
-                  cancelled,
+                  &cancelled,
                 );
                 continue;
               }
             }
           }
+          slot
+            .as_mut()
+            .expect("opened worker connection")
+            .set_operation_control(cancelled.clone(), Some(deadline));
           let response = handle_request(
             slot.as_mut().expect("opened worker connection"),
             request,
@@ -192,7 +196,7 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
           if !readonly && home.is_none() {
             writer.take();
           }
-          let _ = write_http_response_until(&mut stream, &response, deadline, cancelled);
+          let _ = write_http_response_until(&mut stream, &response, deadline, &cancelled);
         }
       });
     }
@@ -955,6 +959,111 @@ mod deadline_tests {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     (listener.accept().unwrap().0, client)
+  }
+  fn active_private_scan(endpoint: &str, duration: Option<Duration>, budget: Duration) {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").unwrap()).join(format!(
+      "active-private-{endpoint}-{}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let root = base.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    // Real traversal and SQL work exceed both the shutdown and request budgets.
+    for n in 0..120_000 {
+      std::fs::write(root.join(format!("target-{n:05}.md")), "x").unwrap();
+    }
+    let db = base.join("index.db");
+    let seed = KuntuIndex::open(&db).unwrap();
+    let allowed = SearchRoot::new(&root);
+    seed.register_root(&allowed).unwrap();
+    drop(seed);
+    let observer = KuntuIndex::open_read_only(&db).unwrap();
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path: db.clone(),
+      store_mode: StoreMode::Private,
+      addr: addr.clone(),
+      duration,
+      max_requests: if duration.is_some() { None } else { Some(1) },
+      allowed_roots: vec![allowed.clone()],
+      allow_non_loopback: false,
+    };
+    let start = Instant::now();
+    let server = thread::spawn(move || serve(config).unwrap());
+    let mut client = loop {
+      match TcpStream::connect(&addr) {
+        Ok(s) => break s,
+        Err(_) if start.elapsed() < Duration::from_secs(10) => {
+          thread::sleep(Duration::from_millis(1))
+        }
+        Err(e) => panic!("daemon startup: {e}"),
+      }
+    };
+    let body = serde_json::to_vec(&json!({"roots":[root]})).unwrap();
+    write!(
+      client,
+      "POST /index/{endpoint} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+      body.len()
+    )
+    .unwrap();
+    client.write_all(&body).unwrap();
+    while observer.root_state_name(&allowed.path).unwrap() != "building" {
+      assert!(start.elapsed() < budget, "scan never became active");
+      thread::sleep(Duration::from_millis(1));
+    }
+    let stats = server.join().unwrap();
+    let state = observer.root_state_name(&allowed.path).unwrap();
+    eprintln!(
+      "ACTIVE_SCAN endpoint={endpoint} elapsed_ms={} state={state}",
+      stats.elapsed_ms
+    );
+    assert!(
+      start.elapsed() < budget,
+      "active private scan delayed shutdown: {stats:?}"
+    );
+    assert_eq!(
+      state, "building",
+      "cancelled generation was published ready"
+    );
+    assert_eq!(
+      observer.doctor().unwrap(),
+      "ok",
+      "cancelled transaction did not roll back"
+    );
+    drop(observer);
+    let mut resumed = KuntuIndex::open(&db).unwrap();
+    assert!(
+      resumed.acquire_writer().unwrap(),
+      "cancelled scan retained its lease"
+    );
+    // A later request can finish the persisted generation.
+    std::fs::remove_dir_all(&allowed.path).unwrap();
+    std::fs::create_dir(&allowed.path).unwrap();
+    std::fs::write(allowed.path.join("resumed.md"), "x").unwrap();
+    resumed
+      .rebuild(&SearchConfig {
+        roots: vec![allowed.clone()],
+      })
+      .unwrap();
+    assert_eq!(resumed.root_state_name(&allowed.path).unwrap(), "ready");
+  }
+  #[test]
+  fn shutdown_reaches_an_active_private_rebuild() {
+    active_private_scan(
+      "rebuild",
+      Some(Duration::from_millis(300)),
+      Duration::from_secs(1),
+    );
+  }
+  #[test]
+  fn request_deadline_reaches_an_active_private_refresh() {
+    active_private_scan("refresh", None, Duration::from_millis(2500));
   }
   #[test]
   fn trickled_input_cannot_extend_the_absolute_request_deadline() {

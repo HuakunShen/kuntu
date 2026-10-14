@@ -147,6 +147,7 @@ pub struct KuntuIndex {
   legacy: Option<kuntu_legacy_index::KuntuIndex>,
   home: Option<Home>,
   cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  operation_deadline: Option<std::time::Instant>,
   _reader: Option<ReaderGuard>,
   shared: bool,
   consumer: String,
@@ -242,6 +243,7 @@ impl KuntuIndex {
     )
   }
   pub fn rebuild(&mut self, config: &SearchConfig) -> Result<RebuildStats> {
+    self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
       return legacy.rebuild(config).map_err(legacy_error);
@@ -261,7 +263,7 @@ impl KuntuIndex {
       let crawl_config = self.index_config(root_id)?;
       let crawl_evidence = shared::evidence_span();
       let (entries, stats) =
-        walk::crawl_cancellable(&CrawlOptions::new(crawl_config), &self.cancel)?;
+        walk::crawl_cancellable(&CrawlOptions::new(crawl_config), &|| self.check_cancelled())?;
       self.check_cancelled()?;
       skipped += stats.skipped;
       if !stats.errors.is_empty() {
@@ -301,6 +303,7 @@ impl KuntuIndex {
           }
         }
         tx.conn.raw.execute("UPDATE root_state SET entry_count=(SELECT count(*) FROM entries WHERE root_id=?1) WHERE root_id=?1",params![root_id])?;
+        self.check_cancelled()?;
         let commit_evidence = shared::evidence_span();
         block_on(tx.commit())?;
         if let Some(span) = commit_evidence {
@@ -340,6 +343,7 @@ impl KuntuIndex {
     })
   }
   pub fn refresh(&mut self, config: &SearchConfig) -> Result<RefreshStats> {
+    self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
       return legacy.refresh(config).map_err(legacy_error);
@@ -365,6 +369,7 @@ impl KuntuIndex {
     })
   }
   pub fn repair(&mut self, config: &SearchConfig) -> Result<RepairStats> {
+    self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
       return legacy.repair(config).map_err(legacy_error);
