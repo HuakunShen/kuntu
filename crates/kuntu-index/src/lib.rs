@@ -74,7 +74,7 @@ impl std::fmt::Display for IndexError {
       ),
       IndexError::RecreateRequired => write!(
         formatter,
-        "index database predates the turso engine and must be recreated"
+        "The index requires revalidation or recreation."
       ),
       IndexError::UnrecognizedDatabase { path } => write!(
         formatter,
@@ -243,6 +243,10 @@ impl KuntuIndex {
     )
   }
   pub fn rebuild(&mut self, config: &SearchConfig) -> Result<RebuildStats> {
+    let result = self.rebuild_inner(config);
+    self.detect_corruption(result)
+  }
+  fn rebuild_inner(&mut self, config: &SearchConfig) -> Result<RebuildStats> {
     self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
@@ -343,6 +347,10 @@ impl KuntuIndex {
     })
   }
   pub fn refresh(&mut self, config: &SearchConfig) -> Result<RefreshStats> {
+    let result = self.refresh_inner(config);
+    self.detect_corruption(result)
+  }
+  fn refresh_inner(&mut self, config: &SearchConfig) -> Result<RefreshStats> {
     self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
@@ -369,6 +377,10 @@ impl KuntuIndex {
     })
   }
   pub fn repair(&mut self, config: &SearchConfig) -> Result<RepairStats> {
+    let result = self.repair_inner(config);
+    self.detect_corruption(result)
+  }
+  fn repair_inner(&mut self, config: &SearchConfig) -> Result<RepairStats> {
     self.check_cancelled()?;
     self.ensure_lease()?;
     if let Some(legacy) = &mut self.legacy {
@@ -467,33 +479,35 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
-    self.recheck_read_access()?;
-    if !config.roots.iter().any(|r| r.enabled) {
-      return Err(IndexError::EmptyScope);
-    }
-    if let Some(legacy) = &self.legacy {
-      let o = legacy
-        .search_with_options(
-          config,
-          query,
-          kuntu_legacy_index::SearchOptions {
-            fetch_budget: options.fetch_budget,
+    self.checked(|| {
+      self.recheck_read_access()?;
+      if !config.roots.iter().any(|r| r.enabled) {
+        return Err(IndexError::EmptyScope);
+      }
+      if let Some(legacy) = &self.legacy {
+        let o = legacy
+          .search_with_options(
+            config,
+            query,
+            kuntu_legacy_index::SearchOptions {
+              fetch_budget: options.fetch_budget,
+            },
+          )
+          .map_err(legacy_error)?;
+        return Ok(IndexedSearchOutcome {
+          candidate_count: o.candidate_count,
+          results: o.results,
+          truncated: o.truncated,
+          coverage: match o.coverage {
+            kuntu_legacy_index::CandidateCoverage::Complete => CandidateCoverage::Complete,
+            kuntu_legacy_index::CandidateCoverage::Truncated => CandidateCoverage::Truncated,
           },
-        )
-        .map_err(legacy_error)?;
-      return Ok(IndexedSearchOutcome {
-        candidate_count: o.candidate_count,
-        results: o.results,
-        truncated: o.truncated,
-        coverage: match o.coverage {
-          kuntu_legacy_index::CandidateCoverage::Complete => CandidateCoverage::Complete,
-          kuntu_legacy_index::CandidateCoverage::Truncated => CandidateCoverage::Truncated,
-        },
-      });
-    }
-    let scope = kuntu_core::SearchScope::new(block_on(root_ids_for_config(&self.conn, config))?)
-      .map_err(|_| IndexError::EmptyScope)?;
-    self.search_scoped(config, &scope, query, options)
+        });
+      }
+      let scope = kuntu_core::SearchScope::new(block_on(root_ids_for_config(&self.conn, config))?)
+        .map_err(|_| IndexError::EmptyScope)?;
+      self.search_scoped(config, &scope, query, options)
+    })
   }
 
   /// Explicit v3 scope; config roots and persisted consumer membership intersect it.
@@ -504,227 +518,229 @@ impl KuntuIndex {
     query: &SearchQuery,
     options: SearchOptions,
   ) -> Result<IndexedSearchOutcome> {
-    self.search_profile.set(SearchProfile::default());
-    self.recheck_read_access()?;
-    if self.legacy.is_some() {
-      return Err(IndexError::RecreateRequired);
-    }
-    let configured = block_on(root_ids_for_config(&self.conn, config))?;
-    let root_ids = kuntu_core::SearchScope::new(
-      requested
-        .ids()
-        .iter()
-        .filter(|id| configured.contains(id))
-        .copied()
-        .collect(),
-    )
-    .map_err(|_| IndexError::EmptyScope)?;
-    let root_ids = root_ids.ids();
-    let budget = options.fetch_budget.clamp(1, MAX_KFS_CANDIDATE_ROWS);
-    self.poll_changes()?;
-    let admission = block_on(CandidateScope::load(
-      &self.conn,
-      root_ids,
-      query,
-      &self.consumer,
-      self.shared,
-      config,
-    ))?;
-    if admission.allowed_roots.is_empty() {
-      return Err(IndexError::EmptyScope);
-    }
-    block_on(async {
-      let empty = IndexedSearchOutcome {
-        candidate_count: 0,
-        results: Vec::new(),
-        truncated: false,
-        coverage: if self.has_building(root_ids)? {
-          CandidateCoverage::Building
-        } else {
-          CandidateCoverage::Complete
-        },
-      };
-      if !query.include_files && !query.include_directories {
-        return Ok(empty);
+    self.checked(|| {
+      self.search_profile.set(SearchProfile::default());
+      self.recheck_read_access()?;
+      if self.legacy.is_some() {
+        return Err(IndexError::RecreateRequired);
       }
-      let query_terms = tokenize(&query.query);
-      if query_terms.is_empty() {
-        // A term-less or fully-unknown query is a miss: it returns an empty
-        // complete result and never falls back to scanning the whole root.
-        return Ok(empty);
-      }
-
-      // Stage 1: posting lists, one range seek per unique token.
-      //
-      // A token's list is cheap to load, but two broad tokens cannot be
-      // intersected by capping each list (a selective token plus a common one
-      // would silently lose rows: the common list is cut at the work bound and
-      // most of the selective token's rows fall outside it). Instead the
-      // smallest *complete* list drives the search: its entries are fetched
-      // and every other token is verified against the row's own path, which is
-      // exactly the predicate the terms table encodes. Only when every token
-      // is too broad to load completely are the capped lists intersected, and
-      // the result is then reported as truncated.
-      let postings_started = std::time::Instant::now();
-      let unique_terms: std::collections::BTreeSet<String> = query_terms.into_iter().collect();
-
-      let mut lists: Vec<(String, TokenPostings)> = Vec::new();
-      for term in &unique_terms {
-        let postings = load_postings(&self.conn, term, DRIVER_PROBE_ROWS, usize::MAX).await?;
-        if postings.complete && postings.ids.is_empty() {
-          // A token that matches nothing ends the search: empty and complete.
-          return Ok(empty);
-        }
-        lists.push((term.clone(), postings));
-      }
-      let mut driver = smallest_complete(&lists);
-      if driver.is_none() {
-        lists.clear();
-        for term in &unique_terms {
-          let postings = load_postings(
-            &self.conn,
-            term,
-            MAX_KFS_CANDIDATE_ROWS * 3,
-            MAX_KFS_CANDIDATE_ROWS,
-          )
-          .await?;
-          lists.push((term.clone(), postings));
-        }
-        driver = smallest_complete(&lists);
-      }
-      let (id_list, verify_tokens, any_token_saturated): (Vec<i64>, Vec<String>, bool) =
-        match driver {
-          Some(position) => {
-            let verify_tokens = lists
-              .iter()
-              .enumerate()
-              .filter(|(index, _)| *index != position)
-              .map(|(_, (term, _))| term.clone())
-              .collect();
-            (rank_ids(&[&lists[position].1.ids]), verify_tokens, false)
-          }
-          None => {
-            let id_maps: Vec<&dyn PostingMap> = lists
-              .iter()
-              .map(|(_, postings)| &postings.ids as &dyn PostingMap)
-              .collect();
-            (rank_ids(&id_maps), Vec::new(), true)
-          }
-        };
-      let mut profile = SearchProfile {
-        postings_ns: postings_started.elapsed().as_nanos(),
-        ..SearchProfile::default()
-      };
-      let fetch_started = std::time::Instant::now();
-      // Stage 2: load the candidate rows by id and filter in Rust.
-      //
-      // The fetch statement carries no predicate at all. turso's planner turns
-      // any indexed predicate beside the id list (root_id, extension) into a
-      // scan of that index, which costs a whole-root scan per batch; the bare
-      // `id IN (...)` is a rowid seek. Scope, kind, extension and policy are
-      // therefore applied to each fetched row before it can become a
-      // candidate, so nothing outside the configured scope or policy is ever
-      // ranked, and the budget counts only admitted rows.
-      let scope = CandidateScope::load(
+      let configured = block_on(root_ids_for_config(&self.conn, config))?;
+      let root_ids = kuntu_core::SearchScope::new(
+        requested
+          .ids()
+          .iter()
+          .filter(|id| configured.contains(id))
+          .copied()
+          .collect(),
+      )
+      .map_err(|_| IndexError::EmptyScope)?;
+      let root_ids = root_ids.ids();
+      let budget = options.fetch_budget.clamp(1, MAX_KFS_CANDIDATE_ROWS);
+      self.poll_changes()?;
+      let admission = block_on(CandidateScope::load(
         &self.conn,
         root_ids,
         query,
         &self.consumer,
         self.shared,
         config,
-      )
-      .await?;
-      let mut candidates: Vec<CandidateRow> = Vec::new();
-      let mut examined = 0usize;
-      'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
-        let mut admitted: HashMap<i64, CandidateRow> = HashMap::with_capacity(chunk.len());
-        for entry in fetch_entries_by_id(&self.conn, chunk).await? {
-          if !verify_tokens.is_empty()
-            && !verify_candidate_tokens(&self.conn, entry.id, &entry.path, &verify_tokens).await?
-          {
-            continue;
-          }
-          let id = entry.id;
-          if let Some(candidate) = scope.admit(query, entry) {
-            admitted.insert(id, candidate);
-          }
-        }
-        for id in chunk {
-          examined += 1;
-          if let Some(candidate) = admitted.remove(id) {
-            candidates.push(candidate);
-            if candidates.len() == budget {
-              break 'chunks;
-            }
-          }
-        }
+      ))?;
+      if admission.allowed_roots.is_empty() {
+        return Err(IndexError::EmptyScope);
       }
-      // The budget stopped the search before every id was examined.
-      let budget_truncated = candidates.len() == budget && examined < id_list.len();
-      let any_token_saturated = any_token_saturated || budget_truncated;
-      let candidate_count = candidates.len();
-      let candidate_saturated = any_token_saturated;
+      block_on(async {
+        let empty = IndexedSearchOutcome {
+          candidate_count: 0,
+          results: Vec::new(),
+          truncated: false,
+          coverage: if self.has_building(root_ids)? {
+            CandidateCoverage::Building
+          } else {
+            CandidateCoverage::Complete
+          },
+        };
+        if !query.include_files && !query.include_directories {
+          return Ok(empty);
+        }
+        let query_terms = tokenize(&query.query);
+        if query_terms.is_empty() {
+          // A term-less or fully-unknown query is a miss: it returns an empty
+          // complete result and never falls back to scanning the whole root.
+          return Ok(empty);
+        }
 
-      profile.fetch_admission_ns = fetch_started.elapsed().as_nanos();
-      let prepared = PreparedQuery::new(query);
-      let mut retained =
-        std::collections::BinaryHeap::<RetainedResult>::with_capacity(query.limit.min(budget));
-      let mut positives = 0;
-      for (ordinal, row) in candidates.into_iter().enumerate() {
-        let started = std::time::Instant::now();
-        let (score, matches) = prepared.score(&row.path, row.root_priority);
-        profile.scoring_ns += started.elapsed().as_nanos();
-        let started = std::time::Instant::now();
-        if score > 0 {
-          positives += 1;
-          if query.limit > 0
-            && (retained.len() < query.limit
-              || retained.peek().is_some_and(|worst| {
-                score > worst.result.score
-                  || (score == worst.result.score && row.path < worst.result.path)
-              }))
-          {
-            if retained.len() == query.limit {
-              retained.pop();
+        // Stage 1: posting lists, one range seek per unique token.
+        //
+        // A token's list is cheap to load, but two broad tokens cannot be
+        // intersected by capping each list (a selective token plus a common one
+        // would silently lose rows: the common list is cut at the work bound and
+        // most of the selective token's rows fall outside it). Instead the
+        // smallest *complete* list drives the search: its entries are fetched
+        // and every other token is verified against the row's own path, which is
+        // exactly the predicate the terms table encodes. Only when every token
+        // is too broad to load completely are the capped lists intersected, and
+        // the result is then reported as truncated.
+        let postings_started = std::time::Instant::now();
+        let unique_terms: std::collections::BTreeSet<String> = query_terms.into_iter().collect();
+
+        let mut lists: Vec<(String, TokenPostings)> = Vec::new();
+        for term in &unique_terms {
+          let postings = load_postings(&self.conn, term, DRIVER_PROBE_ROWS, usize::MAX).await?;
+          if postings.complete && postings.ids.is_empty() {
+            // A token that matches nothing ends the search: empty and complete.
+            return Ok(empty);
+          }
+          lists.push((term.clone(), postings));
+        }
+        let mut driver = smallest_complete(&lists);
+        if driver.is_none() {
+          lists.clear();
+          for term in &unique_terms {
+            let postings = load_postings(
+              &self.conn,
+              term,
+              MAX_KFS_CANDIDATE_ROWS * 3,
+              MAX_KFS_CANDIDATE_ROWS,
+            )
+            .await?;
+            lists.push((term.clone(), postings));
+          }
+          driver = smallest_complete(&lists);
+        }
+        let (id_list, verify_tokens, any_token_saturated): (Vec<i64>, Vec<String>, bool) =
+          match driver {
+            Some(position) => {
+              let verify_tokens = lists
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != position)
+                .map(|(_, (term, _))| term.clone())
+                .collect();
+              (rank_ids(&[&lists[position].1.ids]), verify_tokens, false)
             }
-            retained.push(RetainedResult {
-              ordinal,
-              result: SearchResult {
-                path: row.path,
-                score,
-                provider: "sqlite".into(),
-                matches,
-                kind: row.kind,
-                byte_size: row.byte_size,
-                modified_unix_seconds: row.modified_unix_seconds,
-              },
-            });
-            profile.peak_retained_results = profile.peak_retained_results.max(retained.len());
+            None => {
+              let id_maps: Vec<&dyn PostingMap> = lists
+                .iter()
+                .map(|(_, postings)| &postings.ids as &dyn PostingMap)
+                .collect();
+              (rank_ids(&id_maps), Vec::new(), true)
+            }
+          };
+        let mut profile = SearchProfile {
+          postings_ns: postings_started.elapsed().as_nanos(),
+          ..SearchProfile::default()
+        };
+        let fetch_started = std::time::Instant::now();
+        // Stage 2: load the candidate rows by id and filter in Rust.
+        //
+        // The fetch statement carries no predicate at all. turso's planner turns
+        // any indexed predicate beside the id list (root_id, extension) into a
+        // scan of that index, which costs a whole-root scan per batch; the bare
+        // `id IN (...)` is a rowid seek. Scope, kind, extension and policy are
+        // therefore applied to each fetched row before it can become a
+        // candidate, so nothing outside the configured scope or policy is ever
+        // ranked, and the budget counts only admitted rows.
+        let scope = CandidateScope::load(
+          &self.conn,
+          root_ids,
+          query,
+          &self.consumer,
+          self.shared,
+          config,
+        )
+        .await?;
+        let mut candidates: Vec<CandidateRow> = Vec::new();
+        let mut examined = 0usize;
+        'chunks: for chunk in id_list.chunks(FETCH_CHUNK_IDS) {
+          let mut admitted: HashMap<i64, CandidateRow> = HashMap::with_capacity(chunk.len());
+          for entry in fetch_entries_by_id(&self.conn, chunk).await? {
+            if !verify_tokens.is_empty()
+              && !verify_candidate_tokens(&self.conn, entry.id, &entry.path, &verify_tokens).await?
+            {
+              continue;
+            }
+            let id = entry.id;
+            if let Some(candidate) = scope.admit(query, entry) {
+              admitted.insert(id, candidate);
+            }
+          }
+          for id in chunk {
+            examined += 1;
+            if let Some(candidate) = admitted.remove(id) {
+              candidates.push(candidate);
+              if candidates.len() == budget {
+                break 'chunks;
+              }
+            }
           }
         }
+        // The budget stopped the search before every id was examined.
+        let budget_truncated = candidates.len() == budget && examined < id_list.len();
+        let any_token_saturated = any_token_saturated || budget_truncated;
+        let candidate_count = candidates.len();
+        let candidate_saturated = any_token_saturated;
+
+        profile.fetch_admission_ns = fetch_started.elapsed().as_nanos();
+        let prepared = PreparedQuery::new(query);
+        let mut retained =
+          std::collections::BinaryHeap::<RetainedResult>::with_capacity(query.limit.min(budget));
+        let mut positives = 0;
+        for (ordinal, row) in candidates.into_iter().enumerate() {
+          let started = std::time::Instant::now();
+          let (score, matches) = prepared.score(&row.path, row.root_priority);
+          profile.scoring_ns += started.elapsed().as_nanos();
+          let started = std::time::Instant::now();
+          if score > 0 {
+            positives += 1;
+            if query.limit > 0
+              && (retained.len() < query.limit
+                || retained.peek().is_some_and(|worst| {
+                  score > worst.result.score
+                    || (score == worst.result.score && row.path < worst.result.path)
+                }))
+            {
+              if retained.len() == query.limit {
+                retained.pop();
+              }
+              retained.push(RetainedResult {
+                ordinal,
+                result: SearchResult {
+                  path: row.path,
+                  score,
+                  provider: "sqlite".into(),
+                  matches,
+                  kind: row.kind,
+                  byte_size: row.byte_size,
+                  modified_unix_seconds: row.modified_unix_seconds,
+                },
+              });
+              profile.peak_retained_results = profile.peak_retained_results.max(retained.len());
+            }
+          }
+          profile.sorting_ns += started.elapsed().as_nanos();
+        }
+        let started = std::time::Instant::now();
+        let results = retained
+          .into_sorted_vec()
+          .into_iter()
+          .map(|r| r.result)
+          .collect();
+        let truncated = positives > query.limit;
         profile.sorting_ns += started.elapsed().as_nanos();
-      }
-      let started = std::time::Instant::now();
-      let results = retained
-        .into_sorted_vec()
-        .into_iter()
-        .map(|r| r.result)
-        .collect();
-      let truncated = positives > query.limit;
-      profile.sorting_ns += started.elapsed().as_nanos();
-      self.search_profile.set(profile);
-      let coverage = if self.has_building(root_ids)? {
-        CandidateCoverage::Building
-      } else if candidate_saturated {
-        CandidateCoverage::Truncated
-      } else {
-        CandidateCoverage::Complete
-      };
-      Ok(IndexedSearchOutcome {
-        candidate_count,
-        results,
-        truncated,
-        coverage,
+        self.search_profile.set(profile);
+        let coverage = if self.has_building(root_ids)? {
+          CandidateCoverage::Building
+        } else if candidate_saturated {
+          CandidateCoverage::Truncated
+        } else {
+          CandidateCoverage::Complete
+        };
+        Ok(IndexedSearchOutcome {
+          candidate_count,
+          results,
+          truncated,
+          coverage,
+        })
       })
     })
   }
@@ -734,6 +750,7 @@ impl KuntuIndex {
   }
 
   pub fn status(&self) -> Result<Vec<RootStatus>> {
+    self.checked(|| {
     self.recheck_read_access()?;
     if let Some(legacy) = &self.legacy {
       return legacy.status().map_err(legacy_error);
@@ -762,6 +779,7 @@ impl KuntuIndex {
       }
       Ok(collected)
     })
+      })
   }
 }
 

@@ -143,8 +143,20 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
         let mut reader = None;
         let mut writer = None;
         loop {
-          let stream = receiver.lock().expect("worker queue").recv();
-          let Ok(stream) = stream else { break };
+          if home
+            .as_ref()
+            .is_some_and(|h| KuntuIndex::shared_revalidation_pending(h).unwrap_or(true))
+          {
+            reader.take();
+            writer.take();
+          }
+          // Idle cached readers must also release their epoch registration.
+          let received = receiver.lock().expect("worker queue").recv_timeout(IO_POLL);
+          let stream = match received {
+            Ok(stream) => stream,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+          };
           let QueuedConnection {
             mut stream,
             deadline,
@@ -194,6 +206,13 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
           // Private writes own a lease only for this request. Readers remain
           // cached, while shared writes are submitted to the serialized service.
           if !readonly && home.is_none() {
+            writer.take();
+          }
+          if home
+            .as_ref()
+            .is_some_and(|h| KuntuIndex::shared_revalidation_pending(h).unwrap_or(true))
+          {
+            reader.take();
             writer.take();
           }
           let _ = write_http_response_until(&mut stream, &response, deadline, &cancelled);

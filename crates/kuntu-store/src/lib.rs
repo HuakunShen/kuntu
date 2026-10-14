@@ -352,6 +352,10 @@ impl Home {
   pub fn remove(&self, n: &str) -> Result<()> {
     unlinkat(&*self.dir, n, UnlinkatFlags::NoRemoveDir).map_err(std::io::Error::from)
   }
+  /// Persist namespace changes through the pinned, validated directory.
+  pub fn sync_directory(&self) -> Result<()> {
+    self.dir.sync_all()
+  }
   pub fn quarantine(&self, epoch: u32) -> Result<()> {
     if epoch != EPOCH {
       return Err(err("Only the current epoch can be quarantined."));

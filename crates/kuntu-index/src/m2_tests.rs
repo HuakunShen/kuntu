@@ -1154,6 +1154,210 @@ fn ordinary_opens_and_requests_skip_whole_store_integrity_checks() {
     .with(|n| assert_eq!(n.get(), 0, "ordinary opens scanned the database"));
 }
 
+fn damaged_data_page(table: &str, queued: bool) -> (Home, SearchConfig) {
+  use std::os::unix::fs::FileExt;
+  let (h, config, seed) = fixture();
+  if queued {
+    seed.enqueue("rebuild", &config).unwrap();
+  }
+  let page: u32 = seed
+    .conn
+    .raw
+    .query_row(
+      "SELECT rootpage FROM sqlite_master WHERE name=?1",
+      params![table],
+      |r| r.get(0),
+    )
+    .unwrap();
+  let size: u32 = seed
+    .conn
+    .raw
+    .query_row("PRAGMA page_size", [], |r| r.get(0))
+    .unwrap();
+  seed
+    .conn
+    .raw
+    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+    .unwrap();
+  drop(seed);
+  let file = h.file("index.v3.db", false).unwrap();
+  // Damage the b-tree header, leaving the schema and metadata pages intact.
+  file
+    .write_all_at(&[0xff], u64::from(page - 1) * u64::from(size))
+    .unwrap();
+  file.sync_all().unwrap();
+  (h, config)
+}
+fn has_quarantined_members(h: &Home) -> bool {
+  std::fs::read_dir(&h.path).unwrap().any(|e| {
+    e.unwrap()
+      .file_name()
+      .to_string_lossy()
+      .starts_with("quarantine-")
+  })
+}
+#[test]
+fn late_entries_corruption_waits_for_cached_readers_then_quarantines() {
+  let (h, config) = damaged_data_page("entries", false);
+  shared::OPEN_INTEGRITY_CHECKS.with(|n| n.set(0));
+  let affected = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+  let idle = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+  shared::OPEN_INTEGRITY_CHECKS.with(|n| assert_eq!(n.get(), 0, "unbounded ordinary open"));
+  let error = affected
+    .search_with_metrics(&config, &SearchQuery::new("visible"))
+    .unwrap_err();
+  assert!(
+    matches!(error, IndexError::Engine(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt))
+  );
+  assert!(
+    h.exists("revalidate-3").unwrap(),
+    "diagnosed data-page corruption did not request recovery"
+  );
+  assert!(
+    matches!(idle.count_entries(), Err(IndexError::RecreateRequired)),
+    "cached reader kept using the affected epoch"
+  );
+  drop(affected);
+  assert!(matches!(
+    KuntuIndex::open_shared(h.clone(), false, "strict"),
+    Err(IndexError::LeaseRequired)
+  ));
+  assert!(
+    !has_quarantined_members(&h),
+    "quarantine bypassed a live reader"
+  );
+  drop(idle);
+  let recovered = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  assert_eq!(recovered.count_entries().unwrap(), 0);
+  assert_eq!(recovered.doctor().unwrap(), "ok");
+  assert!(has_quarantined_members(&h));
+  assert!(!h.exists("revalidate-3").unwrap());
+}
+#[test]
+fn late_postings_corruption_enters_revalidation() {
+  let (h, config) = damaged_data_page("name_postings", false);
+  let reader = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+  let error = reader
+    .search_with_metrics(&config, &SearchQuery::new("visible"))
+    .unwrap_err();
+  assert!(
+    matches!(error, IndexError::Engine(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt))
+  );
+  assert!(
+    h.exists("revalidate-3").unwrap(),
+    "postings corruption was only returned to the caller"
+  );
+  drop(reader);
+  let recovered = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  assert_eq!(recovered.count_entries().unwrap(), 0);
+  assert!(has_quarantined_members(&h));
+}
+#[test]
+fn late_scan_corruption_releases_service_capabilities_and_recovers() {
+  let (h, _config) = damaged_data_page("entries", true);
+  let service = WriterService::start(h.clone());
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+  while !has_quarantined_members(&h) {
+    if std::time::Instant::now() >= deadline {
+      drop(service);
+      panic!("writer service retried corruption while retaining its capabilities");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+  }
+  drop(service);
+  let recovered = KuntuIndex::open_shared(h, false, "strict").unwrap();
+  assert_eq!(recovered.count_entries().unwrap(), 0);
+  assert_eq!(recovered.doctor().unwrap(), "ok");
+  assert!(recovered
+    .home
+    .as_ref()
+    .unwrap()
+    .lock("indexer.lock", false)
+    .unwrap()
+    .is_some());
+}
+#[test]
+fn late_revalidation_operational_errors_preserve_database_members() {
+  for code in [
+    rusqlite::ffi::SQLITE_BUSY,
+    rusqlite::ffi::SQLITE_IOERR_READ,
+    rusqlite::ffi::SQLITE_NOMEM,
+  ] {
+    let (h, config) = damaged_data_page("entries", false);
+    let reader = KuntuIndex::open_shared(h.clone(), true, "strict").unwrap();
+    assert!(reader
+      .search_with_metrics(&config, &SearchQuery::new("visible"))
+      .is_err());
+    assert!(
+      h.exists("revalidate-3").unwrap(),
+      "late corruption diagnosis was lost"
+    );
+    drop(reader);
+    let before = member_snapshot(&h);
+    shared::OPEN_CHECK_ERRORS.with(|e| e.borrow_mut().push_back(code));
+    let error = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap_err();
+    assert!(
+      matches!(error, IndexError::Engine(ref e) if e.sqlite_error().is_some_and(|e| e.extended_code == code))
+    );
+    assert_eq!(
+      member_snapshot(&h),
+      before,
+      "operational revalidation failure changed members"
+    );
+    assert!(
+      h.exists("revalidate-3").unwrap(),
+      "operational failure discarded recovery intent"
+    );
+    assert!(!has_quarantined_members(&h));
+    assert!(h.lock("indexer.lock", false).unwrap().is_some());
+    assert!(h.lock("epoch-3.lock", false).unwrap().is_some());
+    let recovered = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+    assert_eq!(recovered.doctor().unwrap(), "ok");
+    assert!(has_quarantined_members(&h));
+  }
+}
+#[test]
+fn late_operational_write_failure_never_requests_quarantine() {
+  let (h, config, index) = fixture();
+  index
+    .conn
+    .raw
+    .execute_batch("PRAGMA query_only=ON")
+    .unwrap();
+  let before = member_snapshot(&h);
+  let error = index.enqueue("rebuild", &config).unwrap_err();
+  assert!(
+    matches!(error, IndexError::Engine(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly))
+  );
+  assert_eq!(member_snapshot(&h), before);
+  assert!(!h.exists("revalidate-3").unwrap());
+  assert!(!has_quarantined_members(&h));
+}
+#[test]
+fn late_revalidation_of_healthy_data_preserves_registrations_and_inbox() {
+  let (h, config, seed) = fixture();
+  seed.enqueue("rebuild", &config).unwrap();
+  drop(seed);
+  h.file("revalidate-3", true).unwrap().sync_all().unwrap();
+  shared::OPEN_INTEGRITY_CHECKS.with(|n| n.set(0));
+  let opened = KuntuIndex::open_shared(h.clone(), false, "strict").unwrap();
+  shared::OPEN_INTEGRITY_CHECKS.with(|n| assert_eq!(n.get(), 1, "revalidation signal was ignored"));
+  assert_eq!(opened.status().unwrap().len(), 1);
+  assert!(opened.count_entries().unwrap() > 0);
+  let pending: i64 = opened
+    .conn
+    .raw
+    .query_row(
+      "SELECT count(*) FROM requests WHERE state='pending'",
+      [],
+      |r| r.get(0),
+    )
+    .unwrap();
+  assert_eq!(pending, 1);
+  assert!(!has_quarantined_members(&h));
+  assert!(!h.exists("revalidate-3").unwrap());
+}
+
 #[test]
 fn simultaneous_fixture_timestamps_allocate_distinct_homes() {
   let first = home_at("simultaneous-fixture", 0);

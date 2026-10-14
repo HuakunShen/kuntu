@@ -1,6 +1,7 @@
 //! Shared access, lease capabilities, scan state, additive migration and hosts.
 use super::*;
 type EntrySnapshot = HashMap<String, (i64, Option<i64>, Option<i64>)>;
+const REVALIDATION_MARKER: &str = "revalidate-3";
 pub(crate) struct CleanupBatch {
   pub inspected: usize,
   pub deleted: usize,
@@ -120,6 +121,91 @@ impl EvidenceSpan {
   }
 }
 impl KuntuIndex {
+  /// Whether cached connections must be released before epoch revalidation.
+  pub fn needs_revalidation(&self) -> Result<bool> {
+    if self.shared {
+      self
+        .home
+        .as_ref()
+        .map_or(Ok(false), Self::shared_revalidation_pending)
+    } else {
+      Ok(false)
+    }
+  }
+  /// Let hosts release idle shared connections without issuing SQL on them.
+  pub fn shared_revalidation_pending(home: &Home) -> Result<bool> {
+    Ok(home.exists(REVALIDATION_MARKER)?)
+  }
+  pub(crate) fn detect_corruption<T>(&self, result: Result<T>) -> Result<T> {
+    if self.shared && result.as_ref().err().is_some_and(corruption_error) {
+      if let Some(home) = &self.home {
+        // This is a request to diagnose, never authority to rename members.
+        // Publish it before dropping the lease so another owner can take over.
+        if !home.exists(REVALIDATION_MARKER)? {
+          home.file(REVALIDATION_MARKER, true)?.sync_all()?;
+          home.sync_directory()?;
+        }
+        self.conn.lease.borrow_mut().take();
+      }
+    }
+    result
+  }
+  pub(crate) fn checked<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    self.detect_corruption(operation())
+  }
+  fn revalidate_home(home: &Home, minor: i64) -> Result<()> {
+    let writer = home
+      .lock("indexer.lock", false)?
+      .ok_or(IndexError::LeaseRequired)?;
+    let epoch = home
+      .lock("epoch-3.lock", false)?
+      .ok_or(IndexError::LeaseRequired)?;
+    if home.exists("index.v3.db")? {
+      let open = || -> Result<rusqlite::Connection> {
+        let raw = rusqlite::Connection::open_with_flags_and_vfs(
+          home.sqlite_name("index.v3.db")?,
+          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+          "kuntu-fd",
+        )?;
+        raw.busy_timeout(Duration::from_millis(5000))?;
+        Ok(raw)
+      };
+      // Recheck identity and compatibility after capability acquisition as
+      // well as data integrity. A signal cannot bypass a newer writer floor.
+      let corrupt =
+        match Self::from_raw(open()?, Some(home.clone()), true, true, "revalidate", minor) {
+          Ok(checked) => {
+            let floor: i64 = checked.conn.raw.query_row(
+              "SELECT value FROM meta WHERE key='min_writer_minor'",
+              [],
+              |r| r.get(0),
+            )?;
+            if floor > minor {
+              return Err(IndexError::ReadOnly);
+            }
+            let result = confirmed_corruption(recovery_check(&checked.conn.raw));
+            drop(checked);
+            result?
+          }
+          Err(error) if corruption_error(&error) => {
+            let raw = open()?;
+            let result = confirmed_corruption(recovery_check(&raw));
+            drop(raw);
+            result?
+          }
+          Err(error) => return Err(error),
+        };
+      if corrupt {
+        home.resume_quarantine(3, &writer, &epoch)?;
+      }
+    }
+    // A crash after completed quarantine may leave only the advisory marker.
+    if home.exists(REVALIDATION_MARKER)? {
+      home.remove(REVALIDATION_MARKER)?;
+      home.sync_directory()?;
+    }
+    Ok(())
+  }
   pub fn open_shared(home: Home, readonly: bool, consumer: &str) -> Result<Self> {
     Self::open_shared_minor(home, readonly, consumer, BUILD_MINOR)
   }
@@ -148,6 +234,12 @@ impl KuntuIndex {
         .ok_or(IndexError::LeaseRequired)?;
       home.resume_quarantine(3, &_lease, &_epoch)?;
     }
+    if home.exists(REVALIDATION_MARKER)? {
+      if readonly {
+        return Err(IndexError::RecreateRequired);
+      }
+      Self::revalidate_home(&home, minor)?;
+    }
     let reader = home.lifetime(3)?;
     kuntu_vfs::register()?;
     let name = home.sqlite_name("index.v3.db")?;
@@ -172,25 +264,7 @@ impl KuntuIndex {
         if readonly {
           return Err(IndexError::RecreateRequired);
         }
-        let writer = home
-          .lock("indexer.lock", false)?
-          .ok_or(IndexError::LeaseRequired)?;
-        let epoch = home
-          .lock("epoch-3.lock", false)?
-          .ok_or(IndexError::LeaseRequired)?;
-        let recheck = rusqlite::Connection::open_with_flags_and_vfs(
-          home.sqlite_name("index.v3.db")?,
-          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-          "kuntu-fd",
-        )?;
-        recheck.busy_timeout(Duration::from_millis(5000))?;
-        let corrupt = confirmed_corruption(recovery_check(&recheck))?;
-        drop(recheck);
-        if corrupt {
-          home.resume_quarantine(3, &writer, &epoch)?;
-        }
-        drop(epoch);
-        drop(writer);
+        Self::revalidate_home(&home, minor)?;
         drop(_boot);
         drop(_local);
         Self::open_shared_minor(home, readonly, consumer, minor)
@@ -402,6 +476,10 @@ impl KuntuIndex {
     })
   }
   pub fn import_v2(&mut self, source: &Path) -> Result<RebuildStats> {
+    let result = self.import_v2_inner(source);
+    self.detect_corruption(result)
+  }
+  fn import_v2_inner(&mut self, source: &Path) -> Result<RebuildStats> {
     self.ensure_lease()?;
     let home = self.home.as_ref().ok_or(IndexError::LeaseRequired)?;
     let _bootstrap = home
@@ -498,6 +576,10 @@ impl KuntuIndex {
     }
   }
   pub fn acquire_writer(&mut self) -> Result<bool> {
+    let result = self.acquire_writer_inner();
+    self.detect_corruption(result)
+  }
+  fn acquire_writer_inner(&mut self) -> Result<bool> {
     if self.conn.readonly.get() {
       self.conn.lease.borrow_mut().take();
       return Err(IndexError::ReadOnly);
@@ -604,6 +686,7 @@ impl KuntuIndex {
     Ok(())
   }
   pub(crate) fn ensure_lease(&mut self) -> Result<()> {
+    self.recheck_read_access()?;
     if self.conn.readonly.get() {
       return Err(IndexError::ReadOnly);
     }
@@ -629,6 +712,7 @@ impl KuntuIndex {
     Ok(())
   }
   pub fn register_root(&self, root: &SearchRoot) -> Result<i64> {
+    self.checked(|| {
     let tx = self.conn.begin_writer_txn(false)?;
     let id = block_on(upsert_root_tx(&tx, root))?;
     let previous:Option<(i32,bool,bool,bool)>=tx.conn.raw.query_row("SELECT priority,include_hidden,include_ignored,enabled FROM root_consumers WHERE root_id=?1 AND consumer=?2",params![id,self.consumer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).ok();
@@ -650,8 +734,10 @@ impl KuntuIndex {
     tx.conn.raw.execute("UPDATE roots SET enabled=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1),include_hidden=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1 AND include_hidden=1),include_ignored=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1 AND include_ignored=1) WHERE id=?1",params![id])?;
     block_on(tx.commit())?;
     Ok(id)
+      })
   }
   pub fn remove_consumer(&self, root_id: i64) -> Result<()> {
+    self.checked(|| {
     let tx = self.conn.begin_writer_txn(false)?;
     tx.conn.raw.execute(
       "DELETE FROM root_consumers WHERE root_id=?1 AND consumer=?2",
@@ -660,8 +746,10 @@ impl KuntuIndex {
     tx.conn.raw.execute("UPDATE roots SET enabled=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1),include_hidden=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1 AND include_hidden=1),include_ignored=EXISTS(SELECT 1 FROM root_consumers WHERE root_id=?1 AND enabled=1 AND include_ignored=1) WHERE id=?1",params![root_id])?;
     tx.conn.raw.execute("UPDATE root_state SET policy_revision=policy_revision+1,status='dirty',dirty=1 WHERE root_id=?1",params![root_id])?;
     block_on(tx.commit())
+      })
   }
   pub fn begin_scan(&self, root_id: i64) -> Result<i64> {
+    self.checked(|| {
     if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
     }
@@ -675,16 +763,20 @@ impl KuntuIndex {
     block_on(tx.commit())?;
     fault("building_committed");
     Ok(gen)
+      })
   }
   pub fn check_scan(&self, root_id: i64, gen: i64) -> Result<()> {
+    self.checked(|| {
     let ok:bool=self.conn.raw.query_row("SELECT status='building' AND active_scan_gen=?2 AND scan_policy_revision=policy_revision AND EXISTS(SELECT 1 FROM roots WHERE id=?1 AND enabled=1) FROM root_state WHERE root_id=?1",params![root_id,gen],|r|r.get(0))?;
     if ok {
       Ok(())
     } else {
       Err(IndexError::StaleScan)
     }
+      })
   }
   pub fn complete_scan(&self, root_id: i64, gen: i64) -> Result<()> {
+    self.checked(|| {
     if self.home.is_some() && self.conn.lease.borrow().is_none() {
       return Err(IndexError::LeaseRequired);
     }
@@ -706,6 +798,7 @@ impl KuntuIndex {
     block_on(tx.commit())?;
     fault("ready_committed");
     Ok(())
+      })
   }
   pub(crate) fn cleanup_stale_batch(
     &self,
@@ -804,98 +897,118 @@ impl KuntuIndex {
     Ok(snapshot)
   }
   pub fn generation_probe(&self) -> Result<i64> {
-    self.recheck_read_access()?;
-    Ok(
-      self
-        .conn
-        .raw
-        .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| {
-          r.get(0)
-        })?,
-    )
+    self.checked(|| {
+      self.recheck_read_access()?;
+      Ok(
+        self
+          .conn
+          .raw
+          .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| {
+            r.get(0)
+          })?,
+      )
+    })
   }
   pub fn point_probe(&self) -> Result<i64> {
-    self.recheck_read_access()?;
-    use rusqlite::OptionalExtension;
-    Ok(
-      self
-        .conn
-        .raw
-        .query_row("SELECT id FROM entries WHERE id=1", [], |r| r.get(0))
-        .optional()?
-        .unwrap_or(0),
-    )
+    self.checked(|| {
+      self.recheck_read_access()?;
+      use rusqlite::OptionalExtension;
+      Ok(
+        self
+          .conn
+          .raw
+          .query_row("SELECT id FROM entries WHERE id=1", [], |r| r.get(0))
+          .optional()?
+          .unwrap_or(0),
+      )
+    })
   }
   pub fn range_probe(&self) -> Result<i64> {
-    self.recheck_read_access()?;
-    Ok(self.conn.raw.query_row(
-      "SELECT count(*) FROM entries WHERE id>=1 AND id<101",
-      [],
-      |r| r.get(0),
-    )?)
+    self.checked(|| {
+      self.recheck_read_access()?;
+      Ok(self.conn.raw.query_row(
+        "SELECT count(*) FROM entries WHERE id>=1 AND id<101",
+        [],
+        |r| r.get(0),
+      )?)
+    })
   }
   pub fn count_entries(&self) -> Result<i64> {
-    self.recheck_read_access()?;
-    Ok(
-      self
-        .conn
-        .raw
-        .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?,
-    )
+    self.checked(|| {
+      self.recheck_read_access()?;
+      Ok(
+        self
+          .conn
+          .raw
+          .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?,
+      )
+    })
   }
   pub fn recheck_read_access(&self) -> Result<()> {
-    if self.legacy.is_some() {
-      return Ok(());
-    }
-    let min: i64 = self.conn.raw.query_row(
-      "SELECT value FROM meta WHERE key='min_reader_minor'",
-      [],
-      |r| r.get(0),
-    )?;
-    if min > self.conn.minor {
-      self.conn.readonly.set(true);
-      self.conn.lease.borrow_mut().take();
-      return Err(IndexError::SchemaTooNew {
-        found: min,
-        supported: self.conn.minor,
-      });
-    }
-    Ok(())
+    self.checked(|| {
+      if self.needs_revalidation()? {
+        self.conn.lease.borrow_mut().take();
+        return Err(IndexError::RecreateRequired);
+      }
+      if self.legacy.is_some() {
+        return Ok(());
+      }
+      let min: i64 = self.conn.raw.query_row(
+        "SELECT value FROM meta WHERE key='min_reader_minor'",
+        [],
+        |r| r.get(0),
+      )?;
+      if min > self.conn.minor {
+        self.conn.readonly.set(true);
+        self.conn.lease.borrow_mut().take();
+        return Err(IndexError::SchemaTooNew {
+          found: min,
+          supported: self.conn.minor,
+        });
+      }
+      Ok(())
+    })
   }
   pub fn root_state_name(&self, path: &Path) -> Result<String> {
-    self.recheck_read_access()?;
-    if let Some(legacy) = &self.legacy {
-      let s = legacy
-        .status()
-        .map_err(legacy_error)?
-        .into_iter()
-        .find(|s| s.path == path)
-        .ok_or(IndexError::EmptyScope)?;
-      return Ok(if s.dirty { "dirty" } else { "ready" }.into());
-    }
-    Ok(self.conn.raw.query_row(
-      "SELECT s.status FROM root_state s JOIN roots r ON r.id=s.root_id WHERE r.path=?1",
-      params![path.to_string_lossy()],
-      |r| r.get(0),
-    )?)
+    self.checked(|| {
+      self.recheck_read_access()?;
+      if let Some(legacy) = &self.legacy {
+        let s = legacy
+          .status()
+          .map_err(legacy_error)?
+          .into_iter()
+          .find(|s| s.path == path)
+          .ok_or(IndexError::EmptyScope)?;
+        return Ok(if s.dirty { "dirty" } else { "ready" }.into());
+      }
+      Ok(self.conn.raw.query_row(
+        "SELECT s.status FROM root_state s JOIN roots r ON r.id=s.root_id WHERE r.path=?1",
+        params![path.to_string_lossy()],
+        |r| r.get(0),
+      )?)
+    })
   }
   pub fn doctor(&self) -> Result<String> {
-    self.recheck_read_access()?;
-    Ok(
-      self
-        .conn
-        .raw
-        .query_row("PRAGMA quick_check", [], |r| r.get(0))?,
-    )
+    self.checked(|| {
+      self.recheck_read_access()?;
+      Ok(
+        self
+          .conn
+          .raw
+          .query_row("PRAGMA quick_check", [], |r| r.get(0))?,
+      )
+    })
   }
   pub fn poll_changes(&self) -> Result<bool> {
-    self.recheck_read_access()?;
-    let version = self
-      .conn
-      .raw
-      .query_row("PRAGMA data_version", [], |r| r.get(0))?;
-    let old = self.data_version.replace(version);
-    Ok(old != 0 && old != version)
+    self.checked(|| {
+      self.recheck_read_access()?;
+      let version = self
+        .conn
+        .raw
+        .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+      let old = self.data_version.replace(version);
+      Ok(old != 0 && old != version)
+    })
   }
   pub(crate) fn has_building(&self, ids: &[i64]) -> Result<bool> {
     for id in ids {
@@ -911,27 +1024,36 @@ impl KuntuIndex {
     Ok(false)
   }
   pub fn enqueue(&self, kind: &str, config: &SearchConfig) -> Result<i64> {
-    if !matches!(kind, "rebuild" | "refresh" | "repair") {
-      return Err(IndexError::StaleScan);
-    }
-    let payload = serde_json::to_string(
-      &config
-        .roots
-        .iter()
-        .map(|r| r.path.clone())
-        .collect::<Vec<_>>(),
-    )
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let tx = self.conn.begin_writer_txn(false)?;
-    tx.conn.raw.execute(
-      "INSERT INTO requests(kind,payload,created_by,created_at) VALUES(?1,?2,?3,?4)",
-      params![kind, payload, self.consumer, unix_now()],
-    )?;
-    let id = tx.conn.raw.last_insert_rowid();
-    block_on(tx.commit())?;
-    Ok(id)
+    self.checked(|| {
+      if self.needs_revalidation()? {
+        return Err(IndexError::RecreateRequired);
+      }
+      if !matches!(kind, "rebuild" | "refresh" | "repair") {
+        return Err(IndexError::StaleScan);
+      }
+      let payload = serde_json::to_string(
+        &config
+          .roots
+          .iter()
+          .map(|r| r.path.clone())
+          .collect::<Vec<_>>(),
+      )
+      .map_err(|e| std::io::Error::other(e.to_string()))?;
+      let tx = self.conn.begin_writer_txn(false)?;
+      tx.conn.raw.execute(
+        "INSERT INTO requests(kind,payload,created_by,created_at) VALUES(?1,?2,?3,?4)",
+        params![kind, payload, self.consumer, unix_now()],
+      )?;
+      let id = tx.conn.raw.last_insert_rowid();
+      block_on(tx.commit())?;
+      Ok(id)
+    })
   }
   pub fn recover_pending_roots(&mut self) -> Result<()> {
+    let result = self.recover_pending_roots_inner();
+    self.detect_corruption(result)
+  }
+  fn recover_pending_roots_inner(&mut self) -> Result<()> {
     self.ensure_lease()?;
     let roots = {
       let mut q=self.conn.raw.prepare("SELECT r.path,c.consumer FROM roots r JOIN root_state s ON s.root_id=r.id JOIN root_consumers c ON c.root_id=r.id WHERE r.enabled=1 AND c.enabled=1 AND s.status IN ('building','dirty','catching_up') ORDER BY r.id,c.priority DESC,c.consumer")?;
@@ -956,6 +1078,10 @@ impl KuntuIndex {
     Ok(())
   }
   pub fn drain_requests(&mut self) -> Result<()> {
+    let result = self.drain_requests_inner();
+    self.detect_corruption(result)
+  }
+  fn drain_requests_inner(&mut self) -> Result<()> {
     self.ensure_lease()?;
     let items = {
       let mut s=self.conn.raw.prepare("SELECT id,kind,payload,created_by FROM requests WHERE state='pending' ORDER BY id LIMIT 16")?;
@@ -989,10 +1115,17 @@ impl KuntuIndex {
         "repair" => self.repair(&config).map(|_| ()),
         _ => Err(IndexError::StaleScan),
       };
-      if matches!(
-        result,
-        Err(IndexError::ReadOnly | IndexError::SchemaTooNew { .. } | IndexError::Cancelled)
-      ) {
+      if self.needs_revalidation()?
+        || matches!(
+          result,
+          Err(
+            IndexError::ReadOnly
+              | IndexError::SchemaTooNew { .. }
+              | IndexError::Cancelled
+              | IndexError::RecreateRequired
+          )
+        )
+      {
         return result;
       }
       let tx = self.conn.begin_writer_txn(false)?;
@@ -1005,6 +1138,10 @@ impl KuntuIndex {
     Ok(())
   }
   pub fn migrate(&mut self, target: i64) -> Result<()> {
+    let result = self.migrate_inner(target);
+    self.detect_corruption(result)
+  }
+  fn migrate_inner(&mut self, target: i64) -> Result<()> {
     if target > self.conn.minor {
       return Err(IndexError::ReadOnly);
     }
@@ -1068,6 +1205,7 @@ impl WriterService {
     let attempted = started.clone();
     let worker = thread::spawn(move || {
       while !signal.load(Ordering::Acquire) {
+        let mut revalidate = false;
         if let Ok(mut index) = KuntuIndex::open_shared(home.clone(), false, "service") {
           index.cancel = signal.clone();
           attempted.store(true, Ordering::Release);
@@ -1077,9 +1215,18 @@ impl WriterService {
               let result = index
                 .drain_requests()
                 .and_then(|()| index.recover_pending_roots());
+              if index.needs_revalidation().unwrap_or(true) {
+                revalidate = true;
+                break;
+              }
               if matches!(
                 result,
-                Err(IndexError::ReadOnly | IndexError::SchemaTooNew { .. } | IndexError::Cancelled)
+                Err(
+                  IndexError::ReadOnly
+                    | IndexError::SchemaTooNew { .. }
+                    | IndexError::Cancelled
+                    | IndexError::RecreateRequired
+                )
               ) {
                 index.conn.lease.borrow_mut().take();
                 break;
@@ -1094,6 +1241,11 @@ impl WriterService {
           }
         }
         acquired.store(false, Ordering::Release);
+        // The affected index (connection, reader registration and lease) has
+        // left scope. Revalidation now obtains fresh exclusive capabilities.
+        if revalidate {
+          continue;
+        }
         // Five seconds is the poll interval; shutdown checks do not clamp it.
         for _ in 0..50 {
           if signal.load(Ordering::Acquire) {

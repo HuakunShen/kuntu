@@ -9,7 +9,7 @@ use kuntu_index::WriterService;
 use kuntu_store::Home;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-type ReadPool = Arc<Mutex<KuntuIndex>>;
+type ReadPool = Arc<Mutex<Option<KuntuIndex>>>;
 
 use kuntu_core::{
   IndexRebuildStats, IndexRefreshStats, IndexRepairStats, IndexRootStatus, MatchKind, SearchConfig,
@@ -131,7 +131,7 @@ impl FileSearchIndex {
       shared: true,
       consumer: consumer.unwrap_or_else(|| "local".into()),
       _service: (!readonly).then(|| Arc::new(WriterService::start(h))),
-      _reader: Some(Arc::new(Mutex::new(read))),
+      _reader: Some(Arc::new(Mutex::new(Some(read)))),
     })
   }
   #[napi(factory)]
@@ -153,7 +153,7 @@ impl FileSearchIndex {
       shared: true,
       consumer: name,
       _service: None,
-      _reader: Some(Arc::new(Mutex::new(reader))),
+      _reader: Some(Arc::new(Mutex::new(Some(reader)))),
     })
   }
   #[napi]
@@ -186,7 +186,7 @@ impl FileSearchIndex {
       shared: true,
       consumer: consumer.unwrap_or_else(|| "local".into()),
       _service: None,
-      _reader: Some(Arc::new(Mutex::new(read))),
+      _reader: Some(Arc::new(Mutex::new(Some(read)))),
     })
   }
   #[napi]
@@ -513,9 +513,27 @@ fn with_reader<T>(
   read: impl FnOnce(&KuntuIndex) -> Result<T>,
 ) -> Result<T> {
   if let Some(pool) = pool {
-    let index = pool.lock().map_err(napi_error)?;
-    index.recheck_read_access().map_err(napi_error)?;
-    read(&index)
+    let mut cached = pool.lock().map_err(napi_error)?;
+    if cached
+      .as_ref()
+      .is_some_and(|index| index.needs_revalidation().unwrap_or(true))
+    {
+      cached.take();
+    }
+    if cached.is_none() {
+      *cached = Some(open_task_index(path, true, shared, consumer)?);
+    }
+    let index = cached.as_ref().expect("opened native reader");
+    let result = index
+      .recheck_read_access()
+      .map_err(napi_error)
+      .and_then(|()| read(index));
+    // All task clones share this slot. Release its connection and epoch
+    // registration before the service attempts exclusive revalidation.
+    if index.needs_revalidation().unwrap_or(true) {
+      cached.take();
+    }
+    result
   } else {
     let index = open_task_index(path, readonly, shared, consumer)?;
     index.recheck_read_access().map_err(napi_error)?;
@@ -684,6 +702,87 @@ mod tests {
   use kuntu_index::KuntuIndex;
 
   use super::*;
+  #[test]
+  fn cached_native_reader_releases_corrupt_epoch_before_revalidation() {
+    use std::os::unix::fs::FileExt;
+    let base = std::env::temp_dir().join(format!(
+      "napi-corrupt-{}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let home = Home::open(&base).unwrap();
+    let root = base.join("files");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("visible-file.md"), "x").unwrap();
+    let config = SearchConfig {
+      roots: vec![SearchRoot::new(&root)],
+    };
+    let mut seed = KuntuIndex::open_shared(home.clone(), false, "client").unwrap();
+    seed.register_root(&config.roots[0]).unwrap();
+    assert!(seed.acquire_writer().unwrap());
+    seed.rebuild(&config).unwrap();
+    drop(seed);
+    let raw = rusqlite::Connection::open(base.join("index.v3.db")).unwrap();
+    let page: u32 = raw
+      .query_row(
+        "SELECT rootpage FROM sqlite_master WHERE name='entries'",
+        [],
+        |r| r.get(0),
+      )
+      .unwrap();
+    let size: u32 = raw.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+    raw
+      .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+      .unwrap();
+    drop(raw);
+    let client = FileSearchIndex::open_client(
+      Some(base.to_string_lossy().into_owned()),
+      Some("client".into()),
+    )
+    .unwrap();
+    let file = home.file("index.v3.db", false).unwrap();
+    file
+      .write_all_at(&[0xff], u64::from(page - 1) * u64::from(size))
+      .unwrap();
+    file.sync_all().unwrap();
+    let result = with_reader(
+      &client.db_path,
+      false,
+      true,
+      "client",
+      &client._reader,
+      |index| {
+        index
+          .search_with_metrics(&config, &kuntu_core::SearchQuery::new("visible"))
+          .map_err(napi_error)
+      },
+    );
+    assert!(result.is_err(), "damaged data page was not diagnosed");
+    assert!(
+      home.lock("epoch-3.lock", false).unwrap().is_some(),
+      "native read cache pinned the corrupt epoch after diagnosis"
+    );
+    let rebuilt = KuntuIndex::open_shared(home.clone(), false, "client").unwrap();
+    assert_eq!(rebuilt.doctor().unwrap(), "ok");
+    drop(rebuilt);
+    let status = with_reader(
+      &client.db_path,
+      false,
+      true,
+      "client",
+      &client._reader,
+      |index| index.status().map_err(napi_error),
+    )
+    .unwrap();
+    assert!(
+      status.is_empty(),
+      "native cache reused the quarantined connection"
+    );
+    drop(client);
+    fs::remove_dir_all(base).unwrap();
+  }
 
   /// The JS surface cannot see `IndexedSearchOutcome::coverage` — the addon's
   /// DTO keeps only `candidate_count` and `results` — so a search through the
