@@ -187,6 +187,11 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
             request,
             &config.allowed_roots,
           );
+          // Private writes own a lease only for this request. Readers remain
+          // cached, while shared writes are submitted to the serialized service.
+          if !readonly && home.is_none() {
+            writer.take();
+          }
           let _ = write_http_response_until(&mut stream, &response, deadline, cancelled);
         }
       });
@@ -798,6 +803,85 @@ mod tests {
 #[cfg(test)]
 mod connection_tests {
   use super::*;
+  #[test]
+  fn sequential_private_requests_across_workers_release_idle_leases() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").unwrap()).join(format!(
+      "private-worker-leases-{}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir_all(base.join("files")).unwrap();
+    std::fs::write(base.join("files/target.md"), "x").unwrap();
+    let db = base.join("index.db");
+    let root = SearchRoot::new(base.join("files"));
+    let body = serde_json::to_vec(&json!({"roots":[root.path]})).unwrap();
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path: db.clone(),
+      store_mode: StoreMode::Private,
+      addr: addr.clone(),
+      duration: None,
+      max_requests: Some(5),
+      allowed_roots: vec![root],
+      allow_non_loopback: false,
+    };
+    let server = thread::spawn(move || serve(config).unwrap());
+    let mut streams = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for endpoint in ["rebuild", "refresh", "rebuild", "refresh"] {
+      let mut stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(s) => break s,
+          Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+          Err(e) => panic!("daemon startup: {e}"),
+        }
+      };
+      stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+      write!(
+        stream,
+        "POST /index/{endpoint} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+      )
+      .unwrap();
+      streams.push(stream);
+    }
+    // Each incomplete body occupies a separate worker before the first write.
+    thread::sleep(Duration::from_millis(100));
+    let mut responses = Vec::new();
+    for mut stream in streams {
+      stream.write_all(&body).unwrap();
+      let mut response = String::new();
+      stream.read_to_string(&mut response).unwrap();
+      responses.push(response);
+    }
+    let mut external = KuntuIndex::open(&db).unwrap();
+    let external_acquired = external.acquire_writer().unwrap();
+    drop(external);
+    let mut final_request = TcpStream::connect(&addr).unwrap();
+    final_request
+      .write_all(b"GET /health HTTP/1.1\r\n\r\n")
+      .unwrap();
+    final_request.read_to_end(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    for (worker, response) in responses.iter().enumerate() {
+      assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "worker {worker}: {response}"
+      );
+    }
+    assert!(
+      external_acquired,
+      "idle private worker retained indexer.lock"
+    );
+  }
   fn health_run(db_path: PathBuf, requests: usize, mode: StoreMode) -> (DaemonRunStats, Vec<f64>) {
     let addr = TcpListener::bind("127.0.0.1:0")
       .unwrap()
