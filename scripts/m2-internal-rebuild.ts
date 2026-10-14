@@ -46,7 +46,8 @@ if(process.argv[2]==='--path-contract'){pathContract();
    assert.ok(stat.isDirectory()&&!stat.isSymbolicLink(),'owner path must be an existing directory, not a symlink');
    validateOwner(stat.uid,process.getuid!());
    const canonical=ownerInternalPath(realpathSync(path));
-   const disk=spawnSync('diskutil',['info','-plist',canonical],{encoding:'buffer'});assert.equal(disk.status,0);
+   const df=spawnSync('df',['-P',canonical],{encoding:'utf8'});assert.equal(df.status,0,df.stderr);const mount=df.stdout.trim().split('\n').at(-1)!.split(/\s+/).slice(5).join(' ');assert.ok(isAbsolute(mount),'cannot resolve the mount point');
+   const disk=spawnSync('diskutil',['info','-plist',mount],{encoding:'buffer'});assert.equal(disk.status,0,'diskutil accepts mount points, not arbitrary folders');
    const decoded=spawnSync('python3',['-c','import sys,plistlib; print(plistlib.loads(sys.stdin.buffer.read()).get("Internal",False))'],{input:disk.stdout,encoding:'utf8'});assert.equal(decoded.status,0);assert.equal(decoded.stdout.trim(),'True','target is not an internal SSD');
   }
   const bin=resolve(process.env.CARGO_TARGET_DIR??'target','release/examples/m2_probe');
