@@ -1,0 +1,14 @@
+# Private v2 compatibility only. Never imported by the shared SQLite backend.
+[package]
+name = "kuntu-legacy-index"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+kuntu-core = { path = "../kuntu-core" }
+kuntu-crawler = { path = "../kuntu-crawler" }
+turso.workspace = true
+futures.workspace = true
+[lints]
+workspace = true

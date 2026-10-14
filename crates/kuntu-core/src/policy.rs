@@ -6,7 +6,7 @@
 
 use std::path::{Component, Path};
 
-use crate::model::{expand_tilde, lowercase_extension, PolicyDecision, SearchConfig, SearchQuery};
+use crate::model::{expand_tilde, PolicyDecision, SearchConfig, SearchQuery};
 
 #[derive(Debug, Clone)]
 pub struct PathPolicy {
@@ -138,28 +138,65 @@ fn is_ignored(path: &Path, components: &[String]) -> bool {
     .is_some_and(|name| name == ".DS_Store")
 }
 
-fn is_sensitive(path: &Path, components: &[String]) -> bool {
-  let sensitive_components = [
-    ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
-  ];
-  if components.iter().any(|component| {
-    let lower = component.to_ascii_lowercase();
-    sensitive_components.contains(&component.as_str())
-      || lower.contains("credentials")
-      || lower.contains("secret")
-  }) {
+const SENSITIVE_COMPONENTS: &[&str] = &[
+  ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
+];
+const SENSITIVE_SUBSTRINGS: &[&str] = &["credentials", "secret"];
+const SENSITIVE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
+/// Compiled rule identity, derived from the same tables used for admission.
+/// The algorithm version covers matching semantics, including .env names.
+pub fn sensitive_policy_identity() -> String {
+  format!(
+    "sensitive-v2|components:{}|substrings:{}|extensions:{}|env:.env,.env.*",
+    SENSITIVE_COMPONENTS.join(","),
+    SENSITIVE_SUBSTRINGS.join(","),
+    SENSITIVE_EXTENSIONS.join(",")
+  )
+}
+/// Current sensitive denial never trusts a producer's persisted flags.
+pub fn denies_sensitive_path(path: &Path) -> bool {
+  path
+    .components()
+    .filter_map(|c| match c {
+      Component::Normal(v) => v.to_str(),
+      _ => None,
+    })
+    .any(sensitive_component)
+    || sensitive_filename(path)
+}
+fn sensitive_component(component: &str) -> bool {
+  SENSITIVE_COMPONENTS.contains(&component)
+    || SENSITIVE_SUBSTRINGS.iter().any(|needle| {
+      component
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
+}
+fn sensitive_filename(path: &Path) -> bool {
+  if path
+    .file_name()
+    .and_then(|v| v.to_str())
+    .is_some_and(|name| {
+      name.eq_ignore_ascii_case(".env")
+        || name
+          .get(..5)
+          .is_some_and(|p| p.eq_ignore_ascii_case(".env."))
+    })
+  {
     return true;
   }
-
-  if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") {
-      return true;
-    }
-  }
-
-  lowercase_extension(path)
-    .is_some_and(|extension| matches!(extension.as_str(), "pem" | "key" | "p12" | "pfx"))
+  path
+    .extension()
+    .and_then(|v| v.to_str())
+    .is_some_and(|ext| {
+      SENSITIVE_EXTENSIONS
+        .iter()
+        .any(|denied| ext.eq_ignore_ascii_case(denied))
+    })
+}
+fn is_sensitive(path: &Path, components: &[String]) -> bool {
+  components.iter().any(|c| sensitive_component(c)) || sensitive_filename(path)
 }
 
 #[cfg(test)]

@@ -18,4 +18,6 @@ pub use model::{
   normalize_root_path, EntryKind, ExplainResult, MatchKind, PolicyDecision, SearchCandidate,
   SearchConfig, SearchQuery, SearchResult, SearchRoot,
 };
-pub use policy::PathPolicy;
+pub use policy::{denies_sensitive_path, sensitive_policy_identity, PathPolicy};
+
+pub use model::SearchScope;

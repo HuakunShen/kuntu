@@ -4,7 +4,7 @@
 //! distributed vocabulary, a pool of nested directories, one to four name
 //! tokens joined by mixed separators, a skewed extension mix, and the root
 //! path components that every real row carries. Rows are written with
-//! multi-row statements through the same turso connection the library uses,
+//! guarded v3 batches through the same SQLite connection and posting writer,
 //! with the same term rules as `insert_terms_tx` (name tokens = field 1,
 //! extension = field 2, every path component token = field 3).
 //!
@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use kuntu_core::ranking::tokenize;
 use kuntu_core::{SearchConfig, SearchRoot};
-use turso::params;
+use rusqlite::params;
 
 use super::{block_on, remove_database_files, KuntuIndex};
 
@@ -154,99 +154,20 @@ pub fn generate_rows(root: &str, rows: usize) -> Vec<RowSpec> {
   specs
 }
 
-fn sql_quote(value: &str) -> String {
-  value.replace('\'', "''")
-}
-
-/// Terms exactly as `insert_terms_tx` derives them: (term, field, weight).
-fn terms_for(spec: &RowSpec) -> Vec<(String, i64, i64)> {
-  let path = Path::new(&spec.path);
-  let name = path
-    .file_name()
-    .and_then(|value| value.to_str())
-    .unwrap_or_default();
-  let mut terms: Vec<(String, i64, i64)> = tokenize(name)
-    .into_iter()
-    .map(|term| (term, 1, 100))
-    .collect();
-  if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-    terms.push((extension.to_ascii_lowercase(), 2, 50));
-  }
-  for component in path
-    .components()
-    .filter_map(|component| component.as_os_str().to_str())
-  {
-    for term in tokenize(component) {
-      terms.push((term, 3, 10));
-    }
-  }
-  terms
-}
-
-/// Plant rows with consecutive ids starting at `first_id`, bypassing the
-/// crawler. Values are generated literals, so multi-row statements keep a
-/// million-row fixture to a few thousand round-trips.
+/// Plant the realistic fixture through v3's actual entry/posting writer.
 pub fn insert_rows(index: &mut KuntuIndex, root_id: i64, rows: &[RowSpec], first_id: i64) {
-  const ENTRIES_PER_STATEMENT: usize = 100;
-  const ENTRIES_PER_TRANSACTION: usize = 25_000;
-  block_on(async {
-    let mut next_id = first_id;
-    for transaction_rows in rows.chunks(ENTRIES_PER_TRANSACTION) {
-      let tx = index.conn.transaction().await.unwrap();
-      for batch in transaction_rows.chunks(ENTRIES_PER_STATEMENT) {
-        let mut entries_sql = String::from(
-          "INSERT INTO entries (id, root_id, path, path_lower, name, name_lower, extension, kind, size, mtime, hidden, ignored, sensitive, deleted, indexed_at) VALUES ",
-        );
-        let mut terms_sql =
-          String::from("INSERT OR IGNORE INTO terms (term, entry_id, field, weight) VALUES ");
-        let mut first_term = true;
-        for (offset, spec) in batch.iter().enumerate() {
-          let id = next_id;
-          next_id += 1;
-          let path = Path::new(&spec.path);
-          let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-          let extension = if spec.is_dir {
-            None
-          } else {
-            path
-              .extension()
-              .and_then(|value| value.to_str())
-              .map(|value| value.to_ascii_lowercase())
-          };
-          let extension_sql = extension
-            .map(|value| format!("'{}'", sql_quote(&value)))
-            .unwrap_or_else(|| "NULL".to_string());
-          if offset > 0 {
-            entries_sql.push(',');
-          }
-          entries_sql.push_str(&format!(
-            "({id}, {root_id}, '{path}', '{path_lower}', '{name}', '{name_lower}', {extension_sql}, {kind}, 8, NULL, 0, 0, 0, 0, 0)",
-            path = sql_quote(&spec.path),
-            path_lower = sql_quote(&spec.path.to_ascii_lowercase()),
-            name = sql_quote(name),
-            name_lower = sql_quote(&name.to_ascii_lowercase()),
-            kind = if spec.is_dir { 2 } else { 1 },
-          ));
-          for (term, field, weight) in terms_for(spec) {
-            if !first_term {
-              terms_sql.push(',');
-            }
-            first_term = false;
-            terms_sql.push_str(&format!(
-              "('{}', {id}, {field}, {weight})",
-              sql_quote(&term)
-            ));
-          }
-        }
-        tx.execute(&entries_sql, ()).await.unwrap();
-        tx.execute(&terms_sql, ()).await.unwrap();
-      }
-      tx.commit().await.unwrap();
+  use super::{block_on, insert_terms_tx};
+  let mut next = first_id;
+  for batch in rows.chunks(5000) {
+    let tx = index.conn.begin_writer_txn(false).unwrap();
+    for row in batch {
+      let path = Path::new(&row.path);
+      tx.conn.raw.prepare_cached("INSERT INTO entries(id,root_id,path,name,extension,kind,size) VALUES(?1,?2,?3,?4,?5,?6,8)").unwrap().execute(params![next,root_id,row.path,path.file_name().and_then(|v|v.to_str()).unwrap_or_default(),path.extension().and_then(|v|v.to_str()),if row.is_dir{2}else{1}]).unwrap();
+      block_on(insert_terms_tx(&tx, next, path)).unwrap();
+      next += 1;
     }
-  });
+    block_on(tx.commit()).unwrap();
+  }
 }
 
 fn pick(counts: &HashMap<String, u32>, low: u32, high: u32) -> String {
@@ -356,9 +277,9 @@ pub fn open_or_build(rows: usize) -> Fixture {
   fs::create_dir_all(&base).unwrap();
   let root = base.join(format!("kuntu-root-{rows}"));
   fs::create_dir_all(&root).unwrap();
-  let root = kuntu_core::normalize_root_path(root);
-  let db_path = base.join(format!("realistic-{rows}.sqlite"));
-  let queries_path = base.join(format!("realistic-{rows}.queries"));
+  let root = PathBuf::from("/Users/kuntu/fixture");
+  let db_path = base.join(format!("realistic-v3-rev2-compact-{rows}.sqlite"));
+  let queries_path = base.join(format!("realistic-v3-rev2-compact-{rows}.queries"));
   let config = SearchConfig {
     roots: vec![SearchRoot::new(&root)],
   };
@@ -385,7 +306,17 @@ pub fn open_or_build(rows: usize) -> Fixture {
   let queries = choose_queries(&specs, rows);
   {
     let mut index = KuntuIndex::open(&db_path).unwrap();
-    index.rebuild(&config).unwrap();
+    let root_id = index.register_root(&config.roots[0]).unwrap();
+    let tx = index.conn.begin_writer_txn(false).unwrap();
+    tx.conn
+      .raw
+      .execute(
+        "UPDATE root_state SET status='ready',dirty=0 WHERE root_id=?1",
+        params![root_id],
+      )
+      .unwrap();
+    tx.conn.raw.execute("DELETE FROM entries", []).unwrap();
+    block_on(tx.commit()).unwrap();
     let root_id: i64 = block_on(async {
       let mut found = index
         .conn
@@ -396,11 +327,6 @@ pub fn open_or_build(rows: usize) -> Fixture {
         .await
         .unwrap();
       found.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
-    });
-    // The rebuild indexed the (empty) root directory itself; the fixture owns
-    // the whole entries table.
-    block_on(async {
-      index.conn.execute("DELETE FROM entries", ()).await.unwrap();
     });
     insert_rows(&mut index, root_id, &specs, 1);
   }

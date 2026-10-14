@@ -12,13 +12,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kuntu_core::{BackendError, MetadataIndex, SearchConfig, SearchQuery, SearchRoot};
-use kuntu_index::{match_names, KuntuIndex};
+use kuntu_index::{match_names, KuntuIndex, WriterService};
+use kuntu_store::{Home, StoreMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
   pub db_path: PathBuf,
+  pub store_mode: StoreMode,
   pub addr: String,
   pub duration: Option<Duration>,
   pub max_requests: Option<usize>,
@@ -31,6 +33,7 @@ pub struct DaemonRunStats {
   pub addr: String,
   pub requests: usize,
   pub elapsed_ms: u128,
+  pub reader_connections: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +69,27 @@ struct SearchResultDto {
   matches: Vec<String>,
 }
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const IO_POLL: Duration = Duration::from_millis(50);
+struct QueuedConnection {
+  stream: TcpStream,
+  deadline: Instant,
+}
+fn io_timeout(
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Duration, BackendError> {
+  if cancelled.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+    return Err(BackendError::new("request cancelled or deadline elapsed"));
+  }
+  Ok(
+    deadline
+      .saturating_duration_since(Instant::now())
+      .min(IO_POLL)
+      .max(Duration::from_millis(1)),
+  )
+}
+
 pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
   validate_bind_addr(&config)?;
   let listener = TcpListener::bind(&config.addr).map_err(BackendError::from)?;
@@ -75,54 +99,183 @@ pub fn serve(config: DaemonConfig) -> Result<DaemonRunStats, BackendError> {
     .map_err(BackendError::from)?
     .to_string();
   let started = Instant::now();
-  let mut index =
-    KuntuIndex::open(&config.db_path).map_err(|err| BackendError::new(err.to_string()))?;
-  let mut requests = 0;
-
-  loop {
-    if config
-      .duration
-      .is_some_and(|duration| started.elapsed() >= duration)
-    {
-      break;
-    }
-    if config
-      .max_requests
-      .is_some_and(|max_requests| requests >= max_requests)
-    {
-      break;
-    }
-
-    match listener.accept() {
-      Ok((stream, _addr)) => {
-        handle_connection(&mut index, stream, &config.allowed_roots)?;
-        requests += 1;
-      }
-      Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-        thread::sleep(Duration::from_millis(10));
-      }
-      Err(err) => return Err(BackendError::from(err)),
-    }
+  let server_deadline = config.duration.map(|d| started + d);
+  let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let shared = config.store_mode == StoreMode::Shared;
+  let home = if shared {
+    Some(
+      Home::open(
+        config
+          .db_path
+          .parent()
+          .ok_or_else(|| BackendError::new("Missing store home."))?,
+      )
+      .map_err(BackendError::from)?,
+    )
+  } else {
+    None
+  };
+  let _service = home.clone().map(WriterService::start);
+  let init = if let Some(h) = &home {
+    KuntuIndex::open_shared(h.clone(), false, "daemon")
+  } else {
+    KuntuIndex::open(&config.db_path)
   }
-
+  .map_err(|e| BackendError::new(e.to_string()))?;
+  for root in &config.allowed_roots {
+    init
+      .register_root(root)
+      .map_err(|e| BackendError::new(e.to_string()))?;
+  }
+  drop(init);
+  let mut requests = 0;
+  let reader_connections = std::sync::atomic::AtomicUsize::new(0);
+  let (sender, receiver) = std::sync::mpsc::sync_channel::<QueuedConnection>(8);
+  let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+  thread::scope(|scope| -> Result<(), BackendError> {
+    for _ in 0..4 {
+      let receiver = receiver.clone();
+      let home = home.clone();
+      let config = &config;
+      let reader_connections = &reader_connections;
+      let cancelled = cancelled.clone();
+      scope.spawn(move || {
+        let mut reader = None;
+        let mut writer = None;
+        loop {
+          if home
+            .as_ref()
+            .is_some_and(|h| KuntuIndex::shared_revalidation_pending(h).unwrap_or(true))
+          {
+            reader.take();
+            writer.take();
+          }
+          // Idle cached readers must also release their epoch registration.
+          let received = receiver.lock().expect("worker queue").recv_timeout(IO_POLL);
+          let stream = match received {
+            Ok(stream) => stream,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+          };
+          let QueuedConnection {
+            mut stream,
+            deadline,
+          } = stream;
+          let request = match read_http_request_until(&mut stream, deadline, &cancelled) {
+            Ok(Some(r)) => r,
+            _ => continue,
+          };
+          let readonly = matches!(
+            (request.method.as_str(), request.path.as_str()),
+            ("GET", _) | ("POST", "/search")
+          );
+          let slot = if readonly { &mut reader } else { &mut writer };
+          if slot.is_none() {
+            if readonly {
+              reader_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let opened = if let Some(h) = &home {
+              KuntuIndex::open_shared(h.clone(), readonly, "daemon")
+            } else if readonly {
+              KuntuIndex::open_read_only(&config.db_path)
+            } else {
+              KuntuIndex::open(&config.db_path)
+            };
+            match opened {
+              Ok(index) => *slot = Some(index),
+              Err(e) => {
+                let _ = write_http_response_until(
+                  &mut stream,
+                  &json_response(500, json!({"error":e.to_string()})),
+                  deadline,
+                  &cancelled,
+                );
+                continue;
+              }
+            }
+          }
+          slot
+            .as_mut()
+            .expect("opened worker connection")
+            .set_operation_control(cancelled.clone(), Some(deadline));
+          let response = handle_request(
+            slot.as_mut().expect("opened worker connection"),
+            request,
+            &config.allowed_roots,
+          );
+          // Private writes own a lease only for this request. Readers remain
+          // cached, while shared writes are submitted to the serialized service.
+          if !readonly && home.is_none() {
+            writer.take();
+          }
+          if home
+            .as_ref()
+            .is_some_and(|h| KuntuIndex::shared_revalidation_pending(h).unwrap_or(true))
+          {
+            reader.take();
+            writer.take();
+          }
+          let _ = write_http_response_until(&mut stream, &response, deadline, &cancelled);
+        }
+      });
+    }
+    let outcome = (|| {
+      'accepts: loop {
+        if server_deadline.is_some_and(|d| Instant::now() >= d) {
+          cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+          break;
+        }
+        if config.max_requests.is_some_and(|m| requests >= m) {
+          break;
+        }
+        match listener.accept() {
+          Ok((stream, _)) => {
+            // macOS inherits nonblocking from accept; normalize it so the
+            // short socket timeouts bound each read/write poll on every Unix.
+            stream.set_nonblocking(false).map_err(BackendError::from)?;
+            let now = Instant::now();
+            let deadline =
+              server_deadline.map_or(now + REQUEST_TIMEOUT, |d| d.min(now + REQUEST_TIMEOUT));
+            let mut queued = QueuedConnection { stream, deadline };
+            requests += 1;
+            loop {
+              if server_deadline.is_some_and(|d| Instant::now() >= d) {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                break 'accepts;
+              }
+              if Instant::now() >= queued.deadline {
+                break;
+              }
+              match sender.try_send(queued) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => queued = returned,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                  return Err(BackendError::new("worker queue disconnected"))
+                }
+              }
+              thread::sleep(Duration::from_millis(2));
+            }
+          }
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(2))
+          }
+          Err(e) => return Err(BackendError::from(e)),
+        }
+      }
+      Ok(())
+    })();
+    if outcome.is_err() {
+      cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(sender);
+    outcome
+  })?;
   Ok(DaemonRunStats {
     addr,
     requests,
     elapsed_ms: started.elapsed().as_millis(),
+    reader_connections: reader_connections.load(std::sync::atomic::Ordering::Relaxed),
   })
-}
-
-fn handle_connection(
-  index: &mut KuntuIndex,
-  mut stream: TcpStream,
-  allowed_roots: &[SearchRoot],
-) -> Result<(), BackendError> {
-  let request = read_http_request(&mut stream)?;
-  let response = match request {
-    Some(request) => handle_request(index, request, allowed_roots),
-    None => json_response(400, json!({ "error": "empty request" })),
-  };
-  write_http_response(&mut stream, &response)
 }
 
 fn handle_request(
@@ -142,6 +295,7 @@ fn handle_request(
                     "entry_count": root.entry_count,
                     "generation": root.generation,
                     "dirty": root.dirty,
+                    "status": index.root_state_name(&root.path).unwrap_or_else(|_|"dirty".into()),
                     "last_full_scan_at": root.last_full_scan_at,
                     "last_incremental_at": root.last_incremental_at
                 })
@@ -169,6 +323,7 @@ fn handle_request(
                 "coverage": match outcome.coverage {
                     kuntu_index::CandidateCoverage::Complete => "complete",
                     kuntu_index::CandidateCoverage::Truncated => "truncated",
+                    kuntu_index::CandidateCoverage::Building => "building",
                 },
                 "results": outcome.results.into_iter().map(SearchResultDto::from).collect::<Vec<_>>()
             }),
@@ -179,53 +334,81 @@ fn handle_request(
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     ("POST", "/index/rebuild") => match parse_roots_request(&request.body, allowed_roots) {
-      Ok(config) => match index.rebuild_index(&config) {
-        Ok(stats) => json_response(
-          200,
-          json!({
-              "stats": {
-                  "roots": stats.roots,
-                  "entries": stats.entries,
-                  "skipped": stats.skipped,
-                  "errors": stats.errors
-              }
-          }),
-        ),
-        Err(err) => json_response(500, json!({ "error": err.to_string() })),
-      },
+      Ok(config) => {
+        if index.is_shared() {
+          return match index.enqueue("rebuild", &config) {
+            Ok(id) => json_response(202, json!({"request_id":id})),
+            Err(e) => json_response(409, json!({"error":e.to_string()})),
+          };
+        }
+        match index.rebuild_index(&config) {
+          Ok(stats) => json_response(
+            200,
+            json!({
+                "stats": {
+                    "roots": stats.roots,
+                    "entries": stats.entries,
+                    "skipped": stats.skipped,
+                    "errors": stats.errors
+                }
+            }),
+          ),
+          Err(err) => json_response(500, json!({ "error": err.to_string() })),
+        }
+      }
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     ("POST", "/index/refresh") => match parse_roots_request(&request.body, allowed_roots) {
-      Ok(config) => match index.refresh_index(&config) {
-        Ok(stats) => json_response(
-          200,
-          json!({
-              "stats": {
-                  "roots": stats.roots,
-                  "inserted": stats.inserted,
-                  "updated": stats.updated,
-                  "deleted": stats.deleted,
-                  "unchanged": stats.unchanged,
-                  "skipped": stats.skipped,
-                  "errors": stats.errors
-              }
-          }),
-        ),
-        Err(err) => json_response(500, json!({ "error": err.to_string() })),
-      },
+      Ok(config) => {
+        if index.is_shared() {
+          return match index.enqueue("refresh", &config) {
+            Ok(id) => json_response(202, json!({"request_id":id})),
+            Err(e) => json_response(409, json!({"error":e.to_string()})),
+          };
+        }
+        match index.refresh_index(&config) {
+          Ok(stats) => json_response(
+            200,
+            json!({
+                "stats": {
+                    "roots": stats.roots,
+                    "inserted": stats.inserted,
+                    "updated": stats.updated,
+                    "deleted": stats.deleted,
+                    "unchanged": stats.unchanged,
+                    "skipped": stats.skipped,
+                    "errors": stats.errors
+                }
+            }),
+          ),
+          Err(err) => json_response(500, json!({ "error": err.to_string() })),
+        }
+      }
       Err(err) => json_response(400, json!({ "error": err.message })),
     },
     _ => json_response(404, json!({ "error": "not found" })),
   }
 }
 
+#[cfg(test)]
 fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, BackendError> {
-  stream
-    .set_read_timeout(Some(Duration::from_secs(2)))
-    .map_err(BackendError::from)?;
+  read_http_request_until(
+    stream,
+    Instant::now() + REQUEST_TIMEOUT,
+    &std::sync::atomic::AtomicBool::new(false),
+  )
+}
+fn read_http_request_until(
+  stream: &mut TcpStream,
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<HttpRequest>, BackendError> {
   let mut buffer = Vec::new();
   let mut chunk = [0_u8; 4096];
   loop {
+    stream
+      .set_read_timeout(Some(io_timeout(deadline, cancelled)?))
+      .map_err(BackendError::from)?;
     match stream.read(&mut chunk) {
       Ok(0) => break,
       Ok(count) => {
@@ -234,20 +417,23 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Back
           break;
         }
       }
-      Err(err)
+      Err(e)
         if matches!(
-          err.kind(),
-          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+          e.kind(),
+          std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
         ) =>
       {
-        break;
+        continue
       }
-      Err(err) => return Err(BackendError::from(err)),
+      Err(e) => return Err(BackendError::from(e)),
     }
   }
   if buffer.is_empty() {
     return Ok(None);
   }
+  io_timeout(deadline, cancelled)?;
   parse_http_request(&buffer).map(Some)
 }
 
@@ -299,9 +485,23 @@ fn content_length(headers: &[u8]) -> Option<usize> {
   })
 }
 
+#[cfg(test)]
 fn write_http_response(
   stream: &mut TcpStream,
   response: &HttpResponse,
+) -> Result<(), BackendError> {
+  write_http_response_until(
+    stream,
+    response,
+    Instant::now() + REQUEST_TIMEOUT,
+    &std::sync::atomic::AtomicBool::new(false),
+  )
+}
+fn write_http_response_until(
+  stream: &mut TcpStream,
+  response: &HttpResponse,
+  deadline: Instant,
+  cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), BackendError> {
   let reason = match response.status {
     200 => "OK",
@@ -317,9 +517,28 @@ fn write_http_response(
         response.body.len(),
         response.body
     );
-  stream
-    .write_all(text.as_bytes())
-    .map_err(BackendError::from)
+  let mut remaining = text.as_bytes();
+  while !remaining.is_empty() {
+    stream
+      .set_write_timeout(Some(io_timeout(deadline, cancelled)?))
+      .map_err(BackendError::from)?;
+    match stream.write(remaining) {
+      Ok(0) => return Err(BackendError::new("response write returned zero")),
+      Ok(n) => remaining = &remaining[n..],
+      Err(e)
+        if matches!(
+          e.kind(),
+          std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+        ) =>
+      {
+        continue
+      }
+      Err(e) => return Err(BackendError::from(e)),
+    }
+  }
+  Ok(())
 }
 
 fn parse_roots_request(
@@ -513,6 +732,7 @@ mod tests {
   #[test]
   fn daemon_rejects_non_loopback_bind_without_opt_in() {
     let config = DaemonConfig {
+      store_mode: StoreMode::Private,
       db_path: PathBuf::from("/tmp/kfs-review-daemon.sqlite"),
       addr: "0.0.0.0:0".to_string(),
       duration: Some(Duration::from_millis(1)),
@@ -532,5 +752,439 @@ mod tests {
       .unwrap()
       .as_nanos();
     std::env::temp_dir().join(format!("kuntu-daemon-{name}-{nonce}"))
+  }
+  #[test]
+  fn non_holder_bulk_endpoint_queues_and_empty_search_is_rejected() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").expect("scratch KUNTU_TEST_DIR"));
+    let home = Home::open(&base.join(format!("daemon-shared-{}", std::process::id()))).unwrap();
+    let root = home.path.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    let roots = vec![SearchRoot::new(&root)];
+    let mut holder = KuntuIndex::open_shared(home.clone(), false, "holder").unwrap();
+    assert!(holder.acquire_writer().unwrap());
+    let mut client = KuntuIndex::open_shared(home, false, "daemon").unwrap();
+    client.register_root(&roots[0]).unwrap();
+    let response = handle_request(
+      &mut client,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/index/rebuild".into(),
+        body: serde_json::to_vec(&json!({"roots":[root.to_string_lossy()]})).unwrap(),
+      },
+      &roots,
+    );
+    assert_eq!(response.status, 202);
+    let response = handle_request(
+      &mut client,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/search".into(),
+        body: br#"{"roots":[],"query":""}"#.to_vec(),
+      },
+      &roots,
+    );
+    assert_eq!(response.status, 400);
+  }
+  #[test]
+  fn strict_daemon_admission_ignores_another_consumers_union() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").expect("scratch directory"));
+    let path = base.join(format!("daemon-policy-{}", std::process::id()));
+    let home = Home::open(&path).unwrap();
+    let root = home.path.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("visible-file.md"), "x").unwrap();
+    std::fs::write(root.join(".hidden-file.md"), "x").unwrap();
+    let allowed = SearchRoot::new(&root);
+    let mut permissive = KuntuIndex::open_shared(home.clone(), false, "permissive").unwrap();
+    let mut broad = allowed.clone();
+    broad.include_hidden = true;
+    permissive.register_root(&broad).unwrap();
+    assert!(permissive.acquire_writer().unwrap());
+    permissive
+      .rebuild(&SearchConfig { roots: vec![broad] })
+      .unwrap();
+    let mut daemon = KuntuIndex::open_shared(home, false, "daemon").unwrap();
+    daemon.register_root(&allowed).unwrap();
+    let response = handle_request(
+      &mut daemon,
+      HttpRequest {
+        method: "POST".into(),
+        path: "/search".into(),
+        body: serde_json::to_vec(
+          &json!({"query":"file","roots":[root.to_string_lossy()],"include_hidden":true}),
+        )
+        .unwrap(),
+      },
+      &[allowed],
+    );
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("visible-file"));
+    assert!(!response.body.contains(".hidden-file"));
+  }
+}
+
+#[cfg(test)]
+mod connection_tests {
+  use super::*;
+  #[test]
+  fn sequential_private_requests_across_workers_release_idle_leases() {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").unwrap()).join(format!(
+      "private-worker-leases-{}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir_all(base.join("files")).unwrap();
+    std::fs::write(base.join("files/target.md"), "x").unwrap();
+    let db = base.join("index.db");
+    let root = SearchRoot::new(base.join("files"));
+    let body = serde_json::to_vec(&json!({"roots":[root.path]})).unwrap();
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path: db.clone(),
+      store_mode: StoreMode::Private,
+      addr: addr.clone(),
+      duration: None,
+      max_requests: Some(5),
+      allowed_roots: vec![root],
+      allow_non_loopback: false,
+    };
+    let server = thread::spawn(move || serve(config).unwrap());
+    let mut streams = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for endpoint in ["rebuild", "refresh", "rebuild", "refresh"] {
+      let mut stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(s) => break s,
+          Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+          Err(e) => panic!("daemon startup: {e}"),
+        }
+      };
+      stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+      write!(
+        stream,
+        "POST /index/{endpoint} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+      )
+      .unwrap();
+      streams.push(stream);
+    }
+    // Each incomplete body occupies a separate worker before the first write.
+    thread::sleep(Duration::from_millis(100));
+    let mut responses = Vec::new();
+    for mut stream in streams {
+      stream.write_all(&body).unwrap();
+      let mut response = String::new();
+      stream.read_to_string(&mut response).unwrap();
+      responses.push(response);
+    }
+    let mut external = KuntuIndex::open(&db).unwrap();
+    let external_acquired = external.acquire_writer().unwrap();
+    drop(external);
+    let mut final_request = TcpStream::connect(&addr).unwrap();
+    final_request
+      .write_all(b"GET /health HTTP/1.1\r\n\r\n")
+      .unwrap();
+    final_request.read_to_end(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    for (worker, response) in responses.iter().enumerate() {
+      assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "worker {worker}: {response}"
+      );
+    }
+    assert!(
+      external_acquired,
+      "idle private worker retained indexer.lock"
+    );
+  }
+  fn health_run(db_path: PathBuf, requests: usize, mode: StoreMode) -> (DaemonRunStats, Vec<f64>) {
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      store_mode: mode,
+      db_path,
+      addr: addr.clone(),
+      duration: None,
+      max_requests: Some(requests),
+      allowed_roots: vec![],
+      allow_non_loopback: false,
+    };
+    let worker = thread::spawn(move || serve(config).unwrap());
+    let mut samples = Vec::new();
+    for _ in 0..requests {
+      let deadline = Instant::now() + Duration::from_secs(10);
+      let start = Instant::now();
+      let mut stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(stream) => break stream,
+          Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+          Err(e) => panic!("daemon startup: {e}"),
+        }
+      };
+      stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+      stream.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+      let mut response = String::new();
+      stream.read_to_string(&mut response).unwrap();
+      assert!(response.contains("\"ok\":true"), "{response}");
+      samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    (worker.join().unwrap(), samples)
+  }
+  #[test]
+  fn health_requests_reuse_worker_reader_connections() {
+    let path = std::env::temp_dir().join(format!("daemon-pool-{}.sqlite", std::process::id()));
+    let (stats, _) = health_run(path, 16, StoreMode::Private);
+    assert!(
+      stats.reader_connections <= 4,
+      "opened {} readers for 16 requests",
+      stats.reader_connections
+    );
+  }
+  #[test]
+  #[ignore = "owner-supplied 1M shared-store copy; release latency evidence"]
+  fn million_store_daemon_health_latency() {
+    let path = PathBuf::from(std::env::var_os("KUNTU_HEALTH_DB").unwrap());
+    let (stats, samples) = health_run(path, 20, StoreMode::Shared);
+    eprintln!(
+      "M2_HEALTH reader_connections={} first_ms={:.3} warm_ms={:?}",
+      stats.reader_connections,
+      samples[0],
+      &samples[1..]
+    );
+  }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+  use super::*;
+  use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  };
+  fn pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    (listener.accept().unwrap().0, client)
+  }
+  fn active_private_scan(endpoint: &str, duration: Option<Duration>, budget: Duration) {
+    let base = PathBuf::from(std::env::var_os("KUNTU_TEST_DIR").unwrap()).join(format!(
+      "active-private-{endpoint}-{}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let root = base.join("files");
+    std::fs::create_dir_all(&root).unwrap();
+    // Real traversal and SQL work exceed both the shutdown and request budgets.
+    for n in 0..120_000 {
+      std::fs::write(root.join(format!("target-{n:05}.md")), "x").unwrap();
+    }
+    let db = base.join("index.db");
+    let seed = KuntuIndex::open(&db).unwrap();
+    let allowed = SearchRoot::new(&root);
+    seed.register_root(&allowed).unwrap();
+    drop(seed);
+    let observer = KuntuIndex::open_read_only(&db).unwrap();
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      db_path: db.clone(),
+      store_mode: StoreMode::Private,
+      addr: addr.clone(),
+      duration,
+      max_requests: if duration.is_some() { None } else { Some(1) },
+      allowed_roots: vec![allowed.clone()],
+      allow_non_loopback: false,
+    };
+    let start = Instant::now();
+    let server = thread::spawn(move || serve(config).unwrap());
+    let mut client = loop {
+      match TcpStream::connect(&addr) {
+        Ok(s) => break s,
+        Err(_) if start.elapsed() < Duration::from_secs(10) => {
+          thread::sleep(Duration::from_millis(1))
+        }
+        Err(e) => panic!("daemon startup: {e}"),
+      }
+    };
+    let body = serde_json::to_vec(&json!({"roots":[root]})).unwrap();
+    write!(
+      client,
+      "POST /index/{endpoint} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+      body.len()
+    )
+    .unwrap();
+    client.write_all(&body).unwrap();
+    while observer.root_state_name(&allowed.path).unwrap() != "building" {
+      assert!(start.elapsed() < budget, "scan never became active");
+      thread::sleep(Duration::from_millis(1));
+    }
+    let stats = server.join().unwrap();
+    let state = observer.root_state_name(&allowed.path).unwrap();
+    eprintln!(
+      "ACTIVE_SCAN endpoint={endpoint} elapsed_ms={} state={state}",
+      stats.elapsed_ms
+    );
+    assert!(
+      start.elapsed() < budget,
+      "active private scan delayed shutdown: {stats:?}"
+    );
+    assert_eq!(
+      state, "building",
+      "cancelled generation was published ready"
+    );
+    assert_eq!(
+      observer.doctor().unwrap(),
+      "ok",
+      "cancelled transaction did not roll back"
+    );
+    drop(observer);
+    let mut resumed = KuntuIndex::open(&db).unwrap();
+    assert!(
+      resumed.acquire_writer().unwrap(),
+      "cancelled scan retained its lease"
+    );
+    // A later request can finish the persisted generation.
+    std::fs::remove_dir_all(&allowed.path).unwrap();
+    std::fs::create_dir(&allowed.path).unwrap();
+    std::fs::write(allowed.path.join("resumed.md"), "x").unwrap();
+    resumed
+      .rebuild(&SearchConfig {
+        roots: vec![allowed.clone()],
+      })
+      .unwrap();
+    assert_eq!(resumed.root_state_name(&allowed.path).unwrap(), "ready");
+  }
+  #[test]
+  fn shutdown_reaches_an_active_private_rebuild() {
+    active_private_scan(
+      "rebuild",
+      Some(Duration::from_millis(300)),
+      Duration::from_secs(1),
+    );
+  }
+  #[test]
+  fn request_deadline_reaches_an_active_private_refresh() {
+    active_private_scan("refresh", None, Duration::from_millis(2500));
+  }
+  #[test]
+  fn trickled_input_cannot_extend_the_absolute_request_deadline() {
+    let (mut server, mut client) = pair();
+    let trickler = thread::spawn(move || {
+      let end = Instant::now() + Duration::from_secs(3);
+      while Instant::now() < end {
+        if client.write_all(b"x").is_err() {
+          break;
+        }
+        thread::sleep(Duration::from_millis(30));
+      }
+    });
+    let start = Instant::now();
+    assert!(read_http_request(&mut server).is_err());
+    let elapsed = start.elapsed();
+    drop(server);
+    trickler.join().unwrap();
+    assert!(
+      elapsed < Duration::from_millis(2500),
+      "trickled read took {elapsed:?}"
+    );
+  }
+  #[test]
+  fn stalled_response_writes_have_an_absolute_deadline() {
+    let (mut server, client) = pair();
+    let blocked = thread::spawn(move || {
+      thread::sleep(Duration::from_secs(3));
+      drop(client);
+    });
+    let response = HttpResponse {
+      status: 200,
+      body: "x".repeat(64 * 1024 * 1024),
+    };
+    let start = Instant::now();
+    assert!(write_http_response(&mut server, &response).is_err());
+    let elapsed = start.elapsed();
+    drop(server);
+    blocked.join().unwrap();
+    assert!(
+      elapsed < Duration::from_millis(2500),
+      "stalled write took {elapsed:?}"
+    );
+  }
+  #[test]
+  fn shutdown_cancels_busy_workers_and_full_queue_submission() {
+    let addr = TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .to_string();
+    let config = DaemonConfig {
+      store_mode: StoreMode::Private,
+      db_path: std::env::temp_dir().join(format!("daemon-shutdown-{}.sqlite", std::process::id())),
+      addr: addr.clone(),
+      duration: Some(Duration::from_millis(250)),
+      max_requests: None,
+      allowed_roots: vec![],
+      allow_non_loopback: false,
+    };
+    let (done, result) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+      done.send(serve(config)).unwrap();
+    });
+    let start = Instant::now();
+    let mut clients = Vec::new();
+    for _ in 0..14 {
+      let stream = loop {
+        match TcpStream::connect(&addr) {
+          Ok(stream) => break stream,
+          Err(_) if start.elapsed() < Duration::from_secs(5) => {
+            thread::sleep(Duration::from_millis(1))
+          }
+          Err(e) => panic!("connect: {e}"),
+        }
+      };
+      let mut stream = stream;
+      stream.write_all(b"x").unwrap();
+      clients.push(stream);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let trickle_stop = stop.clone();
+    let trickler = thread::spawn(move || {
+      while !trickle_stop.load(Ordering::Relaxed) {
+        for stream in &mut clients {
+          let _ = stream.write_all(b"x");
+        }
+        thread::sleep(Duration::from_millis(20));
+      }
+    });
+    let timely = result.recv_timeout(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    trickler.join().unwrap();
+    server.join().unwrap();
+    let stats = timely
+      .expect("shutdown blocked behind occupied workers/full queue")
+      .unwrap();
+    eprintln!("SHUTDOWN stats={stats:?}");
+    assert!(
+      stats.requests >= 12,
+      "did not fill four workers and eight queue slots: {stats:?}"
+    );
+    assert!(stats.elapsed_ms < 1000, "{stats:?}");
   }
 }
