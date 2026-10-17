@@ -577,6 +577,7 @@ impl std::fmt::Display for PolicyFailure {
   }
 }
 impl std::error::Error for PolicyFailure {}
+#[cfg_attr(not(unix), allow(dead_code))]
 fn policy_error(reason: &'static str, message: &str) -> io::Error {
   io::Error::other(PolicyFailure {
     reason,
@@ -1305,6 +1306,7 @@ mod tests {
       fs::create_dir_all(&path).unwrap();
       Self(fs::canonicalize(path).unwrap())
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn file(&self, name: &str, size: usize) -> PathBuf {
       let path = self.0.join(name);
       fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1501,6 +1503,7 @@ mod tests {
     metadata_calls: AtomicU64,
     directory_calls: Mutex<Vec<PathBuf>>,
     fail_guard: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     replace_parent: Option<PathBuf>,
   }
   impl ObservedBackend {
