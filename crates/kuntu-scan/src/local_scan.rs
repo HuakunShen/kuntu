@@ -577,6 +577,7 @@ impl std::fmt::Display for PolicyFailure {
   }
 }
 impl std::error::Error for PolicyFailure {}
+#[cfg_attr(not(unix), allow(dead_code))]
 fn policy_error(reason: &'static str, message: &str) -> io::Error {
   io::Error::other(PolicyFailure {
     reason,
@@ -1163,11 +1164,15 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
             .size
             .saturating_add(node.children.iter().map(|child| child.size).sum::<u64>());
           node.logical_size = node.children.iter().map(|child| child.logical_size).sum();
-          if node
-            .children
-            .iter()
-            .any(|child| child.scan_state != "complete")
-          {
+          // A symbolic link is deliberately never followed, so it cannot make
+          // its parent's measurement incomplete: the folder's size is exactly
+          // what a whole-folder cleanup would remove. Without this rule every
+          // pnpm/yarn `node_modules` (full of workspace links) was `partial`
+          // and could never be staged as a folder.
+          if node.children.iter().any(|child| {
+            child.scan_state != "complete"
+              && !(child.scan_state == "skipped" && child.skip_reason.as_deref() == Some("symlink"))
+          }) {
             node.scan_state = "partial".into();
           }
           // Preserve ignored descendants for safe discovery from this report;
@@ -1301,6 +1306,7 @@ mod tests {
       fs::create_dir_all(&path).unwrap();
       Self(fs::canonicalize(path).unwrap())
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn file(&self, name: &str, size: usize) -> PathBuf {
       let path = self.0.join(name);
       fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1414,6 +1420,8 @@ mod tests {
       .children
       .iter()
       .any(|node| node.skip_reason.as_deref() == Some("symlink")));
+    // The skipped link is not an incompleteness of the folder holding it.
+    assert_eq!(report.nodes[0].scan_state, "complete");
     let mut options = fixture.options();
     options.directories = vec![fixture.0.join("link/file")];
     let report = scan_local_directory(options).unwrap();
@@ -1495,6 +1503,7 @@ mod tests {
     metadata_calls: AtomicU64,
     directory_calls: Mutex<Vec<PathBuf>>,
     fail_guard: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     replace_parent: Option<PathBuf>,
   }
   impl ObservedBackend {
