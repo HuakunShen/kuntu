@@ -4,7 +4,7 @@ use crate::{IgnoredMode, ScanNode, ScanOptions};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(unix)]
 use std::fs;
 use std::io;
@@ -70,6 +70,10 @@ pub struct ScanCoverage {
   pub files: u64,
   pub directories: u64,
   pub skipped_count: u64,
+  /// `skipped_count` split by skip reason (`symlink`, `permission-denied`,
+  /// `mount-boundary`, ...); the values sum to `skipped_count`.
+  #[serde(default)]
+  pub skipped_by_reason: BTreeMap<String, u64>,
   pub denied_count: u64,
   pub issue_count: u64,
   pub issues_truncated: bool,
@@ -704,6 +708,7 @@ struct Stats {
   progress: LocalScanProgress,
   issues: Vec<ScanIssue>,
   issue_count: u64,
+  skipped_by_reason: BTreeMap<String, u64>,
   last_emit: Option<Instant>,
 }
 struct WalkContext<'a, B, F> {
@@ -723,6 +728,7 @@ impl<B: Backend, F: Fn(LocalScanProgress) + Sync> WalkContext<'_, B, F> {
     let mut stats = self.stats.lock().unwrap();
     stats.issue_count += 1;
     stats.progress.skipped_count += 1;
+    *stats.skipped_by_reason.entry(reason.into()).or_default() += 1;
     if reason == "permission-denied" {
       stats.progress.denied_count += 1;
     }
@@ -760,7 +766,16 @@ impl<B: Backend, F: Fn(LocalScanProgress) + Sync> WalkContext<'_, B, F> {
     reason: &str,
     message: impl Into<String>,
   ) -> LocalScanNode {
-    self.issue(path, reason, message);
+    if reason == "symlink" {
+      // Links are never followed by design, so a link is counted but is not
+      // an issue: thousands of them would crowd real problems out of the
+      // bounded issue list.
+      let mut stats = self.stats.lock().unwrap();
+      stats.progress.skipped_count += 1;
+      *stats.skipped_by_reason.entry(reason.into()).or_default() += 1;
+    } else {
+      self.issue(path, reason, message);
+    }
     self.emit(Some(path), false);
     let mut node = new_node(path, depth, self.options.full_path);
     node.is_directory = directory;
@@ -835,6 +850,7 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         progress: LocalScanProgress::default(),
         issues: Vec::new(),
         issue_count: 0,
+        skipped_by_reason: BTreeMap::new(),
         last_emit: None,
       }),
       seen_files: Mutex::new(HashSet::new()),
@@ -900,6 +916,7 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         files: stats.progress.files,
         directories: stats.progress.directories,
         skipped_count: stats.progress.skipped_count,
+        skipped_by_reason: stats.skipped_by_reason,
         denied_count: stats.progress.denied_count,
         issue_count: stats.issue_count,
         issues_truncated: stats.issue_count > ISSUE_LIMIT as u64,
@@ -1389,6 +1406,10 @@ mod tests {
       report.nodes[0].children[0].skip_reason.as_deref(),
       Some("cloud-root")
     );
+    assert_eq!(
+      report.coverage.skipped_by_reason.get("cloud-root"),
+      Some(&1)
+    );
     let paths = (0..250)
       .map(|ix| fixture.0.join(format!("missing{ix}")))
       .collect();
@@ -1420,6 +1441,11 @@ mod tests {
       .children
       .iter()
       .any(|node| node.skip_reason.as_deref() == Some("symlink")));
+    // Counted by reason, but a by-design skip is not reported as an issue.
+    assert_eq!(report.coverage.skipped_count, 1);
+    assert_eq!(report.coverage.skipped_by_reason.get("symlink"), Some(&1));
+    assert_eq!(report.coverage.issue_count, 0);
+    assert!(report.coverage.issues.is_empty());
     // The skipped link is not an incompleteness of the folder holding it.
     assert_eq!(report.nodes[0].scan_state, "complete");
     let mut options = fixture.options();
