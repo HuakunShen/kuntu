@@ -24,7 +24,8 @@ pub use clean::{
 };
 pub use git::{find_dirty_git_repos, DirtyGitRepo, DirtyGitRepoOptions};
 pub use local_scan::{
-  scan_local_directory, scan_local_directory_with_progress, LocalScanCancellation, LocalScanNode,
-  LocalScanProgress, LocalScanReport, ScanCoverage, ScanIssue, ScanVolume,
+  scan_local_directory, scan_local_directory_fold, scan_local_directory_with_progress,
+  LocalScanCancellation, LocalScanEntry, LocalScanFold, LocalScanNode, LocalScanProgress,
+  LocalScanReport, LocalScanVisitor, ScanCoverage, ScanIssue, ScanVolume,
 };
 pub use scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};

@@ -50,6 +50,77 @@ impl From<LocalScanNode> for ScanNode {
   }
 }
 
+/// One entry the protected walk has finished, handed to a
+/// [`LocalScanVisitor`] after all of its children.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalScanEntry<'a> {
+  pub path: &'a Path,
+  pub depth: u32,
+  /// Allocated bytes including every child; hard-linked blocks count once.
+  pub size: u64,
+  pub logical_size: u64,
+  pub is_directory: bool,
+  pub ignored: bool,
+  /// `complete`, `partial` or `skipped`.
+  pub scan_state: &'static str,
+  pub skip_reason: Option<&'static str>,
+}
+
+/// Folds the protected walk into a caller-owned structure while it runs, so
+/// a consumer never holds a whole [`LocalScanNode`] tree. A full-disk walk
+/// has millions of entries; at a few hundred bytes per `LocalScanNode` the
+/// tree alone outweighs most compact indexes built from it.
+///
+/// `visit` runs on the walker's threads, concurrently and with dataless
+/// materialization disabled. An entry is visited after all of its children,
+/// which arrive sorted largest first, then by path. A failed or cancelled
+/// walk returns an error and drops the nodes visited so far, but anything
+/// `visit` recorded elsewhere stays recorded.
+pub trait LocalScanVisitor: Sync {
+  type Node: Send;
+  fn visit(&self, entry: LocalScanEntry<'_>, children: Vec<Self::Node>) -> Self::Node;
+}
+
+/// [`LocalScanReport`] with the roots folded by a [`LocalScanVisitor`].
+#[derive(Debug)]
+pub struct LocalScanFold<T> {
+  pub nodes: Vec<T>,
+  pub coverage: ScanCoverage,
+  pub volumes: Vec<ScanVolume>,
+}
+
+/// The visitor behind [`scan_local_directory`]: builds `LocalScanNode`s.
+struct NodeTree {
+  full_path: bool,
+}
+impl LocalScanVisitor for NodeTree {
+  type Node = LocalScanNode;
+  fn visit(&self, entry: LocalScanEntry<'_>, children: Vec<LocalScanNode>) -> LocalScanNode {
+    let path = entry.path;
+    LocalScanNode {
+      name: if self.full_path {
+        path.to_string_lossy().into_owned()
+      } else {
+        path
+          .file_name()
+          .unwrap_or(path.as_os_str())
+          .to_string_lossy()
+          .into_owned()
+      },
+      path: path.to_path_buf(),
+      size: entry.size,
+      children,
+      depth: entry.depth,
+      ignored: entry.ignored,
+      collapsed: false,
+      logical_size: entry.logical_size,
+      is_directory: entry.is_directory,
+      scan_state: entry.scan_state.into(),
+      skip_reason: entry.skip_reason.map(Into::into),
+    }
+  }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanIssue {
@@ -210,6 +281,7 @@ impl Drop for PolicyGuard {
 struct Facts {
   device: u64,
   inode: u64,
+  links: u64,
   allocated: u64,
   logical: u64,
   directory: bool,
@@ -631,10 +703,15 @@ fn facts_from_stat(stats: &libc::stat) -> Facts {
   #[cfg(not(target_os = "macos"))]
   let dataless = false;
   #[allow(clippy::unnecessary_cast)]
-  let (device, inode) = (stats.st_dev as u64, stats.st_ino as u64);
+  let (device, inode, links) = (
+    stats.st_dev as u64,
+    stats.st_ino as u64,
+    stats.st_nlink as u64,
+  );
   Facts {
     device,
     inode,
+    links,
     allocated: (stats.st_blocks.max(0) as u64).saturating_mul(512),
     logical: stats.st_size.max(0) as u64,
     directory: stats.st_mode & libc::S_IFMT == libc::S_IFDIR,
@@ -711,6 +788,27 @@ struct Stats {
   skipped_by_reason: BTreeMap<String, u64>,
   last_emit: Option<Instant>,
 }
+
+const SEEN_SHARDS: usize = 64;
+
+/// (device, inode) pairs already measured, split over many small tables.
+/// One table of millions of entries would grow by rehashing into ever larger
+/// blocks, and macOS keeps such freed blocks resident in its large-allocation
+/// cache long after the scan; shards stay small and also spread the locking.
+type SeenShard = Mutex<HashSet<(u64, u64)>>;
+struct SeenInodes(Box<[SeenShard]>);
+impl SeenInodes {
+  fn new() -> Self {
+    Self((0..SEEN_SHARDS).map(|_| Mutex::default()).collect())
+  }
+  /// True when the pair was not recorded before.
+  fn insert(&self, device: u64, inode: u64) -> bool {
+    let mixed = (inode ^ device.rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let shard = (mixed >> (64 - SEEN_SHARDS.trailing_zeros())) as usize;
+    self.0[shard].lock().unwrap().insert((device, inode))
+  }
+}
+
 struct WalkContext<'a, B, F> {
   options: &'a ScanOptions,
   backend: &'a B,
@@ -718,11 +816,78 @@ struct WalkContext<'a, B, F> {
   progress: &'a F,
   started: Instant,
   stats: Mutex<Stats>,
-  seen_files: Mutex<HashSet<(u64, u64)>>,
-  seen_dirs: Mutex<HashSet<(u64, u64)>>,
+  /// Only files with more than one link: no other file can be met twice.
+  seen_files: SeenInodes,
+  seen_dirs: SeenInodes,
   cloud_roots: Vec<PathBuf>,
   selected_roots: HashSet<PathBuf>,
 }
+
+/// What one entry folds to, apart from its path, depth and children.
+struct Shape {
+  size: u64,
+  logical_size: u64,
+  is_directory: bool,
+  ignored: bool,
+  scan_state: &'static str,
+  skip_reason: Option<&'static str>,
+}
+impl Shape {
+  fn new(is_directory: bool) -> Self {
+    Self {
+      size: 0,
+      logical_size: 0,
+      is_directory,
+      ignored: false,
+      scan_state: "complete",
+      skip_reason: None,
+    }
+  }
+}
+
+/// The parts of a visited child its parent's own fold needs.
+#[derive(Clone, Copy)]
+struct Folded {
+  size: u64,
+  logical_size: u64,
+  /// The child leaves its parent `partial`.
+  incomplete: bool,
+}
+
+fn fold<V: LocalScanVisitor>(
+  visitor: &V,
+  path: &Path,
+  depth: u32,
+  shape: Shape,
+  children: Vec<V::Node>,
+) -> (V::Node, Folded) {
+  let folded = Folded {
+    size: shape.size,
+    logical_size: shape.logical_size,
+    // A symbolic link is deliberately never followed, so it cannot make
+    // its parent's measurement incomplete: the folder's size is exactly
+    // what a whole-folder cleanup would remove. Without this rule every
+    // pnpm/yarn `node_modules` (full of workspace links) was `partial`
+    // and could never be staged as a folder.
+    incomplete: shape.scan_state != "complete"
+      && !(shape.scan_state == "skipped" && shape.skip_reason == Some("symlink")),
+  };
+  let node = visitor.visit(
+    LocalScanEntry {
+      path,
+      depth,
+      size: shape.size,
+      logical_size: shape.logical_size,
+      is_directory: shape.is_directory,
+      ignored: shape.ignored,
+      scan_state: shape.scan_state,
+      skip_reason: shape.skip_reason,
+    },
+    children,
+  );
+  (node, folded)
+}
+
 impl<B: Backend, F: Fn(LocalScanProgress) + Sync> WalkContext<'_, B, F> {
   fn issue(&self, path: &Path, reason: &str, message: impl Into<String>) {
     let mut stats = self.stats.lock().unwrap();
@@ -761,11 +926,10 @@ impl<B: Backend, F: Fn(LocalScanProgress) + Sync> WalkContext<'_, B, F> {
   fn skipped(
     &self,
     path: &Path,
-    depth: u32,
     directory: bool,
-    reason: &str,
+    reason: &'static str,
     message: impl Into<String>,
-  ) -> LocalScanNode {
+  ) -> Shape {
     if reason == "symlink" {
       // Links are never followed by design, so a link is counted but is not
       // an issue: thousands of them would crowd real problems out of the
@@ -777,11 +941,10 @@ impl<B: Backend, F: Fn(LocalScanProgress) + Sync> WalkContext<'_, B, F> {
       self.issue(path, reason, message);
     }
     self.emit(Some(path), false);
-    let mut node = new_node(path, depth, self.options.full_path);
-    node.is_directory = directory;
-    node.scan_state = "skipped".into();
-    node.skip_reason = Some(reason.into());
-    node
+    let mut shape = Shape::new(directory);
+    shape.scan_state = "skipped";
+    shape.skip_reason = Some(reason);
+    shape
   }
 }
 
@@ -794,6 +957,26 @@ pub fn scan_local_directory_with_progress<F: Fn(LocalScanProgress) + Send + Sync
   cancellation: LocalScanCancellation,
   progress: F,
 ) -> io::Result<LocalScanReport> {
+  let visitor = NodeTree {
+    full_path: options.full_path,
+  };
+  scan_local_directory_fold(options, cancellation, progress, &visitor).map(LocalScanReport::from)
+}
+
+/// The protected walk of [`scan_local_directory_with_progress`], folded by
+/// `visitor` as subtrees finish instead of returned as a `LocalScanNode`
+/// tree. `options.full_path` only shapes the default tree's names; a
+/// visitor reads whatever it needs from each entry's path.
+pub fn scan_local_directory_fold<V, F>(
+  options: ScanOptions,
+  cancellation: LocalScanCancellation,
+  progress: F,
+  visitor: &V,
+) -> io::Result<LocalScanFold<V::Node>>
+where
+  V: LocalScanVisitor,
+  F: Fn(LocalScanProgress) + Send + Sync,
+{
   let guard = PolicyGuard::enter()?; // Before mount-table lookup or current_dir.
   let result = (|| {
     cancellation.check()?;
@@ -805,17 +988,41 @@ pub fn scan_local_directory_with_progress<F: Fn(LocalScanProgress) + Send + Sync
       .num_threads(threads)
       .build()
       .map_err(io::Error::other)?;
-    pool.install(|| scan_with_backend(&options, &cancellation, &progress, &backend))
+    pool.install(|| fold_with_backend(&options, &cancellation, &progress, &backend, visitor))
   })();
   guard.finish(result)
 }
 
+impl From<LocalScanFold<LocalScanNode>> for LocalScanReport {
+  fn from(fold: LocalScanFold<LocalScanNode>) -> Self {
+    Self {
+      nodes: fold.nodes,
+      coverage: fold.coverage,
+      volumes: fold.volumes,
+    }
+  }
+}
+
+#[cfg(test)]
 fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
   options: &ScanOptions,
   cancellation: &LocalScanCancellation,
   progress: &F,
   backend: &B,
 ) -> io::Result<LocalScanReport> {
+  let visitor = NodeTree {
+    full_path: options.full_path,
+  };
+  fold_with_backend(options, cancellation, progress, backend, &visitor).map(LocalScanReport::from)
+}
+
+fn fold_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync, V: LocalScanVisitor>(
+  options: &ScanOptions,
+  cancellation: &LocalScanCancellation,
+  progress: &F,
+  backend: &B,
+  visitor: &V,
+) -> io::Result<LocalScanFold<V::Node>> {
   let guard = backend.enter()?;
   let result = (|| {
     cancellation.check()?;
@@ -853,8 +1060,8 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         skipped_by_reason: BTreeMap::new(),
         last_emit: None,
       }),
-      seen_files: Mutex::new(HashSet::new()),
-      seen_dirs: Mutex::new(HashSet::new()),
+      seen_files: SeenInodes::new(),
+      seen_dirs: SeenInodes::new(),
       cloud_roots,
       selected_roots: unique,
     };
@@ -863,44 +1070,49 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
     let mut volumes = Vec::new();
     let mut seen_volumes = HashSet::new();
     let mut nodes = Vec::new();
+    let mut logical_bytes = 0u64;
     for root in roots {
       cancellation.check()?;
-      if cloud_path(&root, &context.cloud_roots) {
-        nodes.push(context.skipped(
+      let (node, folded) = if cloud_path(&root, &context.cloud_roots) {
+        let shape = context.skipped(
           &root,
-          0,
           false,
           "cloud-root",
           "known cloud domain excluded before metadata",
-        ));
-        continue;
-      }
-      let opened = match backend.root(&root, cancellation) {
-        Ok(opened) => opened,
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
-        Err(error) => {
-          nodes.push(context.skipped(&root, 0, false, error_reason(&error), error.to_string()));
-          continue;
+        );
+        fold(visitor, &root, 0, shape, Vec::new())
+      } else {
+        match backend.root(&root, cancellation) {
+          Ok(opened) => {
+            let device = opened.facts.device;
+            if seen_volumes.insert(device) {
+              volumes.push(opened.volume.clone());
+            }
+            walk(
+              &root,
+              device,
+              0,
+              &[],
+              false,
+              &context,
+              visitor,
+              Access::Root(opened),
+            )?
+          }
+          Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+          Err(error) => {
+            let shape = context.skipped(&root, false, error_reason(&error), error.to_string());
+            fold(visitor, &root, 0, shape, Vec::new())
+          }
         }
       };
-      let device = opened.facts.device;
-      if seen_volumes.insert(device) {
-        volumes.push(opened.volume.clone());
-      }
-      nodes.push(walk(
-        &root,
-        device,
-        0,
-        &[],
-        false,
-        &context,
-        Access::Root(opened),
-      )?);
+      logical_bytes += folded.logical_size;
+      nodes.push(node);
     }
     cancellation.check()?;
     context.emit(None, true);
     let stats = context.stats.into_inner().unwrap();
-    Ok(LocalScanReport {
+    Ok(LocalScanFold {
       nodes,
       volumes,
       coverage: ScanCoverage {
@@ -912,7 +1124,7 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         }
         .into(),
         size_metric: "allocated".into(),
-        logical_bytes: 0,
+        logical_bytes,
         files: stats.progress.files,
         directories: stats.progress.directories,
         skipped_count: stats.progress.skipped_count,
@@ -925,28 +1137,27 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
       },
     })
   })();
-  guard.finish(result).map(|mut report| {
-    report.coverage.logical_bytes = report.nodes.iter().map(|node| node.logical_size).sum();
-    report
-  })
+  guard.finish(result)
 }
 
-fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
+#[allow(clippy::too_many_arguments)]
+fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync, V: LocalScanVisitor>(
   path: &Path,
   device: u64,
   depth: u32,
   stack: &[Arc<Gitignore>],
   inherited_ignored: bool,
   context: &WalkContext<'_, B, F>,
+  visitor: &V,
   access: Access,
-) -> io::Result<LocalScanNode> {
+) -> io::Result<(V::Node, Folded)> {
   let guard = context.backend.enter()?;
   let result = (|| {
     context.cancellation.check()?;
+    let leaf = |shape: Shape| Ok(fold(visitor, path, depth, shape, Vec::new()));
     if cloud_path(path, &context.cloud_roots) {
-      return Ok(context.skipped(
+      return leaf(context.skipped(
         path,
-        depth,
         false,
         "cloud-root",
         "known cloud domain excluded before metadata",
@@ -958,9 +1169,8 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with('.'))
     {
-      return Ok(context.skipped(
+      return leaf(context.skipped(
         path,
-        depth,
         false,
         "hidden",
         "hidden entry excluded by scan options",
@@ -971,41 +1181,32 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
       Access::Child(parent) => match context.backend.metadata(path, parent) {
         Ok(facts) => facts,
         Err(error) => {
-          return Ok(context.skipped(path, depth, false, error_reason(&error), error.to_string()))
+          return leaf(context.skipped(path, false, error_reason(&error), error.to_string()))
         }
       },
     };
     if facts.symlink {
-      return Ok(context.skipped(
-        path,
-        depth,
-        false,
-        "symlink",
-        "symbolic links are never followed",
-      ));
+      return leaf(context.skipped(path, false, "symlink", "symbolic links are never followed"));
     }
     if facts.dataless {
-      return Ok(context.skipped(
+      return leaf(context.skipped(
         path,
-        depth,
         facts.directory,
         "dataless",
         "dataless item excluded; materialization is disabled",
       ));
     }
     if facts.device != device {
-      return Ok(context.skipped(
+      return leaf(context.skipped(
         path,
-        depth,
         facts.directory,
         "mount-boundary",
         "child filesystem requires a separate root scan",
       ));
     }
     if !facts.directory && !facts.file {
-      return Ok(context.skipped(
+      return leaf(context.skipped(
         path,
-        depth,
         false,
         "special-file",
         "only regular files and directories are measured",
@@ -1021,26 +1222,18 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
       }
     }
     if ignored && context.options.ignored_mode == IgnoredMode::Exclude {
-      let mut node = context.skipped(
+      let mut shape = context.skipped(
         path,
-        depth,
         facts.directory,
         "gitignored",
         "gitignored entry excluded by scan options",
       );
-      node.ignored = true;
-      return Ok(node);
+      shape.ignored = true;
+      return leaf(shape);
     }
-    if facts.directory
-      && !context
-        .seen_dirs
-        .lock()
-        .unwrap()
-        .insert((facts.device, facts.inode))
-    {
-      return Ok(context.skipped(
+    if facts.directory && !context.seen_dirs.insert(facts.device, facts.inode) {
+      return leaf(context.skipped(
         path,
-        depth,
         true,
         "duplicate-directory",
         "directory inode was already visited",
@@ -1052,29 +1245,23 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         Access::Child(parent) => match context.backend.directory(path, &parent, facts) {
           Ok(directory) => directory,
           Err(error) => {
-            return Ok(context.skipped(path, depth, true, error_reason(&error), error.to_string()))
+            return leaf(context.skipped(path, true, error_reason(&error), error.to_string()))
           }
         },
       })
     } else {
       None
     };
-    let allocated = if facts.file
-      && !context
-        .seen_files
-        .lock()
-        .unwrap()
-        .insert((facts.device, facts.inode))
-    {
-      0
-    } else {
-      facts.allocated
-    };
-    let mut node = new_node(path, depth, context.options.full_path);
-    node.size = allocated;
-    node.logical_size = if facts.file { facts.logical } else { 0 };
-    node.is_directory = facts.directory;
-    node.ignored = ignored;
+    let allocated =
+      if facts.file && facts.links > 1 && !context.seen_files.insert(facts.device, facts.inode) {
+        0
+      } else {
+        facts.allocated
+      };
+    let mut shape = Shape::new(facts.directory);
+    shape.size = allocated;
+    shape.logical_size = if facts.file { facts.logical } else { 0 };
+    shape.ignored = ignored;
     {
       let mut stats = context.stats.lock().unwrap();
       stats.progress.entries_scanned += 1;
@@ -1087,6 +1274,7 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
     }
     context.emit(Some(path), false);
     context.cancellation.check()?;
+    let mut children = Vec::new();
     if let Some(directory) = directory {
       let mut rules = stack.to_vec();
       if context.options.respect_gitignore && !ignored {
@@ -1107,20 +1295,20 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
                 for line in text.lines() {
                   if let Err(error) = builder.add_line(Some(ignore_path.clone()), line) {
                     context.issue(&ignore_path, "gitignore-error", error.to_string());
-                    node.scan_state = "partial".into();
+                    shape.scan_state = "partial";
                   }
                 }
                 match builder.build() {
                   Ok(ruleset) => rules.push(Arc::new(ruleset)),
                   Err(error) => {
                     context.issue(&ignore_path, "gitignore-error", error.to_string());
-                    node.scan_state = "partial".into();
+                    shape.scan_state = "partial";
                   }
                 }
               }
               Err(error) => {
                 context.issue(&ignore_path, error_reason(&error), error.to_string());
-                node.scan_state = "partial".into();
+                shape.scan_state = "partial";
               }
             }
           }
@@ -1130,13 +1318,13 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
               "dataless",
               "dataless ignore rules were not opened",
             );
-            node.scan_state = "partial".into();
+            shape.scan_state = "partial";
           }
           Ok(_) => {}
           Err(error) if error.kind() == io::ErrorKind::NotFound => {}
           Err(error) => {
             context.issue(&ignore_path, error_reason(&error), error.to_string());
-            node.scan_state = "partial".into();
+            shape.scan_state = "partial";
           }
         }
       }
@@ -1150,17 +1338,17 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
             match entry {
               Ok(child) if context.selected_roots.contains(&child) => {
                 context.issue(&child, "separate-root", "explicitly selected root is scanned separately, without a duplicate child placeholder");
-                node.scan_state = "partial".into();
+                shape.scan_state = "partial";
               }
               Ok(child) => paths.push(child),
               Err(error) => {
                 context.issue(path, error_reason(&error), error.to_string());
-                node.scan_state = "partial".into();
-                node.skip_reason = Some(error_reason(&error).into());
+                shape.scan_state = "partial";
+                shape.skip_reason = Some(error_reason(&error));
               }
             }
           }
-          node.children = paths
+          let mut visited = paths
             .into_par_iter()
             .map(|path| {
               walk(
@@ -1170,66 +1358,37 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
                 &rules,
                 ignored,
                 context,
+                visitor,
                 Access::Child(directory.clone()),
               )
+              .map(|(node, folded)| (path, node, folded))
             })
             .collect::<io::Result<Vec<_>>>()?;
-          node
-            .children
-            .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
-          node.size = node
-            .size
-            .saturating_add(node.children.iter().map(|child| child.size).sum::<u64>());
-          node.logical_size = node.children.iter().map(|child| child.logical_size).sum();
-          // A symbolic link is deliberately never followed, so it cannot make
-          // its parent's measurement incomplete: the folder's size is exactly
-          // what a whole-folder cleanup would remove. Without this rule every
-          // pnpm/yarn `node_modules` (full of workspace links) was `partial`
-          // and could never be staged as a folder.
-          if node.children.iter().any(|child| {
-            child.scan_state != "complete"
-              && !(child.scan_state == "skipped" && child.skip_reason.as_deref() == Some("symlink"))
-          }) {
-            node.scan_state = "partial".into();
+          visited.sort_by(|a, b| b.2.size.cmp(&a.2.size).then_with(|| a.0.cmp(&b.0)));
+          for (_, _, child) in &visited {
+            shape.size = shape.size.saturating_add(child.size);
+            shape.logical_size += child.logical_size;
+            if child.incomplete {
+              shape.scan_state = "partial";
+            }
           }
+          // Not an in-place collect: that would keep the wider tuple buffer.
+          children.reserve_exact(visited.len());
+          children.extend(visited.into_iter().map(|(_, node, _)| node));
           // Preserve ignored descendants for safe discovery from this report;
           // summarize measures them without requiring a second filesystem walk.
         }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
         Err(error) => {
           context.issue(path, error_reason(&error), error.to_string());
-          node.scan_state = "partial".into();
-          node.skip_reason = Some(error_reason(&error).into());
+          shape.scan_state = "partial";
+          shape.skip_reason = Some(error_reason(&error));
         }
       }
     }
-    Ok(node)
+    Ok(fold(visitor, path, depth, shape, children))
   })();
   guard.finish(result)
-}
-
-fn new_node(path: &Path, depth: u32, full_path: bool) -> LocalScanNode {
-  LocalScanNode {
-    name: if full_path {
-      path.to_string_lossy().into_owned()
-    } else {
-      path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
-    },
-    path: path.to_path_buf(),
-    size: 0,
-    children: Vec::new(),
-    depth,
-    ignored: false,
-    collapsed: false,
-    logical_size: 0,
-    is_directory: false,
-    scan_state: "complete".into(),
-    skip_reason: None,
-  }
 }
 
 fn normalize(path: &Path, cwd: &Path) -> PathBuf {
@@ -1378,6 +1537,71 @@ mod tests {
     assert_eq!(report.nodes[0].size, expected);
     assert_eq!(report.coverage.logical_bytes, 16 * 1024 * 1024 + 16384);
     assert!(report.nodes[0].logical_size > report.nodes[0].size);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_visitor_folds_the_same_tree_post_order_without_building_nodes() {
+    struct Recorder(Mutex<Vec<(PathBuf, u64, u64, &'static str)>>);
+    impl LocalScanVisitor for Recorder {
+      /// Entries in the subtree.
+      type Node = usize;
+      fn visit(&self, entry: LocalScanEntry<'_>, children: Vec<usize>) -> usize {
+        self.0.lock().unwrap().push((
+          entry.path.to_path_buf(),
+          entry.size,
+          entry.logical_size,
+          entry.scan_state,
+        ));
+        1 + children.iter().sum::<usize>()
+      }
+    }
+    let fixture = Fixture::new();
+    let file = fixture.file("a", 8192);
+    fs::hard_link(&file, fixture.0.join("a-again")).unwrap();
+    fixture.file("dir/b", 1);
+    fixture.file("dir/sub/c", 4096);
+    std::os::unix::fs::symlink(fixture.0.join("dir"), fixture.0.join("link")).unwrap();
+    let report = scan_local_directory(fixture.options()).unwrap();
+    let recorder = Recorder(Mutex::new(Vec::new()));
+    let folded = scan_local_directory_fold(
+      fixture.options(),
+      LocalScanCancellation::default(),
+      |_| {},
+      &recorder,
+    )
+    .unwrap();
+    let visited = recorder.0.into_inner().unwrap();
+    fn flatten(node: &LocalScanNode, out: &mut Vec<(PathBuf, u64, u64, String)>) {
+      out.push((
+        node.path.clone(),
+        node.size,
+        node.logical_size,
+        node.scan_state.clone(),
+      ));
+      for child in &node.children {
+        flatten(child, out);
+      }
+    }
+    let mut expected = Vec::new();
+    flatten(&report.nodes[0], &mut expected);
+    assert_eq!(folded.nodes, vec![expected.len()]);
+    let mut seen: Vec<_> = visited
+      .iter()
+      .map(|(path, size, logical, state)| (path.clone(), *size, *logical, state.to_string()))
+      .collect();
+    seen.sort();
+    expected.sort();
+    assert_eq!(seen, expected);
+    // Each entry is visited after every entry below it.
+    for (position, (path, ..)) in visited.iter().enumerate() {
+      assert!(visited[position + 1..]
+        .iter()
+        .all(|(later, ..)| !later.starts_with(path) || later == path));
+    }
+    assert_eq!(folded.coverage.files, report.coverage.files);
+    assert_eq!(folded.coverage.logical_bytes, report.coverage.logical_bytes);
+    assert_eq!(folded.coverage.skipped_count, 1);
   }
 
   #[test]
