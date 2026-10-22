@@ -39,6 +39,7 @@ scan/clean/iCloud-eviction half moved here from
   predicates — it full-scans the terms table, so a miss costs ~7.5 s at 1M
   rows (pre-existing: v0.2.x ran the same range shape). A seek-capable range
   plan is the top follow-up before embedding at million-entry scale. |
+| `v0.3.2` | `kuntu-scan`: `scan_local_directory_fold` and `LocalScanVisitor` hand each finished entry to a caller-owned builder, children first, so a consumer can index a full-disk walk without holding a `LocalScanNode` tree (Space Lens desktop, ~6.5M entries: walk-time footprint 2.85 GB → ~0.45 GB). Hard-link dedup records only files with more than one link, and the seen-inode sets are sharded so they never regrow one huge table. `scan_local_directory` output is unchanged. |
 | `v0.3.1` | `kuntu-scan`: a skipped symbolic link (never followed) no longer marks its parent folder `partial`, so folders such as a pnpm/yarn `node_modules` can be staged whole for cleanup. Unreadable children still make the parent `partial`. |
 | `v0.3.0` | Kuntu: file-search renamed, space-lens's scan/clean/cloud engine moved in as `kuntu-scan`; `kfs-*` crates swept to `kuntu-*`. |
 | `v0.2.0` – `v0.2.2` | Index engine moved to turso (schema version 2), trimmed default features, Windows test debt fixed, review fixes. |
