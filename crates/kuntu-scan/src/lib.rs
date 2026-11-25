@@ -27,4 +27,7 @@ pub use local_scan::{
   scan_local_directory, scan_local_directory_with_progress, LocalScanCancellation, LocalScanNode,
   LocalScanProgress, LocalScanReport, ScanCoverage, ScanIssue, ScanVolume,
 };
-pub use scanner::{measure_path, scan_directory, IgnoredMode, ScanNode, ScanOptions};
+pub use scanner::{
+  measure_path, scan_directory, scan_directory_observed, IgnoredMode, ScanNode, ScanObserver,
+  ScanOptions,
+};
