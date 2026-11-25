@@ -1,5 +1,6 @@
 //! Protected metadata-only local scanner. Never falls back to the legacy walker.
 
+use crate::locality::is_cloud_path;
 use crate::{IgnoredMode, ScanNode, ScanOptions};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rayon::prelude::*;
@@ -17,6 +18,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod windows;
+
 const ISSUE_LIMIT: usize = 200;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -24,6 +28,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 #[serde(rename_all = "camelCase")]
 pub struct LocalScanNode {
   pub name: String,
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub size: u64,
   pub children: Vec<LocalScanNode>,
@@ -50,9 +55,31 @@ impl From<LocalScanNode> for ScanNode {
   }
 }
 
+impl LocalScanReport {
+  /// The measured entries as plain scan nodes. `ScanNode` cannot say that an
+  /// entry was skipped, so skipped entries are left out rather than shown as
+  /// empty; `coverage` still counts them.
+  pub fn measured_tree(self) -> Vec<ScanNode> {
+    fn measured(nodes: Vec<LocalScanNode>) -> Vec<ScanNode> {
+      nodes
+        .into_iter()
+        .filter(|node| node.scan_state != "skipped")
+        .map(|mut node| {
+          let children = measured(std::mem::take(&mut node.children));
+          let mut node = ScanNode::from(node);
+          node.children = children;
+          node
+        })
+        .collect()
+    }
+    measured(self.nodes)
+  }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanIssue {
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub reason: String,
   pub message: String,
@@ -84,6 +111,7 @@ pub struct ScanCoverage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanVolume {
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub total_bytes: u64,
   pub available_bytes: u64,
@@ -102,6 +130,7 @@ pub struct LocalScanReport {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalScanProgress {
+  #[serde(serialize_with = "crate::wire_path::serialize_option")]
   pub current_path: Option<PathBuf>,
   pub bytes_scanned: u64,
   pub entries_scanned: u64,
@@ -138,6 +167,8 @@ impl LocalScanCancellation {
 struct PolicyGuard {
   #[cfg(target_os = "macos")]
   previous: i32,
+  #[cfg(windows)]
+  previous: i8,
   active: bool,
   _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -176,7 +207,15 @@ impl PolicyGuard {
       }
       Ok(guard)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+      Ok(Self {
+        previous: windows::expose_placeholders()?,
+        active: true,
+        _thread: std::marker::PhantomData,
+      })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
       Ok(Self {
         active: true,
@@ -192,6 +231,8 @@ impl PolicyGuard {
     if unsafe { setiopolicy_np(3, 1, self.previous) } != 0 {
       return Err(io::Error::last_os_error());
     }
+    #[cfg(windows)]
+    windows::restore_placeholder_mode(self.previous)?;
     self.active = false;
     Ok(())
   }
@@ -209,20 +250,39 @@ impl Drop for PolicyGuard {
 #[derive(Clone, Copy)]
 struct Facts {
   device: u64,
-  inode: u64,
+  /// Zero when the filesystem offers no usable file identity.
+  inode: u128,
   allocated: u64,
   logical: u64,
   directory: bool,
   file: bool,
   symlink: bool,
   dataless: bool,
+  /// Why the platform rules this entry out: skip reason and message.
+  excluded: Option<(&'static str, &'static str)>,
+}
+impl Facts {
+  /// Why the entry's contents must stay untouched, if they must.
+  fn exclusion(&self) -> Option<(&'static str, &'static str)> {
+    if self.dataless {
+      Some((
+        "dataless",
+        "dataless item excluded; materialization is disabled",
+      ))
+    } else {
+      self.excluded
+    }
+  }
 }
 
+#[cfg(not(windows))]
 #[derive(Clone)]
 struct PinnedDirectory {
   #[cfg(unix)]
   fd: Arc<std::os::fd::OwnedFd>,
 }
+#[cfg(windows)]
+use windows::Directory as PinnedDirectory;
 struct OpenedRoot {
   directory: PinnedDirectory,
   facts: Facts,
@@ -306,8 +366,8 @@ impl NativeBackend {
         .max_by_key(|(root, _)| root.components().count())
         .map(|(_, local)| *local);
       if local != Some(true) {
-        return Err(io::Error::new(
-          io::ErrorKind::Unsupported,
+        return Err(policy_error(
+          "non-local-volume",
           "network or unknown filesystem excluded",
         ));
       }
@@ -369,7 +429,16 @@ impl Backend for NativeBackend {
         volume,
       })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+      let (directory, facts, volume) = windows::open_root(path, &|| cancellation.check())?;
+      Ok(OpenedRoot {
+        directory,
+        facts,
+        volume,
+      })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
       let _ = cancellation;
       Err(io::Error::new(
@@ -385,7 +454,11 @@ impl Backend for NativeBackend {
       use std::os::fd::AsRawFd;
       facts_at(parent.fd.as_raw_fd(), &component_name(path)?)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+      windows::metadata(path, parent)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
       let _ = parent;
       Err(io::Error::new(
@@ -435,7 +508,11 @@ impl Backend for NativeBackend {
       volume_fd(path, directory.fd.as_raw_fd())?;
       Ok(directory)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+      windows::directory(path, parent, expected)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
       let _ = (parent, expected);
       Err(io::Error::new(
@@ -504,7 +581,11 @@ impl Backend for NativeBackend {
       }
       Ok(entries)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+      windows::entries(path, directory, &|| cancellation.check())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
       let _ = directory;
       Err(io::Error::new(
@@ -559,7 +640,11 @@ impl Backend for NativeBackend {
       }
       Ok(text)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+      windows::ignore_text(path, directory, expected)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
       let _ = (directory, expected);
       Err(io::Error::new(
@@ -581,7 +666,7 @@ impl std::fmt::Display for PolicyFailure {
   }
 }
 impl std::error::Error for PolicyFailure {}
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn policy_error(reason: &'static str, message: &str) -> io::Error {
   io::Error::other(PolicyFailure {
     reason,
@@ -631,7 +716,7 @@ fn facts_from_stat(stats: &libc::stat) -> Facts {
   #[cfg(not(target_os = "macos"))]
   let dataless = false;
   #[allow(clippy::unnecessary_cast)]
-  let (device, inode) = (stats.st_dev as u64, stats.st_ino as u64);
+  let (device, inode) = (stats.st_dev as u64, stats.st_ino as u128);
   Facts {
     device,
     inode,
@@ -641,6 +726,7 @@ fn facts_from_stat(stats: &libc::stat) -> Facts {
     file: stats.st_mode & libc::S_IFMT == libc::S_IFREG,
     symlink: stats.st_mode & libc::S_IFMT == libc::S_IFLNK,
     dataless,
+    excluded: None,
   }
 }
 #[cfg(unix)]
@@ -718,8 +804,8 @@ struct WalkContext<'a, B, F> {
   progress: &'a F,
   started: Instant,
   stats: Mutex<Stats>,
-  seen_files: Mutex<HashSet<(u64, u64)>>,
-  seen_dirs: Mutex<HashSet<(u64, u64)>>,
+  seen_files: Mutex<HashSet<(u64, u128)>>,
+  seen_dirs: Mutex<HashSet<(u64, u128)>>,
   cloud_roots: Vec<PathBuf>,
   selected_roots: HashSet<PathBuf>,
 }
@@ -803,6 +889,9 @@ pub fn scan_local_directory_with_progress<F: Fn(LocalScanProgress) + Send + Sync
       .min(8);
     let pool = rayon::ThreadPoolBuilder::new()
       .num_threads(threads)
+      // The walk recurses once per directory level; Windows threads start
+      // with too little stack for deep trees.
+      .stack_size(8 * 1024 * 1024)
       .build()
       .map_err(io::Error::other)?;
     pool.install(|| scan_with_backend(&options, &cancellation, &progress, &backend))
@@ -865,7 +954,7 @@ fn scan_with_backend<B: Backend, F: Fn(LocalScanProgress) + Sync>(
     let mut nodes = Vec::new();
     for root in roots {
       cancellation.check()?;
-      if cloud_path(&root, &context.cloud_roots) {
+      if is_cloud_path(&root, &context.cloud_roots) {
         nodes.push(context.skipped(
           &root,
           0,
@@ -943,7 +1032,7 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
   let guard = context.backend.enter()?;
   let result = (|| {
     context.cancellation.check()?;
-    if cloud_path(path, &context.cloud_roots) {
+    if is_cloud_path(path, &context.cloud_roots) {
       return Ok(context.skipped(
         path,
         depth,
@@ -984,14 +1073,8 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         "symbolic links are never followed",
       ));
     }
-    if facts.dataless {
-      return Ok(context.skipped(
-        path,
-        depth,
-        facts.directory,
-        "dataless",
-        "dataless item excluded; materialization is disabled",
-      ));
+    if let Some((reason, message)) = facts.exclusion() {
+      return Ok(context.skipped(path, depth, facts.directory, reason, message));
     }
     if facts.device != device {
       return Ok(context.skipped(
@@ -1037,6 +1120,7 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
         .lock()
         .unwrap()
         .insert((facts.device, facts.inode))
+      && facts.inode != 0
     {
       return Ok(context.skipped(
         path,
@@ -1060,6 +1144,7 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
       None
     };
     let allocated = if facts.file
+      && facts.inode != 0
       && !context
         .seen_files
         .lock()
@@ -1095,7 +1180,7 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
           Ok(ignore_facts)
             if ignore_facts.file
               && !ignore_facts.symlink
-              && !ignore_facts.dataless
+              && ignore_facts.exclusion().is_none()
               && ignore_facts.device == device =>
           {
             match context
@@ -1124,11 +1209,14 @@ fn walk<B: Backend, F: Fn(LocalScanProgress) + Sync>(
               }
             }
           }
-          Ok(ignore_facts) if ignore_facts.dataless => {
+          Ok(ignore_facts) if ignore_facts.exclusion().is_some() => {
+            let reason = ignore_facts
+              .exclusion()
+              .map_or("dataless", |(reason, _)| reason);
             context.issue(
               &ignore_path,
-              "dataless",
-              "dataless ignore rules were not opened",
+              reason,
+              "excluded ignore rules were not opened",
             );
             node.scan_state = "partial".into();
           }
@@ -1259,29 +1347,6 @@ fn normalize(path: &Path, cwd: &Path) -> PathBuf {
   result
 }
 
-fn cloud_path(path: &Path, custom: &[PathBuf]) -> bool {
-  if custom.iter().any(|root| path.starts_with(root)) {
-    return true;
-  }
-  let names: Vec<_> = path
-    .components()
-    .filter_map(|component| match component {
-      Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
-      _ => None,
-    })
-    .collect();
-  names.windows(2).any(|pair| {
-    pair[0] == "library" && matches!(pair[1].as_str(), "cloudstorage" | "mobile documents")
-  }) || names.iter().any(|name| {
-    name == "dropbox"
-      || name == "icloud drive"
-      || name == "iclouddrive"
-      || name.starts_with("onedrive")
-      || name.starts_with("googledrive")
-      || name.starts_with("google drive")
-  })
-}
-
 fn error_reason(error: &io::Error) -> &'static str {
   if let Some(failure) = error
     .get_ref()
@@ -1297,9 +1362,14 @@ fn error_reason(error: &io::Error) -> &'static str {
   if error.raw_os_error() == Some(libc::EDEADLK) {
     return "materialization-blocked";
   }
+  // ERROR_CLOUD_FILE_*: the cloud filter refused to serve without a download.
+  #[cfg(windows)]
+  if matches!(error.raw_os_error(), Some(362..=404)) {
+    return "materialization-blocked";
+  }
   match error.kind() {
     io::ErrorKind::PermissionDenied => "permission-denied",
-    io::ErrorKind::Unsupported => "non-local-volume",
+    io::ErrorKind::Unsupported => "unsupported",
     io::ErrorKind::NotFound => "missing",
     _ => "io-error",
   }
@@ -1323,7 +1393,6 @@ mod tests {
       fs::create_dir_all(&path).unwrap();
       Self(fs::canonicalize(path).unwrap())
     }
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn file(&self, name: &str, size: usize) -> PathBuf {
       let path = self.0.join(name);
       fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1347,7 +1416,7 @@ mod tests {
     }
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn local_report_measures_logical_and_unique_allocated_bytes() {
     let fixture = Fixture::new();
@@ -1393,7 +1462,7 @@ mod tests {
     );
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn progress_can_cancel_and_issues_are_bounded_without_losing_total_counts() {
     let fixture = Fixture::new();
@@ -1455,7 +1524,7 @@ mod tests {
     assert_eq!(report.nodes[0].scan_state, "skipped");
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn protected_gitignore_summarizes_local_ignored_entries_and_exclude_is_explicit() {
     let fixture = Fixture::new();
@@ -1482,7 +1551,7 @@ mod tests {
     assert_eq!(ignored.size, 0);
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn separately_selected_nested_roots_are_scanned_once_and_have_unique_node_paths() {
     let fixture = Fixture::new();
@@ -1520,6 +1589,15 @@ mod tests {
     let mut paths = HashSet::new();
     for node in &report.nodes {
       collect(node, &mut paths);
+    }
+  }
+
+  trait HasComponent {
+    fn starts_with_component(&self, name: &str) -> bool;
+  }
+  impl HasComponent for Path {
+    fn starts_with_component(&self, name: &str) -> bool {
+      self.components().any(|part| part.as_os_str() == name)
     }
   }
 
@@ -1600,12 +1678,18 @@ mod tests {
     fn metadata(&self, path: &Path, parent: &PinnedDirectory) -> io::Result<Facts> {
       self.protected();
       self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+      #[cfg(unix)]
       if path.file_name().is_some_and(|name| name == "blocked") {
         return Err(io::Error::from_raw_os_error(libc::EDEADLK));
       }
       let mut facts = self.native.metadata(path, parent)?;
       if path.file_name().is_some_and(|name| name == "dataless") {
         facts.dataless = true;
+      }
+      if path.file_name().is_some_and(|name| {
+        name == "provider-item" || name == ".gitignore" && path.starts_with_component("held-rules")
+      }) {
+        facts.excluded = Some(("cloud-root", "injected placeholder"));
       }
       if path
         .components()
@@ -1691,6 +1775,49 @@ mod tests {
     }
   }
 
+  /// A simulated placeholder: whatever the platform reports it from, the walk
+  /// must neither descend into it, measure it, nor read its rules.
+  #[cfg(any(unix, windows))]
+  #[test]
+  fn placeholders_are_skipped_unread_and_make_their_parents_partial() {
+    let fixture = Fixture::new();
+    fixture.file("kept", 8192);
+    fixture.file("dataless", 8192);
+    fixture.file("provider-item/file", 8192);
+    fixture.file("held-rules/ignored", 8192);
+    fs::write(fixture.0.join("held-rules/.gitignore"), "ignored\n").unwrap();
+    let backend = ObservedBackend::new(false);
+    let mut options = fixture.options();
+    options.respect_gitignore = true;
+    let report = scan_with_backend(
+      &options,
+      &LocalScanCancellation::default(),
+      &|_| {},
+      &backend,
+    )
+    .unwrap();
+    assert_eq!(report.coverage.logical_bytes, 16384);
+    assert_eq!(report.coverage.files, 2);
+    assert_eq!(report.coverage.skipped_by_reason.get("dataless"), Some(&1));
+    // The folder, and the rules file both as unread rules and as an entry.
+    assert_eq!(
+      report.coverage.skipped_by_reason.get("cloud-root"),
+      Some(&3)
+    );
+    assert_eq!(report.nodes[0].scan_state, "partial");
+    assert!(!report.nodes[0]
+      .children
+      .iter()
+      .flat_map(|node| &node.children)
+      .any(|node| node.ignored));
+    assert!(!backend
+      .directory_calls
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|path| path.ends_with("provider-item")));
+  }
+
   #[cfg(unix)]
   #[test]
   fn dataless_mounts_denials_and_iteration_errors_are_visible_without_descent() {
@@ -1733,7 +1860,7 @@ mod tests {
       .any(|path| path.ends_with("dataless") || path.ends_with("mount")));
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn every_actual_rayon_thread_and_directory_iterator_is_protected() {
     let fixture = Fixture::new();
@@ -1759,7 +1886,7 @@ mod tests {
     assert!(backend.threads.lock().unwrap().len() >= 2);
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn explicitly_selected_child_mount_is_omitted_from_parent_and_scanned_as_its_own_root() {
     let fixture = Fixture::new();
@@ -1787,7 +1914,7 @@ mod tests {
       .any(|node| node.path.ends_with("mount")));
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn progress_is_throttled_and_terminal_counts_match_measured_nodes() {
     let fixture = Fixture::new();

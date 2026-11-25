@@ -1,9 +1,8 @@
-use crate::scanner::{
-  effective_metadata, mark_dir_visited, measure_path_inner, new_seen_inodes, scan_directory,
-  IgnoredMode, ScanNode, ScanOptions, SeenInodes,
-};
+use crate::local_scan::{scan_local_directory, LocalScanNode, ScanCoverage};
+use crate::scanner::{IgnoredMode, ScanOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -19,14 +18,14 @@ pub struct CandidateOptions {
   pub roots: Vec<PathBuf>,
   pub presets: Vec<CleanupPreset>,
   pub ignore_hidden: bool,
-  /// Descend into symlinked directories when searching for candidates.
-  /// Off by default so scans do not wander into symlinked external projects.
+  /// Ignored: candidate searches are local-only and never follow links.
   #[serde(default)]
   pub follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupCandidate {
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub size: u64,
   pub reason: String,
@@ -36,6 +35,7 @@ pub struct CleanupCandidate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemovalEntry {
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub size: u64,
   pub reason: String,
@@ -70,48 +70,63 @@ impl CandidateOptions {
   }
 }
 
-struct CandidateSpec {
-  dir_name: &'static str,
-  preset: CleanupPreset,
-  reason: &'static str,
+/// What a candidate search found, and what it had to leave alone.
+#[derive(Clone, Debug)]
+pub struct CandidateReport {
+  pub candidates: Vec<CleanupCandidate>,
+  /// Matches not offered because part of them was not scanned (a cloud or
+  /// online-only item, another volume, an unreadable folder). Removing such a
+  /// folder would remove what was never looked at.
+  pub withheld: Vec<PathBuf>,
+  pub coverage: ScanCoverage,
 }
 
+/// [`find_local_candidates`] without the coverage; a failed scan finds nothing.
 pub fn find_candidates(options: CandidateOptions) -> Vec<CleanupCandidate> {
-  let mut candidates = Vec::new();
-  let mut seen = HashSet::new();
+  find_local_candidates(options)
+    .map(|report| report.candidates)
+    .unwrap_or_default()
+}
 
-  for preset in options.effective_presets() {
-    match preset {
-      CleanupPreset::Node => find_named_dir_candidates(
-        &options.roots,
-        &CandidateSpec {
-          dir_name: "node_modules",
-          preset: CleanupPreset::Node,
-          reason: "Node dependency directory",
-        },
-        &options,
-        &mut seen,
-        &mut candidates,
-      ),
-      CleanupPreset::Rust => find_named_dir_candidates(
-        &options.roots,
-        &CandidateSpec {
-          dir_name: "target",
-          preset: CleanupPreset::Rust,
-          reason: "Cargo build output directory",
-        },
-        &options,
-        &mut seen,
-        &mut candidates,
-      ),
-      CleanupPreset::Gitignored => {
-        find_gitignored_candidates(&options, &mut seen, &mut candidates);
-      }
+/// Searches one protected local scan of the roots: cloud storage, online-only
+/// items, links and other volumes are never entered. Sizes are allocated bytes,
+/// with a file hard-linked into several places counted once.
+pub fn find_local_candidates(options: CandidateOptions) -> io::Result<CandidateReport> {
+  let presets = options.effective_presets();
+  let report = scan_local_directory(ScanOptions {
+    directories: options.roots.clone(),
+    // Hidden entries are filtered while searching, so a candidate is still
+    // measured and judged complete as a whole.
+    ignore_hidden: false,
+    full_path: false,
+    respect_gitignore: presets.contains(&CleanupPreset::Gitignored),
+    ignored_mode: IgnoredMode::Summarize,
+    follow_symlinks: false,
+  })?;
+  let mut search = Search {
+    ignore_hidden: options.ignore_hidden,
+    seen: HashSet::new(),
+    candidates: Vec::new(),
+    withheld: Vec::new(),
+  };
+  for preset in presets {
+    for root in &report.nodes {
+      search.visit(root, preset);
     }
   }
-
+  let Search {
+    mut candidates,
+    mut withheld,
+    ..
+  } = search;
   candidates.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
-  candidates
+  withheld.sort();
+  withheld.dedup();
+  Ok(CandidateReport {
+    candidates,
+    withheld,
+    coverage: report.coverage,
+  })
 }
 
 pub fn build_removal_plan(candidates: Vec<CleanupCandidate>) -> RemovalPlan {
@@ -151,136 +166,51 @@ pub fn execute_removal_plan(plan: &RemovalPlan) -> RemovalOutcome {
   outcome
 }
 
-fn find_named_dir_candidates(
-  roots: &[PathBuf],
-  spec: &CandidateSpec,
-  options: &CandidateOptions,
-  seen: &mut HashSet<PathBuf>,
-  candidates: &mut Vec<CleanupCandidate>,
-) {
-  let seen_dirs = new_seen_inodes();
-  for root in roots {
-    visit_named_dir_candidate(root, spec, options, seen, &seen_dirs, candidates);
-  }
+struct Search {
+  ignore_hidden: bool,
+  seen: HashSet<PathBuf>,
+  candidates: Vec<CleanupCandidate>,
+  withheld: Vec<PathBuf>,
 }
 
-fn visit_named_dir_candidate(
-  path: &Path,
-  spec: &CandidateSpec,
-  options: &CandidateOptions,
-  seen: &mut HashSet<PathBuf>,
-  seen_dirs: &SeenInodes,
-  candidates: &mut Vec<CleanupCandidate>,
-) {
-  if options.ignore_hidden && is_hidden(path) {
-    return;
+impl Search {
+  fn visit(&mut self, node: &LocalScanNode, preset: CleanupPreset) {
+    if node.scan_state == "skipped" {
+      return;
+    }
+    // `.gitignore` never hides the root the caller named.
+    let hidden_applies = node.depth > 0 || preset != CleanupPreset::Gitignored;
+    if self.ignore_hidden && hidden_applies && is_hidden(&node.path) {
+      return;
+    }
+    let name = node.path.file_name().and_then(|name| name.to_str());
+    let reason = match preset {
+      CleanupPreset::Node => {
+        (node.is_directory && name == Some("node_modules")).then_some("Node dependency directory")
+      }
+      CleanupPreset::Rust => {
+        (node.is_directory && name == Some("target")).then_some("Cargo build output directory")
+      }
+      CleanupPreset::Gitignored => node.ignored.then_some("Path matched by .gitignore"),
+    };
+    let Some(reason) = reason else {
+      for child in &node.children {
+        self.visit(child, preset);
+      }
+      return;
+    };
+    if node.scan_state != "complete" {
+      self.withheld.push(node.path.clone());
+    } else if self.seen.insert(node.path.clone()) {
+      self.candidates.push(CleanupCandidate {
+        path: node.path.clone(),
+        size: node.size,
+        reason: reason.to_string(),
+        preset,
+        ignored: preset == CleanupPreset::Gitignored,
+      });
+    }
   }
-
-  let metadata = match std::fs::symlink_metadata(path) {
-    Ok(metadata) => metadata,
-    Err(_) => return,
-  };
-  let metadata = match effective_metadata(path, metadata, options.follow_symlinks) {
-    Some(metadata) => metadata,
-    None => return,
-  };
-
-  if !metadata.is_dir() {
-    return;
-  }
-
-  if options.follow_symlinks && !mark_dir_visited(path, &metadata, seen_dirs) {
-    return;
-  }
-
-  if path.file_name().and_then(|name| name.to_str()) == Some(spec.dir_name) {
-    push_candidate(
-      path,
-      spec.preset,
-      spec.reason,
-      false,
-      options,
-      seen,
-      candidates,
-    );
-    return;
-  }
-
-  let entries = match std::fs::read_dir(path) {
-    Ok(entries) => entries,
-    Err(_) => return,
-  };
-
-  for entry in entries.flatten() {
-    visit_named_dir_candidate(&entry.path(), spec, options, seen, seen_dirs, candidates);
-  }
-}
-
-fn find_gitignored_candidates(
-  options: &CandidateOptions,
-  seen: &mut HashSet<PathBuf>,
-  candidates: &mut Vec<CleanupCandidate>,
-) {
-  let trees = scan_directory(ScanOptions {
-    directories: options.roots.clone(),
-    ignore_hidden: options.ignore_hidden,
-    full_path: true,
-    respect_gitignore: true,
-    ignored_mode: IgnoredMode::Summarize,
-    follow_symlinks: options.follow_symlinks,
-  });
-
-  for tree in trees {
-    collect_ignored_nodes(&tree, options, seen, candidates);
-  }
-}
-
-fn collect_ignored_nodes(
-  node: &ScanNode,
-  options: &CandidateOptions,
-  seen: &mut HashSet<PathBuf>,
-  candidates: &mut Vec<CleanupCandidate>,
-) {
-  if node.ignored {
-    push_candidate(
-      &node.path,
-      CleanupPreset::Gitignored,
-      "Path matched by .gitignore",
-      true,
-      options,
-      seen,
-      candidates,
-    );
-    return;
-  }
-
-  for child in &node.children {
-    collect_ignored_nodes(child, options, seen, candidates);
-  }
-}
-
-fn push_candidate(
-  path: &Path,
-  preset: CleanupPreset,
-  reason: &str,
-  ignored: bool,
-  options: &CandidateOptions,
-  seen: &mut HashSet<PathBuf>,
-  candidates: &mut Vec<CleanupCandidate>,
-) {
-  let path = path.to_path_buf();
-  if !seen.insert(path.clone()) {
-    return;
-  }
-
-  let size = measure_path_inner(path.as_path(), options.follow_symlinks);
-  candidates.push(CleanupCandidate {
-    size,
-    path,
-    reason: reason.to_string(),
-    preset,
-    ignored,
-  });
 }
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
@@ -392,7 +322,7 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
-  fn symlinked_projects_are_skipped_unless_follow_symlinks_is_set() {
+  fn symlinked_projects_are_never_followed() {
     use std::os::unix::fs::symlink;
 
     // The linked project lives OUTSIDE the scan root, like a vendored
@@ -406,45 +336,80 @@ mod tests {
     write(store.join("real/node_modules/leftover/index.js"), "x\n").unwrap();
     symlink(store.join("real"), root.join("links/project")).unwrap();
 
-    let skipped = find_candidates(CandidateOptions {
-      roots: vec![root.clone()],
-      presets: vec![CleanupPreset::Node],
-      ignore_hidden: false,
-      follow_symlinks: false,
-    });
-    assert!(skipped.is_empty());
-
-    let followed = find_candidates(CandidateOptions {
-      roots: vec![root.clone()],
-      presets: vec![CleanupPreset::Node],
-      ignore_hidden: false,
-      follow_symlinks: true,
-    });
-    assert_eq!(followed.len(), 1);
-    assert!(followed[0].path.starts_with(root.join("links")));
-    assert!(followed[0].path.ends_with("node_modules"));
+    for follow_symlinks in [false, true] {
+      assert!(find_candidates(CandidateOptions {
+        roots: vec![root.clone()],
+        presets: vec![CleanupPreset::Node],
+        ignore_hidden: false,
+        follow_symlinks,
+      })
+      .is_empty());
+    }
 
     remove_dir_all(base).unwrap();
   }
 
-  #[cfg(unix)]
   #[test]
-  fn symlink_cycles_do_not_hang_the_candidate_walk() {
-    use std::os::unix::fs::symlink;
+  fn cloud_folders_are_never_candidates_and_withhold_what_contains_them() {
+    let root = fixture("cloud-candidates");
+    create_dir_all(root.join("OneDrive/app/node_modules")).unwrap();
+    create_dir_all(root.join("mixed/node_modules/Dropbox")).unwrap();
+    create_dir_all(root.join("plain/node_modules")).unwrap();
+    for file in [
+      "OneDrive/app/node_modules/a",
+      "mixed/node_modules/Dropbox/b",
+      "plain/node_modules/c",
+    ] {
+      write(root.join(file), "x\n").unwrap();
+    }
 
-    let root = fixture("cycle");
-    create_dir_all(root.join("app/node_modules/pkg")).unwrap();
-    symlink(root.join("app"), root.join("app/loop")).unwrap();
-
-    let candidates = find_candidates(CandidateOptions {
-      roots: vec![root.join("app")],
+    let report = find_local_candidates(CandidateOptions {
+      roots: vec![root.clone()],
       presets: vec![CleanupPreset::Node],
       ignore_hidden: false,
-      follow_symlinks: true,
-    });
+      follow_symlinks: false,
+    })
+    .unwrap();
 
-    assert_eq!(candidates.len(), 1);
-    assert!(candidates[0].path.ends_with("node_modules"));
+    assert_eq!(report.candidates.len(), 1, "{:?}", report.candidates);
+    assert!(report.candidates[0].path.ends_with("plain/node_modules"));
+    assert_eq!(report.withheld.len(), 1);
+    assert!(report.withheld[0].ends_with("mixed/node_modules"));
+    assert_eq!(
+      report.coverage.skipped_by_reason.get("cloud-root"),
+      Some(&2)
+    );
+    assert!(find_candidates(CandidateOptions {
+      roots: vec![root.join("OneDrive")],
+      presets: vec![],
+      ignore_hidden: false,
+      follow_symlinks: false,
+    })
+    .is_empty());
+
+    remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn hidden_entries_are_searched_only_when_asked_but_measured_either_way() {
+    let root = fixture("hidden-candidates");
+    create_dir_all(root.join(".tool/node_modules")).unwrap();
+    create_dir_all(root.join("app/node_modules/.bin")).unwrap();
+    write(root.join(".tool/node_modules/a"), "x\n").unwrap();
+    write(root.join("app/node_modules/.bin/b"), "x\n").unwrap();
+    let search = |ignore_hidden| {
+      find_candidates(CandidateOptions {
+        roots: vec![root.clone()],
+        presets: vec![CleanupPreset::Node],
+        ignore_hidden,
+        follow_symlinks: false,
+      })
+    };
+
+    assert_eq!(search(false).len(), 2);
+    let visible = search(true);
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].path.ends_with("app/node_modules"));
 
     remove_dir_all(root).unwrap();
   }

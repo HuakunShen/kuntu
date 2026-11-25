@@ -10,8 +10,10 @@ pub mod clean;
 pub mod cloud;
 pub mod git;
 pub mod local_scan;
+pub mod locality;
 pub mod scanner;
 pub mod snapshot;
+mod wire_path;
 
 pub use snapshot::{
   CapabilityState, NodeFlag, NodeKind, NodeScanState, PlatformCapabilities, SnapshotEnvelope,
@@ -19,8 +21,9 @@ pub use snapshot::{
 };
 
 pub use clean::{
-  build_removal_plan, delete_path, execute_removal_plan, find_candidates, CandidateOptions,
-  CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome, RemovalPlan,
+  build_removal_plan, delete_path, execute_removal_plan, find_candidates, find_local_candidates,
+  CandidateOptions, CandidateReport, CleanupCandidate, CleanupPreset, RemovalEntry, RemovalOutcome,
+  RemovalPlan,
 };
 pub use git::{find_dirty_git_repos, DirtyGitRepo, DirtyGitRepoOptions};
 pub use local_scan::{
