@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,13 +50,40 @@ struct ScanCtx<'a> {
   options: &'a ScanOptions,
   seen_inodes: &'a SeenInodes,
   seen_dirs: &'a SeenInodes,
+  observer: &'a ScanObserver,
+}
+
+/// Live view of a running walk: counters to poll and a flag that stops it.
+#[derive(Debug, Default)]
+pub struct ScanObserver {
+  pub cancelled: AtomicBool,
+  pub files: AtomicU64,
+  pub bytes: AtomicU64,
+}
+
+impl ScanObserver {
+  fn is_cancelled(&self) -> bool {
+    self.cancelled.load(Ordering::Relaxed)
+  }
+
+  fn count(&self, is_dir: bool, bytes: u64) {
+    self.files.fetch_add(u64::from(!is_dir), Ordering::Relaxed);
+    self.bytes.fetch_add(bytes, Ordering::Relaxed);
+  }
 }
 
 pub fn scan_directory(options: ScanOptions) -> Vec<ScanNode> {
+  scan_directory_observed(options, &ScanObserver::default())
+}
+
+/// [`scan_directory`] reporting to `observer`. Once `cancelled` is set the walk
+/// winds down and the returned tree is partial: callers must discard it.
+pub fn scan_directory_observed(options: ScanOptions, observer: &ScanObserver) -> Vec<ScanNode> {
   let ctx = ScanCtx {
     options: &options,
     seen_inodes: &new_seen_inodes(),
     seen_dirs: &new_seen_inodes(),
+    observer,
   };
 
   options
@@ -114,6 +142,10 @@ fn scan_path(
   collapsed: bool,
   ctx: &ScanCtx<'_>,
 ) -> Option<ScanNode> {
+  if ctx.observer.is_cancelled() {
+    return None;
+  }
+
   let options = ctx.options;
   let metadata = effective_metadata(
     path,
@@ -126,6 +158,7 @@ fn scan_path(
   if is_dir && options.follow_symlinks && !mark_dir_visited(path, &metadata, ctx.seen_dirs) {
     return None;
   }
+  ctx.observer.count(is_dir, own_size);
 
   if !is_dir {
     return Some(ScanNode {
@@ -155,6 +188,7 @@ fn scan_path(
           ctx.seen_inodes,
           ctx.seen_dirs,
           options.follow_symlinks,
+          ctx.observer,
         ),
       children: vec![],
       depth,
@@ -235,7 +269,8 @@ fn summarize_path(
     if follow_symlinks && !mark_dir_visited(path, &metadata, seen_dirs) {
       return 0;
     }
-    own_size + summarize_dir_children(path, seen_inodes, seen_dirs, follow_symlinks)
+    let unobserved = ScanObserver::default();
+    own_size + summarize_dir_children(path, seen_inodes, seen_dirs, follow_symlinks, &unobserved)
   } else {
     own_size
   }
@@ -280,7 +315,11 @@ fn summarize_dir_children(
   seen_inodes: &SeenInodes,
   seen_dirs: &SeenInodes,
   follow_symlinks: bool,
+  observer: &ScanObserver,
 ) -> u64 {
+  if observer.is_cancelled() {
+    return 0;
+  }
   match std::fs::read_dir(path) {
     Ok(entries) => entries
       .par_bridge()
@@ -291,13 +330,23 @@ fn summarize_dir_children(
         let metadata = effective_metadata(&entry_path, metadata, follow_symlinks)?;
         let own_size = unique_allocated_size(&entry_path, &metadata, seen_inodes)?;
 
+        let revisited = metadata.is_dir()
+          && follow_symlinks
+          && !mark_dir_visited(&entry_path, &metadata, seen_dirs);
+        if revisited {
+          return None;
+        }
+        observer.count(metadata.is_dir(), own_size);
+
         if metadata.is_dir() {
-          if follow_symlinks && !mark_dir_visited(&entry_path, &metadata, seen_dirs) {
-            return None;
-          }
-          Some(
-            own_size + summarize_dir_children(&entry_path, seen_inodes, seen_dirs, follow_symlinks),
-          )
+          let children = summarize_dir_children(
+            &entry_path,
+            seen_inodes,
+            seen_dirs,
+            follow_symlinks,
+            observer,
+          );
+          Some(own_size + children)
         } else {
           Some(own_size)
         }
@@ -387,4 +436,50 @@ fn allocated_size(metadata: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn allocated_size(metadata: &std::fs::Metadata) -> u64 {
   metadata.len()
+}
+
+#[cfg(test)]
+mod observer_tests {
+  use super::*;
+  use std::sync::atomic::Ordering;
+
+  #[test]
+  fn observer_counts_the_walk_and_a_cancelled_walk_stops() {
+    let root = std::env::temp_dir().join(format!("kuntu-observer-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("ignored/deep")).unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored\n").unwrap();
+    std::fs::write(root.join("src/a"), vec![b'x'; 8192]).unwrap();
+    std::fs::write(root.join("ignored/deep/b"), vec![b'y'; 8192]).unwrap();
+    let options = ScanOptions {
+      directories: vec![root.clone()],
+      ignore_hidden: false,
+      full_path: false,
+      respect_gitignore: true,
+      ignored_mode: IgnoredMode::Summarize,
+      follow_symlinks: false,
+    };
+
+    let observer = ScanObserver::default();
+    let tree = scan_directory_observed(options.clone(), &observer);
+    // Summarized (collapsed) subtrees are counted too.
+    assert_eq!(observer.files.load(Ordering::Relaxed), 3);
+    assert_eq!(observer.bytes.load(Ordering::Relaxed), tree[0].size);
+
+    let observer = ScanObserver::default();
+    observer.cancelled.store(true, Ordering::Relaxed);
+    assert!(scan_directory_observed(options, &observer).is_empty());
+    assert_eq!(observer.files.load(Ordering::Relaxed), 0);
+    assert_eq!(
+      summarize_dir_children(
+        &root,
+        &new_seen_inodes(),
+        &new_seen_inodes(),
+        false,
+        &observer
+      ),
+      0
+    );
+    std::fs::remove_dir_all(root).unwrap();
+  }
 }
