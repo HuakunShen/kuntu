@@ -31,6 +31,7 @@ pub struct ScanOptions {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanNode {
   pub name: String,
+  #[serde(serialize_with = "crate::wire_path::serialize")]
   pub path: PathBuf,
   pub size: u64,
   pub children: Vec<ScanNode>,
